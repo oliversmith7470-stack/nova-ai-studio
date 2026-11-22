@@ -428,7 +428,112 @@
         font-size: 17px;
       }
     }
-  </style>
+/* NOVA AI WRITING STUDIO */
+.writing-studio {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(8, 5, 20, 0.96);
+  padding: 24px;
+  overflow-y: auto;
+}
+
+.writing-panel {
+  width: 100%;
+  max-width: 760px;
+  margin: 35px auto;
+  padding: 25px;
+  background: #17122b;
+  border: 1px solid #493477;
+  border-radius: 18px;
+  color: #fff;
+}
+
+.writing-panel h2 {
+  color: #c7a5ff;
+  margin-bottom: 10px;
+}
+
+.writing-panel p {
+  color: #c5bfd4;
+  line-height: 1.6;
+}
+
+#writingPrompt {
+  width: 100%;
+  min-height: 160px;
+  margin: 18px 0;
+  padding: 15px;
+  background: #0d0a19;
+  color: #fff;
+  border: 1px solid #59418a;
+  border-radius: 10px;
+  font: inherit;
+  resize: vertical;
+}
+
+#writingPrompt:focus {
+  outline: 2px solid #9b6cff;
+}
+
+.writing-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.writing-actions button {
+  padding: 12px 20px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+#generateWritingButton {
+  background: #8b5cf6;
+  color: white;
+}
+
+#closeWritingButton {
+  background: #332747;
+  color: white;
+}
+
+#writingStatus {
+  margin: 15px 0;
+  color: #c7a5ff;
+}
+
+#writingResult {
+  display: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #0d0a19;
+  border: 1px solid #493477;
+  border-radius: 10px;
+  padding: 18px;
+  margin-top: 18px;
+  color: #f3efff;
+  line-height: 1.7;
+}
+
+@media (max-width: 600px) {
+  .writing-studio {
+    padding: 12px;
+  }
+
+  .writing-panel {
+    margin: 12px auto;
+    padding: 18px;
+  }
+
+  .writing-actions button {
+    width: 100%;
+  }
+}  
+</style>
 </head>
 
 <body>
@@ -569,14 +674,14 @@
           </button>
         </article>
 
-        <article class="tool-card" data-name="writing">
-          <div class="tool-icon">✍️</div>
-          <h3>AI Writing Assistant</h3>
-          <p>Develop scripts, stories, captions, prompts and creative ideas.</p>
-          <button class="tool-button" onclick="openTool('AI Writing Assistant')">
-            Explore Tool →
-          </button>
-        </article>
+<article class="tool-card" data-name="writing">
+  <div class="tool-icon">✍️</div>
+  <h3>AI Writing Assistant</h3>
+  <p>Develop scripts, stories, captions, prompts and creative ideas.</p>
+  <button class="tool-button" onclick="openWritingStudio()">
+    Start Writing →
+  </button>
+</article>
 
         <article class="tool-card" data-name="editing">
           <div class="tool-icon">✨</div>
@@ -636,6 +741,63 @@
 
 </div>
 
+<!-- NOVA AI WRITING STUDIO -->
+<section id="writingStudio" class="writing-studio">
+  <div class="writing-panel">
+
+    <h2>✍️ NOVA AI WRITING STUDIO</h2>
+    <p>Turn your ideas into powerful content.</p>
+
+    <label for="writingType">Content Type</label>
+    <select id="writingType">   
+      <option value="Video Script">Video Script</option>
+      <option value="Story">Story</option>
+      <option value="Social Media Caption">Social Media Caption</option>      
+      <option value="AI Prompt">AI Prompt</option>
+      <option value="Article">Article</option>
+      <option value="Poem">Poem</option>
+      <option value="Email">Email</option>
+      <option value="Other">Other</option>
+    </select>
+
+    <label for="writingTone">Writing Tone</label>    
+    <select id="writingTone">
+      <option value="Professional">Professional</option>
+      <option value="Creative">Creative</option>
+      <option value="Friendly">Friendly</option>
+      <option value="Persuasive">Persuasive</option>
+      <option value="Educational">Educational</option>
+      <option value="Emotional">Emotional</option>
+    </select>
+
+    <label for="writingPrompt">Describe what you want to create</label>
+    <textarea id="writingPrompt"
+      placeholder="Enter your topic, idea or instructions..."></textarea>
+
+    <div class="writing-actions">
+      <button id="generateWritingButton" type="button"
+        onclick="generateWriting()">Generate Content →</button>
+
+      <button id="closeWritingButton" type="button"
+        onclick="closeWritingStudio()">Close Studio</button>
+    </div>
+
+    <p id="writingStatus"></p>
+
+    <h3>Your Generated Content</h3>
+    <textarea id="writingResult" rows="12"
+      placeholder="Your generated content will appear here..."
+      style="width:100%;"></textarea>
+
+    <div class="writing-actions">
+      <button type="button" onclick="copyWriting()">Copy Content</button>
+      <button type="button" onclick="clearWriting()">Clear Content</button>
+    </div>
+
+  </div>
+</section>
+<!-- END NOVA AI WRITING STUDIO -->  
+  
 <script>
 
   function toggleMenu() {
@@ -689,7 +851,112 @@
     document.getElementById("noResults").style.display =
       visible === 0 ? "block" : "none";
   }
+    // NOVA AI WRITING STUDIO FUNCTIONS
 
+  function openWritingStudio() {
+    document.getElementById("writingStudio").style.display = "block";
+    document.body.style.overflow = "hidden";
+  }
+
+  function closeWritingStudio() {
+    document.getElementById("writingStudio").style.display = "none";
+    document.body.style.overflow = "";
+  }
+
+  async function generateWriting() {
+    const type = document.getElementById("writingType").value;
+    const tone = document.getElementById("writingTone").value;
+    const idea = document.getElementById("writingPrompt").value.trim();
+    const result = document.getElementById("writingResult");
+    const status = document.getElementById("writingStatus");
+    const button = document.getElementById("generateWritingButton");
+
+    if (!idea) {
+      status.textContent = "Please enter your writing idea first.";
+      return;
+    }
+
+    const prompt =
+      "Act as an expert professional AI writer.\n\n" +
+      "CONTENT TYPE: " + type + "\n" +
+      "WRITING TONE: " + tone + "\n" +
+      "TOPIC AND INSTRUCTIONS: " + idea + "\n\n" +
+      "Create original, high-quality, engaging and well-structured content. " +
+      "Follow the user's instructions carefully.";
+
+    if (prompt.length > 4000) {
+      status.textContent = "Your request is too long. Please shorten it.";
+      return;
+    }
+
+    button.disabled = true;
+    button.textContent = "Generating...";
+    status.textContent = "NOVA AI is creating your content...";
+    result.style.display = "block";
+    result.value = "";
+
+    try {
+      const response = await fetch("/.netlify/functions/gemini", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          prompt: prompt
+        })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "AI generation failed.");
+      }
+
+      if (!data.text) {
+        throw new Error("The AI returned an empty response.");
+      }
+
+      result.value = data.text;
+      status.textContent = "Your content has been generated successfully!";
+
+    } catch (error) {
+      console.error("NOVA Writing Studio Error:", error);
+      result.value = "";
+      status.textContent =
+        "Generation failed: " + error.message +
+        ". Please try again.";
+
+    } finally {
+      button.disabled = false;
+      button.textContent = "Generate Content →";
+    }
+  }    
+
+  function copyWriting() {
+    const result = document.getElementById("writingResult");
+
+    if (!result.value.trim()) {
+      document.getElementById("writingStatus").textContent =
+        "There is nothing to copy yet.";
+      return;
+    }
+
+    result.select();
+    result.setSelectionRange(0, result.value.length);
+
+    const copied = document.execCommand("copy");
+
+    document.getElementById("writingStatus").textContent =
+      copied ? "Content copied successfully!" :
+      "Please select and copy the content manually.";
+  }
+
+  function clearWriting() {
+    document.getElementById("writingPrompt").value = "";
+    document.getElementById("writingResult").value = "";
+    document.getElementById("writingResult").style.display = "none";
+    document.getElementById("writingStatus").textContent = "";
+  }    
 </script>
 
 </body>
