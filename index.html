@@ -5,7 +5,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#080b18">
+  <meta name="description" content="NOVA AI STUDIO - Transform your imagination into extraordinary visual experiences.">
   <title>NOVA AI STUDIO | Create Beyond Imagination</title>
+
   <style>
     * {
       box-sizing: border-box;
@@ -13,17 +15,25 @@
       padding: 0;
     }
 
+    html {
+      width: 100%;
+      overflow-x: hidden;
+      scroll-behavior: smooth;
+    }
+
     body {
       background: #080b18;
       color: #ffffff;
       font-family: Arial, sans-serif;
       min-height: 100vh;
+      overflow-x: hidden;
     }
 
     header {
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 15px;
       padding: 22px 7%;
       border-bottom: 1px solid #20243b;
     }
@@ -44,6 +54,7 @@
       border: 1px solid #55418d;
       padding: 8px 12px;
       border-radius: 20px;
+      white-space: nowrap;
     }
 
     main {
@@ -83,6 +94,7 @@
       padding: 25px;
       border-radius: 18px;
       text-align: left;
+      width: 100%;
     }
 
     .studio h2 {
@@ -98,12 +110,19 @@
 
     .mode {
       flex: 1;
+      min-width: 0;
       padding: 13px 8px;
       background: #1c223b;
       border: 1px solid #343a59;
       color: white;
       border-radius: 9px;
       cursor: pointer;
+      font-size: 14px;
+      transition: 0.2s ease;
+    }
+
+    .mode:hover {
+      border-color: #9b75ff;
     }
 
     .mode.active {
@@ -112,15 +131,17 @@
     }
 
     textarea {
+      display: block;
       width: 100%;
-      min-height: 125px;
+      min-height: 140px;
       resize: vertical;
       padding: 16px;
       border-radius: 10px;
       border: 1px solid #343a59;
       background: #090e20;
       color: white;
-      font-size: 15px;
+      font-size: 16px;
+      font-family: inherit;
       outline: none;
     }
 
@@ -128,8 +149,13 @@
       border-color: #9b75ff;
     }
 
+    textarea::placeholder {
+      color: #8990aa;
+    }
+
     .generate {
       width: 100%;
+      min-height: 52px;
       padding: 16px;
       margin-top: 17px;
       background: linear-gradient(90deg, #6847d5, #9b61e9);
@@ -139,12 +165,19 @@
       font-size: 16px;
       font-weight: bold;
       cursor: pointer;
+      transition: 0.2s ease;
+    }
+
+    .generate:hover {
+      opacity: 0.9;
+      transform: translateY(-2px);
     }
 
     .notice {
       color: #8990aa;
       font-size: 12px;
       text-align: center;
+      line-height: 1.6;
       margin-top: 14px;
     }
 
@@ -153,6 +186,7 @@
       margin-top: 18px;
       text-align: center;
       font-size: 14px;
+      line-height: 1.6;
     }
 
     footer {
@@ -160,13 +194,123 @@
       color: #737b95;
       padding: 35px 15px;
       font-size: 12px;
+      line-height: 1.7;
     }
 
+    /* TABLET RESPONSIVENESS */
+    @media (max-width: 768px) {
+      header {
+        padding: 20px 5%;
+      }
+
+      main {
+        width: 92%;
+        margin: 55px auto;
+      }
+
+      h1 {
+        font-size: clamp(36px, 7vw, 54px);
+      }
+
+      .studio {
+        padding: 22px;
+      }
+    }
+
+    /* MOBILE RESPONSIVENESS */
     @media (max-width: 500px) {
-      header { padding: 18px 5%; }
-      main { margin: 55px auto; }
-      .studio { padding: 17px; }
-      .modes { flex-direction: column; }
+      header {
+        padding: 17px 5%;
+        gap: 10px;
+      }
+
+      .logo {
+        font-size: clamp(14px, 4vw, 18px);
+        letter-spacing: 0;
+      }
+
+      .status {
+        font-size: 10px;
+        padding: 7px 9px;
+      }
+
+      main {
+        width: 92%;
+        margin: 45px auto;
+      }
+
+      .tag {
+        font-size: 10px;
+        letter-spacing: 2px;
+      }
+
+      h1 {
+        font-size: clamp(34px, 9vw, 46px);
+        line-height: 1.12;
+      }
+
+      .intro {
+        font-size: 14px;
+        line-height: 1.7;
+      }
+
+      .studio {
+        padding: 17px;
+        border-radius: 14px;
+      }
+
+      .studio h2 {
+        font-size: 18px;
+      }
+
+      .modes {
+        flex-direction: column;
+      }
+
+      .mode {
+        min-height: 48px;
+      }
+
+      textarea {
+        min-height: 140px;
+      }
+
+      .generate {
+        min-height: 50px;
+        font-size: 15px;
+      }
+
+      footer {
+        padding: 28px 15px;
+      }
+    }
+
+    /* SMALL PHONE SCREENS */
+    @media (max-width: 360px) {
+      header {
+        padding: 15px 4%;
+      }
+
+      .logo {
+        font-size: 13px;
+      }
+
+      .status {
+        font-size: 9px;
+        padding: 6px 7px;
+      }
+
+      main {
+        width: 94%;
+      }
+
+      .studio {
+        padding: 13px;
+      }
+
+      h1 {
+        font-size: 34px;
+      }
     }
   </style>
 </head>
@@ -193,10 +337,14 @@
 
       <div class="modes">
         <button class="mode active" id="textMode"
-          onclick="setMode('text')">Text to Video</button>
+          onclick="setMode('text')">
+          Text to Video
+        </button>
 
         <button class="mode" id="imageMode"
-          onclick="setMode('image')">Image to Video</button>
+          onclick="setMode('image')">
+          Image to Video
+        </button>
       </div>
 
       <textarea id="prompt"
@@ -210,7 +358,7 @@
         Early prototype. AI video generation is not connected yet.
       </p>
 
-      <p id="message"></p>
+      <p id="message" aria-live="polite"></p>
     </section>
   </main>
 
