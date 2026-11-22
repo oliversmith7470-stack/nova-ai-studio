@@ -1,315 +1,431 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#080b18">
-  <meta name="description" content="NOVA AI STUDIO - Transform your imagination into extraordinary visual experiences.">
-  <title>NOVA AI STUDIO | Create Beyond Imagination</title>
+  <meta name="description" content="NOVA AI STUDIO - Your all-in-one AI creative platform.">
+  <title>NOVA AI STUDIO | AI Creative Platform</title>
 
   <style>
     * {
-      box-sizing: border-box;
       margin: 0;
       padding: 0;
+      box-sizing: border-box;
     }
 
-    html {
-      width: 100%;
-      overflow-x: hidden;
-      scroll-behavior: smooth;
+    :root {
+      --bg: #080b18;
+      --panel: #11162a;
+      --panel2: #171d34;
+      --border: #252c46;
+      --purple: #9875ff;
+      --text: #ffffff;
+      --muted: #929bb5;
     }
 
     body {
-      background: #080b18;
-      color: #ffffff;
+      background: var(--bg);
+      color: var(--text);
       font-family: Arial, sans-serif;
       min-height: 100vh;
       overflow-x: hidden;
     }
 
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 15px;
-      padding: 22px 7%;
-      border-bottom: 1px solid #20243b;
+    button, input {
+      font: inherit;
     }
 
-    .logo {
-      font-size: 20px;
+    button {
+      cursor: pointer;
+    }
+
+    .app {
+      display: flex;
+      min-height: 100vh;
+    }
+
+    /* SIDEBAR */
+
+    .sidebar {
+      width: 250px;
+      flex-shrink: 0;
+      background: #0d1224;
+      border-right: 1px solid var(--border);
+      padding: 26px 17px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .brand {
+      font-size: 21px;
       font-weight: 800;
       letter-spacing: 1px;
+      padding: 0 10px 35px;
     }
 
-    .logo span {
-      color: #9b75ff;
+    .brand span {
+      color: var(--purple);
     }
 
-    .status {
-      color: #b8a4ff;
-      font-size: 12px;
-      border: 1px solid #55418d;
-      padding: 8px 12px;
-      border-radius: 20px;
-      white-space: nowrap;
+    .nav-label {
+      color: #707a98;
+      font-size: 10px;
+      font-weight: bold;
+      letter-spacing: 2px;
+      padding: 12px 12px;
     }
 
-    main {
-      width: 90%;
-      max-width: 900px;
-      margin: 75px auto;
-      text-align: center;
-    }
-
-    .tag {
-      color: #ad91ff;
-      font-size: 12px;
-      letter-spacing: 3px;
-      margin-bottom: 20px;
-    }
-
-    h1 {
-      font-size: clamp(38px, 8vw, 68px);
-      line-height: 1.08;
-      margin-bottom: 20px;
-    }
-
-    h1 span {
-      color: #a58aff;
-    }
-
-    .intro {
-      color: #a8adc4;
-      line-height: 1.7;
-      max-width: 580px;
-      margin: 0 auto 35px;
-    }
-
-    .studio {
-      background: #11162a;
-      border: 1px solid #292e49;
-      padding: 25px;
-      border-radius: 18px;
-      text-align: left;
-      width: 100%;
-    }
-
-    .studio h2 {
-      font-size: 20px;
-      margin-bottom: 20px;
-    }
-
-    .modes {
+    .nav-item {
       display: flex;
-      gap: 10px;
-      margin-bottom: 18px;
+      align-items: center;
+      gap: 12px;
+      width: 100%;
+      padding: 13px 12px;
+      margin-bottom: 5px;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      color: #aeb6cc;
+      background: transparent;
+      text-align: left;
+      font-size: 14px;
     }
 
-    .mode {
+    .nav-item:hover,
+    .nav-item.active {
+      background: #211b3e;
+      color: white;
+      border-color: #483577;
+    }
+
+    .nav-icon {
+      font-size: 18px;
+      width: 23px;
+    }
+
+    .sidebar-bottom {
+      margin-top: auto;
+      padding: 15px 10px 0;
+      border-top: 1px solid var(--border);
+    }
+
+    .sidebar-bottom p {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    /* MAIN AREA */
+
+    .main {
       flex: 1;
       min-width: 0;
-      padding: 13px 8px;
-      background: #1c223b;
-      border: 1px solid #343a59;
+      padding: 30px 4%;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 15px;
+      margin-bottom: 38px;
+    }
+
+    .menu-btn {
+      display: none;
+      background: var(--panel2);
+      border: 1px solid var(--border);
       color: white;
-      border-radius: 9px;
-      cursor: pointer;
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 20px;
+    }
+
+    .top-title {
+      color: #aab2c8;
       font-size: 14px;
-      transition: 0.2s ease;
     }
 
-    .mode:hover {
-      border-color: #9b75ff;
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
     }
 
-    .mode.active {
-      background: #6545c5;
-      border-color: #9b75ff;
+    .prototype {
+      background: #211b3e;
+      color: #c3afff;
+      border: 1px solid #483577;
+      border-radius: 20px;
+      padding: 8px 13px;
+      font-size: 11px;
     }
 
-    textarea {
-      display: block;
+    /* WELCOME SECTION */
+
+    .welcome {
+      background:
+        radial-gradient(circle at 90% 20%, #50319b55, transparent 40%),
+        linear-gradient(120deg, #17152f, #11162a);
+      border: 1px solid #373057;
+      border-radius: 18px;
+      padding: 36px;
+      margin-bottom: 32px;
+    }
+
+    .welcome-label {
+      color: #b69bff;
+      font-size: 11px;
+      letter-spacing: 2px;
+      margin-bottom: 15px;
+    }
+
+    .welcome h1 {
+      font-size: clamp(27px, 4vw, 43px);
+      line-height: 1.2;
+      margin-bottom: 13px;
+    }
+
+    .welcome h1 span {
+      color: #ae91ff;
+    }
+
+    .welcome p {
+      color: #aab2c8;
+      line-height: 1.7;
+      max-width: 540px;
+      font-size: 14px;
+    }
+
+    /* SEARCH */
+
+    .search {
       width: 100%;
-      min-height: 140px;
-      resize: vertical;
-      padding: 16px;
-      border-radius: 10px;
-      border: 1px solid #343a59;
-      background: #090e20;
+      max-width: 460px;
+      margin-top: 23px;
+      padding: 14px 16px;
+      border-radius: 9px;
+      border: 1px solid #3b365b;
+      background: #0b1021;
       color: white;
-      font-size: 16px;
-      font-family: inherit;
       outline: none;
     }
 
-    textarea:focus {
-      border-color: #9b75ff;
+    .search:focus {
+      border-color: var(--purple);
     }
 
-    textarea::placeholder {
-      color: #8990aa;
+    /* SECTIONS */
+
+    .section-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 18px;
     }
 
-    .generate {
-      width: 100%;
-      min-height: 52px;
-      padding: 16px;
-      margin-top: 17px;
-      background: linear-gradient(90deg, #6847d5, #9b61e9);
-      color: white;
-      border: none;
-      border-radius: 10px;
-      font-size: 16px;
-      font-weight: bold;
-      cursor: pointer;
+    .section-heading h2 {
+      font-size: 19px;
+    }
+
+    .section-heading p {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    /* TOOL CARDS */
+
+    .tools-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .tool-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      padding: 22px;
+      min-width: 0;
       transition: 0.2s ease;
     }
 
-    .generate:hover {
-      opacity: 0.9;
-      transform: translateY(-2px);
+    .tool-card:hover {
+      border-color: #8264d5;
+      transform: translateY(-3px);
     }
 
-    .notice {
-      color: #8990aa;
+    .tool-icon {
+      width: 47px;
+      height: 47px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 12px;
+      background: #29204b;
+      font-size: 24px;
+      margin-bottom: 17px;
+    }
+
+    .tool-card h3 {
+      font-size: 16px;
+      margin-bottom: 9px;
+    }
+
+    .tool-card p {
+      color: var(--muted);
       font-size: 12px;
-      text-align: center;
-      line-height: 1.6;
-      margin-top: 14px;
+      line-height: 1.7;
+      min-height: 40px;
+      margin-bottom: 17px;
     }
 
-    #message {
-      color: #c2afff;
-      margin-top: 18px;
+    .tool-button {
+      width: 100%;
+      padding: 11px;
+      background: #29204b;
+      color: #c8b5ff;
+      border: 1px solid #514080;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: bold;
+    }
+
+    .tool-button:hover {
+      background: #49358a;
+      color: white;
+    }
+
+    /* CREATIONS */
+
+    .creations {
+      margin-top: 40px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      padding: 24px;
+    }
+
+    .empty {
       text-align: center;
-      font-size: 14px;
+      padding: 32px 10px;
+    }
+
+    .empty-icon {
+      font-size: 36px;
+      margin-bottom: 14px;
+    }
+
+    .empty h3 {
+      font-size: 16px;
+      margin-bottom: 9px;
+    }
+
+    .empty p {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    #notice {
+      display: none;
+      background: #211b3e;
+      border: 1px solid #483577;
+      color: #d1c1ff;
+      padding: 15px;
+      border-radius: 9px;
+      margin-top: 20px;
+      font-size: 13px;
       line-height: 1.6;
     }
 
     footer {
-      text-align: center;
       color: #737b95;
-      padding: 35px 15px;
-      font-size: 12px;
-      line-height: 1.7;
+      text-align: center;
+      font-size: 11px;
+      padding: 35px 10px 15px;
     }
 
-    /* TABLET RESPONSIVENESS */
-    @media (max-width: 768px) {
-      header {
-        padding: 20px 5%;
+    /* TABLET */
+
+    @media (max-width: 1000px) {
+      .sidebar {
+        width: 215px;
       }
 
-      main {
-        width: 92%;
-        margin: 55px auto;
-      }
-
-      h1 {
-        font-size: clamp(36px, 7vw, 54px);
-      }
-
-      .studio {
-        padding: 22px;
+      .tools-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
 
-    /* MOBILE RESPONSIVENESS */
-    @media (max-width: 500px) {
-      header {
-        padding: 17px 5%;
-        gap: 10px;
+    /* MOBILE */
+
+    @media (max-width: 650px) {
+      .sidebar {
+        position: fixed;
+        top: 0;
+        bottom: 0;
+        left: -270px;
+        width: 250px;
+        z-index: 10;
+        transition: left 0.25s ease;
       }
 
-      .logo {
-        font-size: clamp(14px, 4vw, 18px);
-        letter-spacing: 0;
+      .sidebar.open {
+        left: 0;
       }
 
-      .status {
-        font-size: 10px;
+      .menu-btn {
+        display: block;
+      }
+
+      .main {
+        width: 100%;
+        padding: 20px 4%;
+      }
+
+      .topbar {
+        margin-bottom: 24px;
+      }
+
+      .top-title {
+        font-size: 12px;
+      }
+
+      .welcome {
+        padding: 24px 19px;
+      }
+
+      .welcome h1 {
+        font-size: 30px;
+      }
+
+      .tools-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .tool-card {
+        padding: 19px;
+      }
+
+      .creations {
+        padding: 17px;
+      }
+    }
+
+    @media (max-width: 360px) {
+      .prototype {
+        font-size: 9px;
         padding: 7px 9px;
       }
 
-      main {
-        width: 92%;
-        margin: 45px auto;
+      .welcome h1 {
+        font-size: 26px;
       }
 
-      .tag {
-        font-size: 10px;
-        letter-spacing: 2px;
-      }
-
-      h1 {
-        font-size: clamp(34px, 9vw, 46px);
-        line-height: 1.12;
-      }
-
-      .intro {
-        font-size: 14px;
-        line-height: 1.7;
-      }
-
-      .studio {
-        padding: 17px;
-        border-radius: 14px;
-      }
-
-      .studio h2 {
-        font-size: 18px;
-      }
-
-      .modes {
-        flex-direction: column;
-      }
-
-      .mode {
-        min-height: 48px;
-      }
-
-      textarea {
-        min-height: 140px;
-      }
-
-      .generate {
-        min-height: 50px;
-        font-size: 15px;
-      }
-
-      footer {
-        padding: 28px 15px;
-      }
-    }
-
-    /* SMALL PHONE SCREENS */
-    @media (max-width: 360px) {
-      header {
-        padding: 15px 4%;
-      }
-
-      .logo {
-        font-size: 13px;
-      }
-
-      .status {
-        font-size: 9px;
-        padding: 6px 7px;
-      }
-
-      main {
-        width: 94%;
-      }
-
-      .studio {
-        padding: 13px;
-      }
-
-      h1 {
-        font-size: 34px;
+      .section-heading h2 {
+        font-size: 17px;
       }
     }
   </style>
@@ -317,88 +433,264 @@
 
 <body>
 
-  <header>
-    <div class="logo">NOVA <span>AI STUDIO</span></div>
-    <div class="status">● Prototype</div>
-  </header>
+<div class="app">
 
-  <main>
-    <p class="tag">THE FUTURE OF VIDEO CREATION</p>
+  <!-- SIDEBAR -->
 
-    <h1>Create Beyond <span>Imagination.</span></h1>
+  <aside class="sidebar" id="sidebar">
 
-    <p class="intro">
-      Transform your ideas into extraordinary visual experiences.
-      Welcome to the beginning of a new creative era.
-    </p>
+    <div class="brand">NOVA <span>AI STUDIO</span></div>
 
-    <section class="studio">
-      <h2>AI Video Creation Studio</h2>
+    <p class="nav-label">WORKSPACE</p>
 
-      <div class="modes">
-        <button class="mode active" id="textMode"
-          onclick="setMode('text')">
-          Text to Video
+    <button class="nav-item active" onclick="showNotice('Dashboard')">
+      <span class="nav-icon">⌂</span> Dashboard
+    </button>
+
+    <p class="nav-label">AI CREATION TOOLS</p>
+
+    <button class="nav-item" onclick="openTool('AI Video Generator')">
+      <span class="nav-icon">▶</span> AI Video
+    </button>
+
+    <button class="nav-item" onclick="openTool('AI Image Generator')">
+      <span class="nav-icon">▧</span> AI Images
+    </button>
+
+    <button class="nav-item" onclick="openTool('AI Voice Studio')">
+      <span class="nav-icon">♫</span> AI Voice
+    </button>
+
+    <button class="nav-item" onclick="openTool('AI Writing Assistant')">
+      <span class="nav-icon">✎</span> AI Writing
+    </button>
+
+    <button class="nav-item" onclick="openTool('AI Editing Tools')">
+      <span class="nav-icon">✧</span> AI Editing
+    </button>
+
+    <p class="nav-label">LIBRARY</p>
+
+    <button class="nav-item" onclick="showNotice('My Creations')">
+      <span class="nav-icon">▣</span> My Creations
+    </button>
+
+    <button class="nav-item" onclick="showNotice('Settings')">
+      <span class="nav-icon">⚙</span> Settings
+    </button>
+
+    <div class="sidebar-bottom">
+      <p>NOVA AI STUDIO</p>
+      <p>AI POWERED. CREATIVITY UNLIMITED.</p>
+      <p>Version 2.1 Prototype</p>
+    </div>
+
+  </aside>
+
+  <!-- MAIN CONTENT -->
+
+  <main class="main">
+
+    <div class="topbar">
+
+      <div style="display:flex;align-items:center;gap:13px;">
+        <button class="menu-btn" onclick="toggleMenu()" aria-label="Open navigation">
+          ☰
         </button>
-
-        <button class="mode" id="imageMode"
-          onclick="setMode('image')">
-          Image to Video
-        </button>
+        <p class="top-title">Creative Workspace / Dashboard</p>
       </div>
 
-      <textarea id="prompt"
-        placeholder="Describe the video you want to create..."></textarea>
+      <div class="top-actions">
+        <span class="prototype">● Prototype</span>
+      </div>
 
-      <button class="generate" onclick="generateDemo()">
-        Start Creating
-      </button>
+    </div>
 
-      <p class="notice">
-        Early prototype. AI video generation is not connected yet.
+    <!-- WELCOME -->
+
+    <section class="welcome">
+
+      <p class="welcome-label">WELCOME TO YOUR CREATIVE WORLD</p>
+
+      <h1>Create Beyond <span>Imagination.</span></h1>
+
+      <p>
+        Your creative journey starts here.
+        Explore powerful AI tools for videos, images,
+        voiceovers, writing and more.
       </p>
 
-      <p id="message" aria-live="polite"></p>
+      <input
+        type="search"
+        class="search"
+        id="search"
+        placeholder="Search AI creative tools..."
+        aria-label="Search creative tools"
+        oninput="filterTools()"
+      >
+
     </section>
+
+    <!-- TOOLS -->
+
+    <section>
+
+      <div class="section-heading">
+        <h2>Explore AI Tools</h2>
+        <p>Creative possibilities await</p>
+      </div>
+
+      <div class="tools-grid" id="toolsGrid">
+
+        <article class="tool-card" data-name="video">
+          <div class="tool-icon">🎬</div>
+          <h3>AI Video Generator</h3>
+          <p>Transform text prompts and images into cinematic video experiences.</p>
+          <button class="tool-button" onclick="openTool('AI Video Generator')">
+            Explore Tool →
+          </button>
+        </article>
+
+        <article class="tool-card" data-name="image">
+          <div class="tool-icon">🎨</div>
+          <h3>AI Image Generator</h3>
+          <p>Create beautiful digital artwork, realistic images and designs.</p>
+          <button class="tool-button" onclick="openTool('AI Image Generator')">
+            Explore Tool →
+          </button>
+        </article>
+
+        <article class="tool-card" data-name="voice">
+          <div class="tool-icon">🎙️</div>
+          <h3>AI Voice Studio</h3>
+          <p>Create voiceovers, narration and speech from written scripts.</p>
+          <button class="tool-button" onclick="openTool('AI Voice Studio')">
+            Explore Tool →
+          </button>
+        </article>
+
+        <article class="tool-card" data-name="writing">
+          <div class="tool-icon">✍️</div>
+          <h3>AI Writing Assistant</h3>
+          <p>Develop scripts, stories, captions, prompts and creative ideas.</p>
+          <button class="tool-button" onclick="openTool('AI Writing Assistant')">
+            Explore Tool →
+          </button>
+        </article>
+
+        <article class="tool-card" data-name="editing">
+          <div class="tool-icon">✨</div>
+          <h3>AI Editing Studio</h3>
+          <p>Discover tools for improving and enhancing creative projects.</p>
+          <button class="tool-button" onclick="openTool('AI Editing Tools')">
+            Explore Tool →
+          </button>
+        </article>
+
+        <article class="tool-card" data-name="assistant">
+          <div class="tool-icon">🤖</div>
+          <h3>AI Creative Assistant</h3>
+          <p>Get assistance with brainstorming, planning and creative workflows.</p>
+          <button class="tool-button" onclick="openTool('AI Creative Assistant')">
+            Explore Tool →
+          </button>
+        </article>
+
+      </div>
+
+      <p id="noResults" style="display:none;color:#929bb5;padding:20px 0;font-size:13px;">
+        No matching tools found.
+      </p>
+
+    </section>
+
+    <!-- NOTICE -->
+
+    <div id="notice" role="status" aria-live="polite"></div>
+
+    <!-- MY CREATIONS -->
+
+    <section class="creations">
+
+      <div class="section-heading">
+        <h2>My Creations</h2>
+        <p>Recent projects</p>
+      </div>
+
+      <div class="empty">
+        <div class="empty-icon">📂</div>
+        <h3>Your creative library is waiting</h3>
+        <p>
+          Your generated videos, images and other projects
+          will appear here when project storage is connected.
+        </p>
+      </div>
+
+    </section>
+
+    <footer>
+      © 2026 NOVA AI STUDIO. Built for the future of creativity.
+    </footer>
+
   </main>
 
-  <footer>
-    © 2026 NOVA AI STUDIO. Built for the future of creativity.
-  </footer>
+</div>
 
-  <script>
-    let currentMode = "text";
+<script>
 
-    function setMode(mode) {
-      currentMode = mode;
+  function toggleMenu() {
+    document.getElementById("sidebar")
+      .classList.toggle("open");
+  }
 
-      document.getElementById("textMode")
-        .classList.toggle("active", mode === "text");
+  function showNotice(section) {
+    const notice = document.getElementById("notice");
 
-      document.getElementById("imageMode")
-        .classList.toggle("active", mode === "image");
+    notice.style.display = "block";
+    notice.textContent =
+      section + " is part of the NOVA AI STUDIO development roadmap.";
 
-      document.getElementById("prompt").placeholder =
-        mode === "text"
-        ? "Describe the video you want to create..."
-        : "Image upload functionality will be added in the next version.";
+    document.getElementById("sidebar")
+      .classList.remove("open");
+  }
 
-      document.getElementById("message").textContent = "";
-    }
+  function openTool(tool) {
+    const notice = document.getElementById("notice");
 
-    function generateDemo() {
-      const prompt = document.getElementById("prompt").value.trim();
+    notice.style.display = "block";
+    notice.textContent =
+      tool + " is being prepared for integration. AI generation is not connected yet.";
 
-      if (!prompt) {
-        document.getElementById("message").textContent =
-          "Please enter a creative idea first.";
-        return;
-      }
+    document.getElementById("sidebar")
+      .classList.remove("open");
 
-      document.getElementById("message").textContent =
-        "Your idea has been received! Real AI generation is coming in a future update.";
-    }
-  </script>
+    notice.scrollIntoView({
+      behavior: "smooth",
+      block: "center"
+    });
+  }
+
+  function filterTools() {
+    const query = document.getElementById("search")
+      .value.toLowerCase().trim();
+
+    const cards = document.querySelectorAll(".tool-card");
+    let visible = 0;
+
+    cards.forEach(card => {
+      const matches =
+        card.textContent.toLowerCase().includes(query);
+
+      card.style.display = matches ? "" : "none";
+
+      if (matches) visible++;
+    });
+
+    document.getElementById("noResults").style.display =
+      visible === 0 ? "block" : "none";
+  }
+
+</script>
 
 </body>
 </html>
