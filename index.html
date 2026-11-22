@@ -1,0 +1,256 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#080b18">
+  <title>NOVA AI STUDIO | Create Beyond Imagination</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: #080b18;
+      color: #ffffff;
+      font-family: Arial, sans-serif;
+      min-height: 100vh;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 22px 7%;
+      border-bottom: 1px solid #20243b;
+    }
+
+    .logo {
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: 1px;
+    }
+
+    .logo span {
+      color: #9b75ff;
+    }
+
+    .status {
+      color: #b8a4ff;
+      font-size: 12px;
+      border: 1px solid #55418d;
+      padding: 8px 12px;
+      border-radius: 20px;
+    }
+
+    main {
+      width: 90%;
+      max-width: 900px;
+      margin: 75px auto;
+      text-align: center;
+    }
+
+    .tag {
+      color: #ad91ff;
+      font-size: 12px;
+      letter-spacing: 3px;
+      margin-bottom: 20px;
+    }
+
+    h1 {
+      font-size: clamp(38px, 8vw, 68px);
+      line-height: 1.08;
+      margin-bottom: 20px;
+    }
+
+    h1 span {
+      color: #a58aff;
+    }
+
+    .intro {
+      color: #a8adc4;
+      line-height: 1.7;
+      max-width: 580px;
+      margin: 0 auto 35px;
+    }
+
+    .studio {
+      background: #11162a;
+      border: 1px solid #292e49;
+      padding: 25px;
+      border-radius: 18px;
+      text-align: left;
+    }
+
+    .studio h2 {
+      font-size: 20px;
+      margin-bottom: 20px;
+    }
+
+    .modes {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+
+    .mode {
+      flex: 1;
+      padding: 13px 8px;
+      background: #1c223b;
+      border: 1px solid #343a59;
+      color: white;
+      border-radius: 9px;
+      cursor: pointer;
+    }
+
+    .mode.active {
+      background: #6545c5;
+      border-color: #9b75ff;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 125px;
+      resize: vertical;
+      padding: 16px;
+      border-radius: 10px;
+      border: 1px solid #343a59;
+      background: #090e20;
+      color: white;
+      font-size: 15px;
+      outline: none;
+    }
+
+    textarea:focus {
+      border-color: #9b75ff;
+    }
+
+    .generate {
+      width: 100%;
+      padding: 16px;
+      margin-top: 17px;
+      background: linear-gradient(90deg, #6847d5, #9b61e9);
+      color: white;
+      border: none;
+      border-radius: 10px;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    .notice {
+      color: #8990aa;
+      font-size: 12px;
+      text-align: center;
+      margin-top: 14px;
+    }
+
+    #message {
+      color: #c2afff;
+      margin-top: 18px;
+      text-align: center;
+      font-size: 14px;
+    }
+
+    footer {
+      text-align: center;
+      color: #737b95;
+      padding: 35px 15px;
+      font-size: 12px;
+    }
+
+    @media (max-width: 500px) {
+      header { padding: 18px 5%; }
+      main { margin: 55px auto; }
+      .studio { padding: 17px; }
+      .modes { flex-direction: column; }
+    }
+  </style>
+</head>
+
+<body>
+
+  <header>
+    <div class="logo">NOVA <span>AI STUDIO</span></div>
+    <div class="status">● Prototype</div>
+  </header>
+
+  <main>
+    <p class="tag">THE FUTURE OF VIDEO CREATION</p>
+
+    <h1>Create Beyond <span>Imagination.</span></h1>
+
+    <p class="intro">
+      Transform your ideas into extraordinary visual experiences.
+      Welcome to the beginning of a new creative era.
+    </p>
+
+    <section class="studio">
+      <h2>AI Video Creation Studio</h2>
+
+      <div class="modes">
+        <button class="mode active" id="textMode"
+          onclick="setMode('text')">Text to Video</button>
+
+        <button class="mode" id="imageMode"
+          onclick="setMode('image')">Image to Video</button>
+      </div>
+
+      <textarea id="prompt"
+        placeholder="Describe the video you want to create..."></textarea>
+
+      <button class="generate" onclick="generateDemo()">
+        Start Creating
+      </button>
+
+      <p class="notice">
+        Early prototype. AI video generation is not connected yet.
+      </p>
+
+      <p id="message"></p>
+    </section>
+  </main>
+
+  <footer>
+    © 2026 NOVA AI STUDIO. Built for the future of creativity.
+  </footer>
+
+  <script>
+    let currentMode = "text";
+
+    function setMode(mode) {
+      currentMode = mode;
+
+      document.getElementById("textMode")
+        .classList.toggle("active", mode === "text");
+
+      document.getElementById("imageMode")
+        .classList.toggle("active", mode === "image");
+
+      document.getElementById("prompt").placeholder =
+        mode === "text"
+        ? "Describe the video you want to create..."
+        : "Image upload functionality will be added in the next version.";
+
+      document.getElementById("message").textContent = "";
+    }
+
+    function generateDemo() {
+      const prompt = document.getElementById("prompt").value.trim();
+
+      if (!prompt) {
+        document.getElementById("message").textContent =
+          "Please enter a creative idea first.";
+        return;
+      }
+
+      document.getElementById("message").textContent =
+        "Your idea has been received! Real AI generation is coming in a future update.";
+    }
+  </script>
+
+</body>
+</html>
