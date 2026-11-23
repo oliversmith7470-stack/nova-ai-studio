@@ -1216,12 +1216,10 @@ function setMotionMode(mode) {
 // ==========================================
 
 function novaExtractSubject(prompt) {
-  const clean = prompt
-    .replace(/\s+/g, " ")
-    .trim();
+  const clean = prompt.replace(/\s+/g, " ").trim();
 
   const match = clean.match(
-    /(?:a|an|the)\s+((?:[\w'-]+\s+){0,4}[\w'-]+)/
+    /^(?:a|an|the)\s+(.+?)(?=\s+(?:emerges?|appears?|rises?|awakens?|comes|steps|flies|spreads?|moves?|walks?|runs?|attacks?|reveals?|opens?|transforms?)\b|[,.;!?]|$)/i
   );
 
   return match ? match[1].trim() : "Main subject";
@@ -1253,7 +1251,14 @@ function novaDetectActions(prompt) {
     },
     {
       name: "Reveal",
-      words: ["reveals", "revealing", "glowing eyes", "opens its eyes", "unveils"]
+      words: [
+        "reveals",
+        "revealing",
+        "glowing eyes",
+        "golden eyes",
+        "opens its eyes",
+        "unveils"
+      ]
     },
     {
       name: "Emotion",
@@ -1354,6 +1359,21 @@ function novaChooseBeats(prompt, count) {
     camera: "Hero shot",
     motion: "Powerful final movement followed by a brief hold"
   });
+
+  // When only two scenes fit, the slice below would discard the reveal
+  // beat. Fold it into the second beat instead, so the reveal survives.
+  if (count === 2 && actions.includes("Reveal")) {
+    const revealIndex = beats.findIndex(
+      beat => beat.title === "The Visual Reveal"
+    );
+    if (revealIndex > 1) {
+      beats[1].title += " and the Reveal";
+      beats[1].direction +=
+        " End the scene with the visual reveal: bring attention to the important visual detail and make the reveal unmistakable.";
+      beats[1].motion += ", then a controlled reveal with a brief visual hold";
+      beats.splice(revealIndex, 1);
+    }
+  }
 
   while (beats.length < count) {
     beats.splice(beats.length - 1, 0, {
