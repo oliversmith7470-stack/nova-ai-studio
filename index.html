@@ -1833,6 +1833,8 @@ function displayMotionVideo(videoUrl) {
 ========================================= */
 
 const NOVA_JOBS_KEY = "nova-motion-jobs";
+const NOVA_PROJECTS_KEY = "nova-motion-projects";
+const NOVA_CHARACTERS_KEY = "nova-motion-characters";
 const NOVA_IMAGE_DB = "nova-motion-assets";
 
 function novaNewId(prefix) {
@@ -1879,6 +1881,215 @@ function novaSaveJob(job) {
 
 function novaGetJob(id) {
   return novaLoadJobs().find(item => item.id === id) || null;
+}
+
+/* ---------- Project and Character Memory Storage (Stage 3.4A) ---------- */
+
+function novaLoadProjects() {
+  try {
+    const raw = localStorage.getItem(NOVA_PROJECTS_KEY);
+    const projects = raw ? JSON.parse(raw) : [];
+    return Array.isArray(projects) ? projects : [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function novaSaveProjects(projects) {
+  try {
+    if (!Array.isArray(projects)) return false;
+    localStorage.setItem(NOVA_PROJECTS_KEY, JSON.stringify(projects));
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function novaGetProject(id) {
+  return novaLoadProjects().find(item => item.id === id) || null;
+}
+
+function novaSaveProject(project) {
+  if (!project || typeof project.id !== "string") return false;
+
+  const projects = novaLoadProjects();
+  const index = projects.findIndex(item => item.id === project.id);
+
+  if (index >= 0) {
+    projects[index] = project;
+  } else {
+    projects.unshift(project);
+  }
+
+  return novaSaveProjects(projects);
+}
+
+function novaCreateProject(name, description = "") {
+  const cleanName = typeof name === "string" ? name.trim() : "";
+
+  if (!cleanName) return null;
+
+  const now = new Date().toISOString();
+
+  const project = {
+    id: novaNewId("nova-project"),
+    name: cleanName,
+    description: typeof description === "string" ? description.trim() : "",
+    createdAt: now,
+    updatedAt: null,
+    characterIds: [],
+    continuity: {
+      worldDescription: "",
+      visualStyle: "",
+      rules: [],
+      notes: []
+    }
+  };
+
+  return novaSaveProject(project) ? project : null;
+}
+
+function novaUpdateProject(id, patch) {
+  if (!id || !patch || typeof patch !== "object" || Array.isArray(patch)) {
+    return null;
+  }
+
+  const project = novaGetProject(id);
+  if (!project) return null;
+
+  const updated = {
+    ...project,
+    ...patch,
+    id: project.id,
+    createdAt: project.createdAt,
+    updatedAt: new Date().toISOString()
+  };
+
+  if (!novaSaveProject(updated)) return null;
+
+  return updated;
+}
+
+/* ---------- Character Memory Storage (Stage 3.4A) ---------- */
+
+function novaLoadCharacters() {
+  try {
+    const raw = localStorage.getItem(NOVA_CHARACTERS_KEY);
+    const characters = raw ? JSON.parse(raw) : [];
+    return Array.isArray(characters) ? characters : [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function novaSaveCharacters(characters) {
+  try {
+    if (!Array.isArray(characters)) return false;
+    localStorage.setItem(NOVA_CHARACTERS_KEY, JSON.stringify(characters));
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function novaGetCharacter(id) {
+  return novaLoadCharacters().find(item => item.id === id) || null;
+}
+
+function novaSaveCharacter(character) {
+  if (!character || typeof character.id !== "string") return false;
+
+  const characters = novaLoadCharacters();
+  const index = characters.findIndex(item => item.id === character.id);
+
+  if (index >= 0) {
+    characters[index] = character;
+  } else {
+    characters.unshift(character);
+  }
+
+  return novaSaveCharacters(characters);
+}
+
+function novaCreateCharacter(projectId, details = {}) {
+  const project = novaGetProject(projectId);
+
+  if (!project || !details || typeof details !== "object") {
+    return null;
+  }
+
+  const now = new Date().toISOString();
+
+  const character = {
+    id: novaNewId("nova-char"),
+    projectId: project.id,
+    name: typeof details.name === "string" ? details.name.trim() : "",
+    description: typeof details.description === "string"
+      ? details.description
+      : "",
+    appearance: {
+      species: details.appearance?.species || "",
+      colors: details.appearance?.colors || "",
+      distinctiveFeatures: details.appearance?.distinctiveFeatures || "",
+      permanentDetails: Array.isArray(details.appearance?.permanentDetails)
+        ? details.appearance.permanentDetails
+        : []
+    },
+    imageAssetId: details.imageAssetId || null,
+    continuityNotes: Array.isArray(details.continuityNotes)
+      ? details.continuityNotes
+      : [],
+    version: 1,
+    createdAt: now,
+    updatedAt: null
+  };
+
+  if (!novaSaveCharacter(character)) return null;
+
+  const characterIds = Array.isArray(project.characterIds)
+    ? project.characterIds
+    : [];
+
+  if (!characterIds.includes(character.id)) {
+    const updatedProject = {
+      ...project,
+      characterIds: [...characterIds, character.id],
+      updatedAt: new Date().toISOString()
+    };
+
+    if (!novaSaveProject(updatedProject)) {
+      const characters = novaLoadCharacters().filter(
+        item => item.id !== character.id
+      );
+      novaSaveCharacters(characters);
+      return null;
+    }
+  }
+
+  return character;
+}
+
+function novaUpdateCharacter(id, patch) {
+  if (!id || !patch || typeof patch !== "object" || Array.isArray(patch)) {
+    return null;
+  }
+
+  const character = novaGetCharacter(id);
+  if (!character) return null;
+
+  const updated = {
+    ...character,
+    ...patch,
+    id: character.id,
+    projectId: character.projectId,
+    createdAt: character.createdAt,
+    updatedAt: new Date().toISOString(),
+    version: (character.version || 1) + 1
+  };
+
+  if (!novaSaveCharacter(updated)) return null;
+
+  return updated;
 }
 
 function novaUpdateJob(id, patch) {
