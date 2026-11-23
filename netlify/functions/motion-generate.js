@@ -263,6 +263,11 @@ exports.handler = async (event) => {
 
     return respond(503, response);
   } catch (error) {
+    console.error(
+      "[NOVA MOTION] Job creation/storage error:",
+      error
+    );
+
     return respond(500, {
       jobId,
       status: "failed",
