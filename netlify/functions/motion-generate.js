@@ -1,12 +1,15 @@
 /*
- * NOVA MOTION — Independent Job Gateway
- * Stage 3.1B
+ * NOVA MOTION — Persistent Job Gateway
+ * Stage 3.2
  *
- * NOVA owns the job ID and production plan.
- * This endpoint validates and acknowledges the job.
+ * NOVA owns the job ID, production plan and job record.
+ * Netlify Blobs provides persistent server-side storage.
  *
- * No external provider calls are made in this stage.
+ * No external video provider is called in this stage.
  */
+
+const crypto = require("crypto");
+const jobStore = require("./lib/nova-job-store");
 
 const ALLOWED_ORIGIN =
   "https://nova-ai-studio-5r8o.netlify.app";
@@ -14,9 +17,13 @@ const ALLOWED_ORIGIN =
 const HEADERS = {
   "Content-Type": "application/json",
   "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers":
+    "Content-Type, X-NOVA-JOB-TOKEN",
   "Access-Control-Allow-Methods": "POST, OPTIONS"
 };
+
+const UNAVAILABLE_MESSAGE =
+  "NOVA received and saved your production job, but the Wan 2.2 provider is not configured yet. No video has been generated.";
 
 function respond(statusCode, data) {
   return {
@@ -26,12 +33,7 @@ function respond(statusCode, data) {
   };
 }
 
-function validJobId(id) {
-  return typeof id === "string" &&
-    /^nova-job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-}
-
-function validatePlan(plan) {
+function validPlan(plan) {
   if (!plan || typeof plan !== "object" ||
       Array.isArray(plan)) {
     return "A valid scene plan is required.";
@@ -49,12 +51,83 @@ function validatePlan(plan) {
     if (
       !scene ||
       typeof scene !== "object" ||
-      typeof scene.generationPrompt !== "string" &&
-      typeof scene.prompt !== "string"
+      (
+        typeof scene.generationPrompt !== "string" &&
+        typeof scene.prompt !== "string"
+      )
     ) {
       return "Scene " + (i + 1) +
         " is missing a valid generation prompt.";
     }
+  }
+
+  return null;
+}
+
+function hashToken(token) {
+  return crypto
+    .createHash("sha256")
+    .update(token)
+    .digest("hex");
+}
+
+function tokenMatches(token, storedHash) {
+  if (
+    typeof token !== "string" ||
+    typeof storedHash !== "string"
+  ) {
+    return false;
+  }
+
+  const suppliedHash = Buffer.from(hashToken(token), "hex");
+  const expectedHash = Buffer.from(storedHash, "hex");
+
+  return suppliedHash.length === expectedHash.length &&
+    crypto.timingSafeEqual(suppliedHash, expectedHash);
+}
+
+function getToken(event) {
+  const headers = event.headers || {};
+
+  return headers["x-nova-job-token"] ||
+    headers["X-NOVA-JOB-TOKEN"] ||
+    "";
+}
+
+function buildScenes(plan) {
+  return plan.scenes.map((scene, index) => ({
+    index,
+    title: scene.title || "Scene " + (index + 1),
+    prompt: scene.generationPrompt || scene.prompt,
+    direction: scene.direction || "",
+    camera: scene.camera || "",
+    motion: scene.motion || "",
+    start: scene.start ?? null,
+    end: scene.end ?? null,
+    duration: scene.duration ?? null,
+    status: "queued",
+    providerJobId: null,
+    videoUrl: null,
+    error: null
+  }));
+}
+
+function validateImage(imageDataUrl) {
+  if (imageDataUrl == null) {
+    return null;
+  }
+
+  if (
+    typeof imageDataUrl !== "string" ||
+    !/^data:image\/(png|jpeg|webp);base64,/i.test(
+      imageDataUrl
+    )
+  ) {
+    return "The reference image format is invalid.";
+  }
+
+  if (imageDataUrl.length > 7 * 1024 * 1024) {
+    return "The reference image exceeds the allowed size.";
   }
 
   return null;
@@ -97,14 +170,14 @@ exports.handler = async (event) => {
 
   const jobId = body.jobId;
 
-  if (!validJobId(jobId)) {
+  if (!jobStore.validJobId(jobId)) {
     return respond(400, {
       status: "failed",
       message: "A valid NOVA job ID is required."
     });
   }
 
-  const planError = validatePlan(body.plan);
+  const planError = validPlan(body.plan);
 
   if (planError) {
     return respond(400, {
@@ -114,47 +187,87 @@ exports.handler = async (event) => {
     });
   }
 
-  /*
-   * Image bytes are not forwarded to a provider in 3.1B.
-   * Validate the optional reference image format and size.
-   */
+  const imageError = validateImage(body.imageDataUrl);
 
-  if (body.imageDataUrl != null) {
-    if (
-      typeof body.imageDataUrl !== "string" ||
-      !/^data:image\/(png|jpeg|webp);base64,/i.test(
-        body.imageDataUrl
-      )
-    ) {
-      return respond(400, {
+  if (imageError) {
+    return respond(
+      imageError.includes("exceeds") ? 413 : 400,
+      {
         jobId,
         status: "failed",
-        message: "The reference image format is invalid."
-      });
-    }
-
-    if (body.imageDataUrl.length > 7 * 1024 * 1024) {
-      return respond(413, {
-        jobId,
-        status: "failed",
-        message: "The reference image exceeds the allowed size."
-      });
-    }
+        message: imageError
+      }
+    );
   }
 
-  /*
-   * Important:
-   * Never accept browser-submitted status,
-   * providerJobId, videoUrl or completion claims.
-   *
-   * No provider has been dispatched.
-   */
+  try {
+    let job = await jobStore.getJob(jobId);
+    let accessToken = null;
 
-  return respond(503, {
-    jobId,
-    status: "unavailable",
-    provider: "wan22-modal",
-    message:
-      "NOVA received and validated your production job, but the Wan 2.2 provider is not configured yet. No video has been generated."
-  });
+    if (!job) {
+      accessToken = crypto.randomBytes(32).toString("hex");
+
+      const now = new Date().toISOString();
+
+      const newJob = {
+        id: jobId,
+        createdAt: now,
+        updatedAt: now,
+        status: "unavailable",
+        provider: "wan22-modal",
+        plan: body.plan,
+        scenes: buildScenes(body.plan),
+        accessTokenHash: hashToken(accessToken),
+        error: UNAVAILABLE_MESSAGE
+      };
+
+      const result = await jobStore.createJob(newJob);
+      job = result.job;
+
+      if (!result.created) {
+        accessToken = null;
+      }
+    }
+
+    if (!job || job.id !== jobId) {
+      return respond(500, {
+        jobId,
+        status: "failed",
+        message: "NOVA could not verify the saved job."
+      });
+    }
+
+    if (accessToken === null) {
+      const suppliedToken = getToken(event);
+
+      if (!tokenMatches(suppliedToken, job.accessTokenHash)) {
+        return respond(401, {
+          jobId,
+          status: "failed",
+          message:
+            "A valid NOVA job access token is required."
+        });
+      }
+    }
+
+    const response = {
+      jobId: job.id,
+      status: job.status,
+      provider: job.provider,
+      message: job.error || UNAVAILABLE_MESSAGE
+    };
+
+    if (accessToken) {
+      response.accessToken = accessToken;
+    }
+
+    return respond(503, response);
+  } catch (error) {
+    return respond(500, {
+      jobId,
+      status: "failed",
+      message:
+        "NOVA could not save the production job. Please try again."
+    });
+  }
 };
