@@ -979,6 +979,69 @@
   }
 }
 
+
+/* Stage 3.5A — Visual Identity Manager (additive; the 3.4D/3.4E
+   styles above are untouched). Stacked, mobile-first. */
+
+.ws-style-lock {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  vertical-align: middle;
+}
+
+.ws-style-fragment {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.ws-scene-control {
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+
+.ws-scene-control:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.ws-scene-control h4 {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.ws-scene-cast {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 0 0 10px;
+}
+
+.ws-cast-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.ws-cast-check input[type="checkbox"] {
+  margin: 0;
+}
+
+@media (max-width: 380px) {
+  .ws-scene-cast {
+    flex-direction: column;
+    gap: 6px;
+  }
+}
+
 </style>
 </head>
 
@@ -1224,6 +1287,7 @@
           </select>
 
           <div id="motionIdentityReview"></div>
+          <div id="motionSceneContinuity"></div>
 
           <button type="button" class="tool-button ws-identity-button" onclick="novaOpenWorkspaceFromMotion()">Manage Projects &amp; Characters →</button>
 
@@ -1732,6 +1796,96 @@ function buildMotionPlan() {
     }
   }
 
+  // Stage 3.5A: the plan cast is the project's characters,
+  // in order. A single-character cast keeps the 3.4E line
+  // (byte-identical, A12); a multi-character cast gets one
+  // identity line per character, built inside the scene loop
+  // with the correct scene number (Correction 1). The style
+  // block carries the plan's styleBasis as a separate line.
+  // The legacy "Visual style: <motionStyle>" line is
+  // untouched (locked tests pin it); full dropdown
+  // replacement is deferred.
+  // Final correction: the block runs whenever a project is
+  // selected — cast validation depends on the CAST itself,
+  // never on the selected-character gate (A7, Section 3.3:
+  // "a plan never builds with an unvalidated cast"). The
+  // identity lines come from the cast, not the selection,
+  // so a plan with no selected character still validates
+  // its cast and still carries its identity lines; a
+  // foreign selected character is ignored for identity
+  // purposes and never enters the cast (validation would
+  // refuse it if the project's list named it). The deleted
+  // selected character stays a NARROW exception — only its
+  // own id is dropped from the cast before validation
+  // (Correction 2); every other cast member is validated
+  // normally, so a plan never builds with an unvalidated
+  // cast.
+  let planCast = [];
+  let planCastContexts = [];
+  let planStyleBasis = null;
+  let styleBlock = "";
+  const selectedCharacterForPlan = novaSelectedCharacterId
+    ? novaGetCharacter(novaSelectedCharacterId)
+    : null;
+  if (novaSelectedProjectId) {
+    const selectedProject = novaGetProject(novaSelectedProjectId);
+    if (selectedProject) {
+      let cast = Array.isArray(selectedProject.characterIds)
+        ? selectedProject.characterIds.slice()
+        : [];
+      // Narrow deleted-selected exception (Correction 2):
+      // drop exactly the deleted selected character's id.
+      // The exception is selected-only — any other ghost or
+      // foreign id still refuses the build.
+      if (novaSelectedCharacterId && !selectedCharacterForPlan) {
+        cast = cast.filter((id) => id !== novaSelectedCharacterId);
+      }
+      const castError = novaValidateCast(selectedProject, cast);
+      if (castError) {
+        alert(castError);
+        return;
+      }
+      planCast = cast;
+      const castCharacters = cast
+        .map((id) => novaGetCharacter(id))
+        .filter(Boolean);
+      if (cast.length === 1) {
+        // Single character: the 3.4E line, byte-identical.
+        const castLines = novaBuildCastLines(
+          selectedProject,
+          castCharacters,
+          null
+        );
+        if (castLines.error) {
+          alert(castLines.error);
+          return;
+        }
+        continuityLine = castLines.lines[0] || "";
+      } else if (cast.length > 1) {
+        // Multi-character: contexts are built once here;
+        // the per-scene lines (with the correct scene
+        // number) are built inside the scene loop.
+        const built = novaBuildCastContexts(
+          selectedProject,
+          castCharacters
+        );
+        if (built.error) {
+          alert(built.error);
+          return;
+        }
+        planCastContexts = built.contexts;
+        continuityLine = "";
+      }
+      planStyleBasis = novaGetProjectVisualStyle(selectedProject);
+      styleBlock =
+        "Visual style: " +
+        novaVisualStyleFragment(
+          planStyleBasis.preset,
+          planStyleBasis.customDirection
+        );
+    }
+  }
+
   let elapsed = 0;
 
   const scenes = beats.map((beat, index) => {
@@ -1753,6 +1907,10 @@ function buildMotionPlan() {
         "Maintain the same subject identity and appearance throughout the sequence."
       ),
       ...(continuityLine ? [continuityLine] : []),
+      ...(planCastContexts.length > 1
+        ? novaCastIdentityLines(planCastContexts, index + 1)
+        : []),
+      ...(styleBlock ? [styleBlock] : []),
       "Environment and visual continuity must remain consistent with previous scenes.",
       "Aspect ratio: " + ratio
     ].join(" ");
@@ -1787,6 +1945,10 @@ novaMotionPlan = {
   duration: duration,
   style: style,
   camera: camera,
+  projectId: novaSelectedProjectId || null,
+  cast: planCast,
+  styleBasis: planStyleBasis,
+  version: 1,
   image: novaMotionImageFile
     ? {
         name: novaMotionImageFile.name,
@@ -1854,6 +2016,10 @@ if (generateButton) {
   // Stage 3.4E: refresh the identity review so continuity
   // warnings reflect the final prompt text.
   novaRenderProductionIdentity();
+
+  // Stage 3.5A: render the per-scene presence + override
+  // controls for the new plan.
+  novaRenderSceneContinuityControls();
 }
 
 
@@ -2218,7 +2384,7 @@ function novaSaveProject(project) {
   return novaSaveProjects(projects);
 }
 
-function novaCreateProject(name, description = "") {
+function novaCreateProject(name, description = "", visualStyle) {
   const cleanName = typeof name === "string" ? name.trim() : "";
 
   if (!cleanName) return null;
@@ -2239,6 +2405,11 @@ function novaCreateProject(name, description = "") {
       notes: []
     }
   };
+
+  // Stage 3.5A: the visual style record. Two-argument calls
+  // (and invalid values) yield the photorealistic-human
+  // default; novaCreateProject itself persists the preset.
+  project.continuity.visualStyle = novaCoerceVisualStyle(visualStyle);
 
   return novaSaveProject(project) ? project : null;
 }
@@ -2327,6 +2498,11 @@ function novaCreateCharacter(projectId, details = {}) {
       distinctiveFeatures: details.appearance?.distinctiveFeatures || "",
       permanentDetails: Array.isArray(details.appearance?.permanentDetails)
         ? details.appearance.permanentDetails
+        : [],
+      wardrobe: details.appearance?.wardrobe || "",
+      hair: details.appearance?.hair || "",
+      accessories: Array.isArray(details.appearance?.accessories)
+        ? details.appearance.accessories
         : []
     },
     imageAssetId: details.imageAssetId || null,
@@ -3699,6 +3875,7 @@ function novaWorkspaceProjectFormHtml() {
     <input class="motion-input" id="wsProjectName" type="text" value="${editing ? novaEscape(editing.name) : ""}" placeholder="Example: Ashfall — Fantasy Film Universe">
     <label class="motion-label" for="wsProjectDescription">Description</label>
     <textarea class="motion-input" id="wsProjectDescription" rows="3" placeholder="What is this project about?">${editing ? novaEscape(editing.description || "") : ""}</textarea>
+    ${editing ? "" : novaStylePickerHtml("photorealistic-human", "", "wsNewStyle", false)}
     <div class="ws-row">
       <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceSaveProject()">Save Project</button>
       <button type="button" class="ws-btn" onclick="novaWorkspaceBackToProjects()">Cancel</button>
@@ -3783,7 +3960,7 @@ function novaWorkspaceProjectDetailHtml() {
     <label class="motion-label" for="wsContinuityWorld">World description</label>
     <textarea class="motion-input" id="wsContinuityWorld" rows="3">${novaEscape(continuity.worldDescription || "")}</textarea>
     <label class="motion-label" for="wsContinuityStyle">Visual style</label>
-    <input class="motion-input" id="wsContinuityStyle" type="text" value="${novaEscape(continuity.visualStyle || "")}">
+    ${novaStyleLegacyInputHtml(continuity.visualStyle)}
     <label class="motion-label" for="wsContinuityRules">Continuity rules (one per line)</label>
     <textarea class="motion-input" id="wsContinuityRules" rows="4">${novaEscape((continuity.rules || []).join("\n"))}</textarea>
     <label class="motion-label" for="wsContinuityNotes">Project notes (one per line)</label>
@@ -3791,6 +3968,10 @@ function novaWorkspaceProjectDetailHtml() {
     <div class="ws-row">
       <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceSaveContinuity()">Save Continuity</button>
     </div>
+  </section>
+
+  <section class="motion-panel">
+    ${novaWorkspaceStyleSectionHtml(project)}
   </section>`;
 }
 
@@ -3829,13 +4010,20 @@ function novaWorkspaceCharacterFormHtml() {
     <input class="motion-input" id="wsCharacterFeatures" type="text" value="${novaEscape(appearance.distinctiveFeatures || "")}" placeholder="Example: Scar on left cheek">
     <label class="motion-label" for="wsCharacterDetails">Permanent details (one per line)</label>
     <textarea class="motion-input" id="wsCharacterDetails" rows="4" placeholder="Details that never change about this character.">${novaEscape(((appearance.permanentDetails) || []).join("\n"))}</textarea>
+    <label class="motion-label" for="wsCharacterWardrobe">Wardrobe</label>
+    <input class="motion-input" id="wsCharacterWardrobe" type="text" value="${novaEscape(appearance.wardrobe || "")}" placeholder="Example: Grey cloak, leather boots">
+    <label class="motion-label" for="wsCharacterHair">Hair</label>
+    <input class="motion-input" id="wsCharacterHair" type="text" value="${novaEscape(appearance.hair || "")}" placeholder="Example: Long black braid">
+    <label class="motion-label" for="wsCharacterAccessories">Accessories (one per line)</label>
+    <textarea class="motion-input" id="wsCharacterAccessories" rows="3" placeholder="Items the character always carries.">${novaEscape(((appearance.accessories) || []).join("\n"))}</textarea>
     <label class="motion-label" for="wsCharacterNotes">Continuity notes (one per line)</label>
     <textarea class="motion-input" id="wsCharacterNotes" rows="4">${novaEscape(((editing && editing.continuityNotes) || []).join("\n"))}</textarea>
-    <label class="motion-label">Reference image</label>
+    <label class="motion-label">Reference image — stored in this browser.</label>
     <div class="ws-thumb" id="wsCharacterImagePreview">${editing && editing.imageAssetId ? "" : "<span class=\"motion-note\">No reference image saved</span>"}</div>
-    <label class="motion-label" for="wsCharacterImage">${editing && editing.imageAssetId ? "Replace reference image (optional — leave empty to keep the current image)" : "Upload reference image (optional)"}</label>
+    <label class="motion-label" for="wsCharacterImage">Identity reference (saved for this character — supplied to the video provider when generation is connected)</label>
     <input class="motion-upload" id="wsCharacterImage" type="file" accept="image/*">
-    <p class="motion-note">Replacing the image only changes this character. Images already recorded in production jobs stay exactly as they were.</p>
+    <p class="motion-note">This image is saved with the character and recorded in production records. It is NOT sent to a video-generation provider yet — face consistency across generated clips is not available in this version.</p>
+    <p class="motion-note">Replacing the image only changes this character. Images already recorded in production jobs stay exactly as they were.${editing && editing.imageAssetId ? " Leave empty to keep the current image." : ""}</p>
     <div class="ws-row">
       <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceSaveCharacter()">Save Character</button>
       <button type="button" class="ws-btn" onclick="novaWorkspaceBackToProject()">Cancel</button>
@@ -3911,7 +4099,13 @@ function novaWorkspaceSaveProject() {
     }
     novaWorkspaceSetStatus("Project saved.");
   } else {
-    const created = novaCreateProject(name, description);
+    const pickedStyle = novaReadStylePicker("wsNewStyle");
+    const styleSelect = document.getElementById("wsNewStylePreset");
+    if (styleSelect && styleSelect.value === "custom" && !pickedStyle) {
+      novaWorkspaceSetStatus("Enter a custom direction for the Custom style.");
+      return;
+    }
+    const created = novaCreateProject(name, description, pickedStyle);
     if (!created) {
       novaWorkspaceSetStatus("That project could not be created.");
       return;
@@ -4093,6 +4287,11 @@ async function novaWorkspaceSaveCharacter() {
   const permanentDetails = novaWorkspaceLines(
     document.getElementById("wsCharacterDetails").value
   );
+  const wardrobe = document.getElementById("wsCharacterWardrobe").value.trim();
+  const hair = document.getElementById("wsCharacterHair").value.trim();
+  const accessories = novaWorkspaceLines(
+    document.getElementById("wsCharacterAccessories").value
+  );
   const continuityNotes = novaWorkspaceLines(
     document.getElementById("wsCharacterNotes").value
   );
@@ -4140,7 +4339,10 @@ async function novaWorkspaceSaveCharacter() {
     species,
     colors,
     distinctiveFeatures,
-    permanentDetails
+    permanentDetails,
+    wardrobe,
+    hair,
+    accessories
   };
 
   if (editing) {
@@ -4283,11 +4485,22 @@ function novaWorkspaceSaveContinuity() {
     return;
   }
 
+  // Stage 3.5A: an empty style input keeps a structured
+  // preset style (the legacy input is read-only for preset
+  // styles); a typed value replaces it with a free-text
+  // style.
+  const styleInput = document.getElementById("wsContinuityStyle").value.trim();
+  const storedStyle = project.continuity ? project.continuity.visualStyle : "";
   const continuity = {
     worldDescription: document
       .getElementById("wsContinuityWorld")
       .value.trim(),
-    visualStyle: document.getElementById("wsContinuityStyle").value.trim(),
+    visualStyle:
+      styleInput === "" &&
+      storedStyle &&
+      typeof storedStyle === "object"
+        ? storedStyle
+        : styleInput,
     rules: novaWorkspaceLines(
       document.getElementById("wsContinuityRules").value
     ),
@@ -4404,6 +4617,11 @@ function novaRenderProductionIdentity() {
       <span class="motion-note">Version ${selected.version || 1}</span>
     </div>
   </div>` + novaContinuityReviewHtml(selected, project);
+  // Stage 3.5A: the reference-image statement (Section 6)
+  // and the Visual Style section (preset, overrides,
+  // warnings).
+  review.innerHTML += `<p class="motion-note">${novaEscape(NOVA_REFERENCE_IMAGE_STRINGS.reviewStatement)}</p>`;
+  review.innerHTML += novaProductionStyleSectionHtml(selected, project);
   if (selected.imageAssetId) {
     novaWorkspaceLoadImageInto("motionIdentityThumb", selected.imageAssetId);
   }
@@ -4465,7 +4683,7 @@ const NOVA_CONTINUITY_COLORS = [
   "black", "white", "red", "blue", "green", "yellow", "orange",
   "purple", "pink", "brown", "grey", "gray", "silver", "gold",
   "golden", "bronze", "copper", "crimson", "azure", "emerald",
-  "scarlet", "violet", "amber", "ivory", "obsidian"
+  "scarlet", "violet", "amber", "ivory", "obsidian", "blonde"
 ];
 
 const NOVA_CONTINUITY_FEATURES = [
@@ -4856,6 +5074,21 @@ function novaCheckContinuityConflicts(context, promptText) {
     });
   }
 
+  // Stage 3.5A: wardrobe / hair / accessories checks (the
+  // same matcher, more input). The `seen` set guards
+  // against double-reporting a key the base checks already
+  // raised.
+  const appearanceWarnings = novaCheckAppearanceConflicts(
+    context,
+    prompt,
+    seen
+  );
+  appearanceWarnings.forEach(warning => {
+    if (seen.has(warning.key)) return;
+    seen.add(warning.key);
+    warnings.push(warning);
+  });
+
   return warnings;
 }
 
@@ -4921,6 +5154,17 @@ function novaContinuitySceneLine(context) {
       "Permanent details: " + character.permanentDetails.join("; ")
     );
   }
+  // Stage 3.5A: wardrobe / hair / accessories (only when
+  // non-empty; the context carries them after enrichment).
+  if (character.wardrobe) {
+    parts.push("Wardrobe: " + character.wardrobe);
+  }
+  if (character.hair) {
+    parts.push("Hair: " + character.hair);
+  }
+  if (character.accessories && character.accessories.length) {
+    parts.push("Accessories: " + character.accessories.join("; "));
+  }
   if (character.continuityNotes.length) {
     parts.push("Character notes: " + character.continuityNotes.join("; "));
   }
@@ -4953,6 +5197,9 @@ function novaContinuityReviewHtml(character, project) {
   }
 
   const context = built.context;
+  // Stage 3.5A: attach wardrobe / hair / accessories so
+  // the appearance checks (Section 5.2) run in this review.
+  novaAttachAppearanceToContext(context, character);
   const promptField = document.getElementById("motionPrompt");
   const promptText = promptField ? promptField.value : "";
   const warnings = novaCheckContinuityConflicts(context, promptText).filter(
@@ -5021,7 +5268,7 @@ function novaContinuityReviewHtml(character, project) {
     html += `<p class="motion-note">No project notes saved yet.</p>`;
   }
 
-  html += `<p class="motion-note">Reference image: ${context.character.imageAssetId ? "saved" : "none saved"}</p>`;
+  html += `<p class="motion-note">Reference image: ${context.character.imageAssetId ? "stored (not yet supplied to the provider)." : "none saved."}</p>`;
 
   if (warnings.length) {
     html += `<p><strong>Possible continuity conflicts</strong> <span class="motion-note">(rule-based checks — review them; warnings never block generation)</span></p>`;
@@ -5036,6 +5283,1642 @@ function novaContinuityReviewHtml(character, project) {
   html += `</div>`;
   return html;
 }
+
+/* =====================================================================
+   NOVA MOTION — Stage 3.5A: Visual Identity Manager
+   ---------------------------------------------------------------------
+   Who the characters are, what they look like, and how the production
+   is rendered. Project-level visual styles (five presets + custom),
+   plan styleBasis with historical precedence, cast identity lines,
+   wardrobe / hair / accessory checks, and reference-image management.
+
+   Design: 35-design.md Revision 3, Part I (Sections 3–10). 3.5B
+   (Production State Manager) is NOT implemented here.
+
+   Rules this section follows:
+   - Deterministic rules only. No AI calls, no new dependencies.
+   - Warnings never block and never rewrite the user's prompt.
+   - Snapshots are immutable; the planner never silently repairs memory.
+   - Reference images are STORED and RECORDED — never SUPPLIED to a
+     provider. No UI text here promises face consistency from a saved
+     image alone (Section 6).
+   - The 3.4E context builder is protected: wardrobe / hair /
+     accessories reach the checker and the scene line through
+     novaAttachAppearanceToContext, which enriches a freshly built
+     context from the stored character record.
+
+   Integration points (see apply-35a.py):
+   - buildMotionPlan() records styleBasis/version/cast/projectId,
+     builds the cast identity line, and appends the style block.
+   - novaContinuitySceneLine() gains wardrobe / hair / accessories.
+   - novaCheckContinuityConflicts() gains the appearance checks.
+   - novaRenderProductionIdentity() appends the style section.
+   - novaCreateProject() gains the optional visualStyle argument.
+   - novaCreateCharacter() stores wardrobe / hair / accessories.
+   - Workspace forms gain the style step + appearance fields.
+   ===================================================================== */
+
+// ---- Visual style presets (Section 4.1, 7.5) --------------------------
+// Fragments are the design's EXACT fixed texts. Distinctive markers
+// are the design's fixed lists; adding a marker word is a design
+// change, not an implementation choice. The shared set belongs to
+// both realistic presets and never warns in either.
+const NOVA_VISUAL_STYLE_PRESETS = {
+  "photorealistic-human": {
+    name: "Photorealistic Human",
+    description: "Lifelike human characters — natural skin, realistic eyes, believable movement.",
+    fragment: "Photorealistic human characters: natural skin texture with visible pores and fine detail, anatomically correct facial proportions, realistic eyes with natural iris detail and catchlights, believable hair with individual strands, physically plausible clothing fabric and drape, natural body movement, subtle lifelike expressions, and the same facial identity in every shot.",
+    distinctiveMarkers: ["live-action", "human drama", "documentary", "real people", "real actors", "everyday life"]
+  },
+  "cinematic-fantasy": {
+    name: "Cinematic Fantasy",
+    description: "Lifelike fantasy — creatures and people with dramatic cinematic lighting.",
+    fragment: "Cinematic photorealistic fantasy: lifelike creatures and people with natural skin, scale and feather texture, realistic eyes and believable movement, dramatic cinematic lighting, and the same face and form for every character in every shot.",
+    distinctiveMarkers: ["fantasy", "magical", "dragons", "mythical", "epic fantasy", "otherworldly", "enchanted"]
+  },
+  "stylised-3d": {
+    name: "Stylised 3D",
+    description: "Stylised 3D animation — clean sculpted forms, expressive faces, vibrant colour.",
+    fragment: "Stylised 3D animation: clean sculpted forms, expressive larger-than-life faces, smooth polished surfaces, vibrant colour, and the same character design in every shot.",
+    distinctiveMarkers: ["3d animation", "pixar-style", "cgi", "cartoon", "claymation"]
+  },
+  "anime": {
+    name: "Anime",
+    description: "Anime — cel-shaded colour, large expressive eyes, dynamic poses.",
+    fragment: "Anime style: cel-shaded colour, large expressive eyes, clean line work, dynamic poses, and the same character design in every shot.",
+    distinctiveMarkers: ["anime", "manga", "japanese animation", "cel-shaded"]
+  },
+  "custom": {
+    name: "Custom Direction",
+    description: "Your own words describe the look.",
+    fragment: null,
+    distinctiveMarkers: []
+  }
+};
+
+const NOVA_VISUAL_STYLE_SHARED_MARKERS = [
+  "realistic", "photorealistic", "cinematic", "lifelike", "natural", "believable"
+];
+
+const NOVA_VISUAL_STYLE_DEFAULT_PRESET = "photorealistic-human";
+
+// Preset keys in definition order (deterministic warning order).
+const NOVA_VISUAL_STYLE_PRESET_KEYS = [
+  "photorealistic-human",
+  "cinematic-fantasy",
+  "stylised-3d",
+  "anime",
+  "custom"
+];
+
+// ---- Reference-image strings (Section 6 — EXACT) ----------------------
+// "Stored" vs "supplied" is the load-bearing distinction: STORED means
+// the image is in this browser's IndexedDB and named in production
+// records; SUPPLIED means it was handed to a generation provider.
+// In 3.5, images are stored and recorded — never supplied.
+const NOVA_REFERENCE_IMAGE_STRINGS = {
+  formLabel: "Identity reference (saved for this character — supplied to the video provider when generation is connected)",
+  reviewStatement: "Reference images are stored with the project. Face consistency at generation time depends on the connected video provider.",
+  formHeader: "Reference image — stored in this browser.",
+  formSubtext: "This image is saved with the character and recorded in production records. It is NOT sent to a video-generation provider yet — face consistency across generated clips is not available in this version.",
+  reviewWithImage: "Reference image: stored (not yet supplied to the provider).",
+  reviewWithoutImage: "Reference image: none saved.",
+  jobView: "Reference image IDs recorded. Images were not supplied to a provider for this job."
+};
+
+// Style-lock consequence text (Section 4.4 — EXACT).
+const NOVA_STYLE_CHANGE_CONSEQUENCES = "Changing the project style changes the visual direction of every scene that does not have its own override. Scene overrides are unaffected. Existing jobs keep the style they were created with. In-progress plans keep the style they were created with until you update them (Section 4.6).";
+
+// Redundant-override refusal (Section 4.2 — EXACT).
+const NOVA_STYLE_REDUNDANT_OVERRIDE = "This scene already uses that style — no override is needed.";
+
+// ---- Style coercion + fragments (Sections 3.1, 4.1, 4.3) --------------
+
+// Coerces a caller-supplied visualStyle value into a stored style
+// record. Anything that is not a valid preset object yields the
+// photorealistic-human default. Never throws.
+function novaCoerceVisualStyle(value) {
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    NOVA_VISUAL_STYLE_PRESETS[value.preset]
+  ) {
+    return {
+      preset: value.preset,
+      customDirection:
+        typeof value.customDirection === "string" ? value.customDirection : ""
+    };
+  }
+  return {
+    preset: NOVA_VISUAL_STYLE_DEFAULT_PRESET,
+    customDirection: ""
+  };
+}
+
+// Read-time coercion ONLY — never writes (Section 4.3). A legacy
+// string coerces to { preset: "custom", customDirection: <verbatim> }:
+// PRESERVATION, not conversion — the string is never mapped to a
+// named preset. A missing/empty/malformed style coerces to the
+// photorealistic-human default. Always returns a fresh object.
+function novaGetProjectVisualStyle(project) {
+  const continuity =
+    project &&
+    project.continuity &&
+    typeof project.continuity === "object" &&
+    !Array.isArray(project.continuity)
+      ? project.continuity
+      : {};
+  const vs = continuity.visualStyle;
+  if (typeof vs === "string") {
+    if (!vs) {
+      return {
+        preset: NOVA_VISUAL_STYLE_DEFAULT_PRESET,
+        customDirection: ""
+      };
+    }
+    return { preset: "custom", customDirection: vs };
+  }
+  if (vs && typeof vs === "object" && !Array.isArray(vs)) {
+    return novaCoerceVisualStyle(vs);
+  }
+  return {
+    preset: NOVA_VISUAL_STYLE_DEFAULT_PRESET,
+    customDirection: ""
+  };
+}
+
+// The fixed fragment for a preset, or the custom text verbatim.
+// An unknown preset coerces to the default fragment (defensive;
+// stored data is never trusted blindly).
+function novaVisualStyleFragment(preset, customDirection) {
+  if (preset === "custom") {
+    return typeof customDirection === "string" ? customDirection : "";
+  }
+  const spec = NOVA_VISUAL_STYLE_PRESETS[preset];
+  if (spec && spec.fragment) return spec.fragment;
+  return NOVA_VISUAL_STYLE_PRESETS[NOVA_VISUAL_STYLE_DEFAULT_PRESET].fragment;
+}
+
+function novaPresetDisplayName(preset) {
+  const spec = NOVA_VISUAL_STYLE_PRESETS[preset];
+  return spec ? spec.name : preset;
+}
+
+// The legacy free-text form of a stored style, for the continuity
+// form's style input: a string stays itself; a custom preset shows
+// its direction; a named preset has no free-text form ("").
+function novaLegacyStyleText(visualStyle) {
+  if (typeof visualStyle === "string") return visualStyle;
+  if (
+    visualStyle &&
+    typeof visualStyle === "object" &&
+    visualStyle.preset === "custom"
+  ) {
+    return typeof visualStyle.customDirection === "string"
+      ? visualStyle.customDirection
+      : "";
+  }
+  return "";
+}
+
+// The continuity form's style input. Legacy string styles keep the
+// editable text input (unchanged behaviour). Structured preset
+// styles get a read-only input: the preset is managed in the Visual
+// Style section, not here — an empty value on save keeps the preset.
+function novaStyleLegacyInputHtml(visualStyle) {
+  if (
+    visualStyle &&
+    typeof visualStyle === "object" &&
+    !Array.isArray(visualStyle) &&
+    NOVA_VISUAL_STYLE_PRESETS[visualStyle.preset]
+  ) {
+    const label =
+      visualStyle.preset === "custom"
+        ? "Custom direction — managed in the Visual Style section"
+        : novaPresetDisplayName(visualStyle.preset) +
+          " (preset — managed in the Visual Style section)";
+    return `<input class="motion-input" id="wsContinuityStyle" type="text" value="" readonly placeholder="${novaEscape(label)}">`;
+  }
+  return `<input class="motion-input" id="wsContinuityStyle" type="text" value="${novaEscape(novaLegacyStyleText(visualStyle))}">`;
+}
+
+// ---- Plan style basis + historical precedence (Sections 3.4, 4.6) -----
+
+// Legacy plans (created before 3.5A, no styleBasis) gain one from
+// the current project style on first planner open. Returns true when
+// it assigned a basis, false when the plan already had one (or no
+// project was given). The assignment COPIES the project style; it
+// never substitutes the default.
+function novaEnsurePlanStyleBasis(plan, project) {
+  if (!plan || plan.styleBasis) return false;
+  if (!project) return false;
+  plan.styleBasis = novaGetProjectVisualStyle(project);
+  return true;
+}
+
+// The effective style for one scene (Section 4.6). Precedence:
+// scene override > plan styleBasis > live project style >
+// new-project default. Always returns a fresh object. Defensive at
+// every level: a string styleBasis coerces to custom verbatim, an
+// unknown preset coerces to the default.
+function novaEffectiveSceneStyle(plan, project, scene) {
+  if (
+    scene &&
+    scene.styleOverride &&
+    typeof scene.styleOverride === "object" &&
+    !Array.isArray(scene.styleOverride)
+  ) {
+    const o = scene.styleOverride;
+    if (NOVA_VISUAL_STYLE_PRESETS[o.preset]) {
+      return {
+        preset: o.preset,
+        customDirection:
+          typeof o.customDirection === "string" ? o.customDirection : ""
+      };
+    }
+  }
+  if (plan && plan.styleBasis) {
+    const b = plan.styleBasis;
+    if (typeof b === "string") {
+      return b
+        ? { preset: "custom", customDirection: b }
+        : {
+            preset: NOVA_VISUAL_STYLE_DEFAULT_PRESET,
+            customDirection: ""
+          };
+    }
+    if (
+      typeof b === "object" &&
+      !Array.isArray(b) &&
+      NOVA_VISUAL_STYLE_PRESETS[b.preset]
+    ) {
+      return {
+        preset: b.preset,
+        customDirection:
+          typeof b.customDirection === "string" ? b.customDirection : ""
+      };
+    }
+  }
+  if (project) return novaGetProjectVisualStyle(project);
+  return {
+    preset: NOVA_VISUAL_STYLE_DEFAULT_PRESET,
+    customDirection: ""
+  };
+}
+
+// Adopting the live project style is explicit (Section 4.6): the
+// review panel asks first (novaAskAdoptProjectStyle), and this
+// function applies it — updates the plan's styleBasis and bumps the
+// plan version, then rebuilds every scene prompt (their style
+// blocks change) and refreshes the review + scene controls.
+// Returns true when it adopted, false when there was nothing to do.
+let novaStyleAdoptConfirm = false;
+
+function novaAskAdoptProjectStyle() {
+  novaStyleAdoptConfirm = true;
+  novaRenderProductionIdentity();
+}
+
+function novaCancelAdoptProjectStyle() {
+  novaStyleAdoptConfirm = false;
+  novaRenderProductionIdentity();
+}
+
+function novaAdoptProjectStyle() {
+  novaStyleAdoptConfirm = false;
+  if (!novaMotionPlan || !novaMotionPlan.projectId) return false;
+  const project = novaGetProject(novaMotionPlan.projectId);
+  if (!project) return false;
+  novaMotionPlan.styleBasis = novaGetProjectVisualStyle(project);
+  novaMotionPlan.version = (novaMotionPlan.version || 1) + 1;
+  if (Array.isArray(novaMotionPlan.scenes)) {
+    novaMotionPlan.scenes.forEach((scene, index) => {
+      novaRebuildScenePrompt(index);
+    });
+  }
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+  return true;
+}
+
+// ---- Cast validation + per-scene presence (Sections 3.2, 5.1) ---------
+
+// Every cast id must exist AND belong to the project. Returns null
+// when the cast is valid, or an error string naming the first bad id
+// ("Character <id> is not in this project"). A non-array cast is
+// treated as a failure, never coerced silently.
+function novaValidateCast(project, cast) {
+  if (!Array.isArray(cast)) return "The cast list is missing or invalid.";
+  if (!project) return "The project is missing.";
+  for (const id of cast) {
+    const character = novaGetCharacter(id);
+    if (!character) {
+      return "Character " + id + " is not in this project.";
+    }
+    if (character.projectId !== project.id) {
+      return "Character " + id + " is not in this project.";
+    }
+  }
+  return null;
+}
+
+// Which characters appear in one scene. A missing charactersPresent
+// field inherits the whole plan cast; an explicit empty list means
+// NO characters are present; otherwise the listed subset is used.
+// An id that fails validation produces an error naming the scene
+// number and the id — fail-closed, never a silent drop.
+function novaSceneCharacters(project, plan, scene) {
+  if (!scene || typeof scene !== "object") {
+    return { characters: [], error: "Scene is missing." };
+  }
+  if (scene.charactersPresent === undefined || scene.charactersPresent === null) {
+    const cast = plan && Array.isArray(plan.cast) ? plan.cast : [];
+    const castError = novaValidateCast(project, cast);
+    if (castError) {
+      return { characters: [], error: castError };
+    }
+    return {
+      characters: cast
+        .map((id) => novaGetCharacter(id))
+        .filter((c) => c !== null && c !== undefined),
+      error: null
+    };
+  }
+  if (!Array.isArray(scene.charactersPresent)) {
+    return {
+      characters: [],
+      error:
+        "Scene " + (scene.number || "?") +
+        ": the character list is not a list."
+    };
+  }
+  if (scene.charactersPresent.length === 0) {
+    return { characters: [], error: null };
+  }
+  const characters = [];
+  for (const id of scene.charactersPresent) {
+    const character = novaGetCharacter(id);
+    if (!character || !project || character.projectId !== project.id) {
+      return {
+        characters: [],
+        error:
+          "Scene " + (scene.number || "?") +
+          ": character " + id + " is not in this project."
+      };
+    }
+    if (plan && Array.isArray(plan.cast) && !plan.cast.includes(id)) {
+      return {
+        characters: [],
+        error:
+          "Scene " + (scene.number || "?") +
+          ": character " + id + " is not in this plan's cast."
+      };
+    }
+    characters.push(character);
+  }
+  return { characters, error: null };
+}
+
+// ---- Cast identity lines (Sections 5.1, 13.5) ------------------------
+
+// The project parts of a continuity line, in the EXACT formats of
+// novaContinuitySceneLine. Project parts appear once, before the
+// first character segment.
+function novaProjectContinuityParts(project) {
+  const parts = [];
+  if (!project) return parts;
+  if (project.name) {
+    parts.push(
+      "Project: " +
+        project.name +
+        (project.description ? " — " + project.description : "")
+    );
+  } else if (project.description) {
+    parts.push("Project: " + project.description);
+  }
+  if (project.worldDescription) {
+    parts.push("World: " + project.worldDescription);
+  }
+  if (project.visualStyle) {
+    parts.push("Project visual style: " + project.visualStyle);
+  }
+  if (project.rules && project.rules.length) {
+    parts.push("Project rules: " + project.rules.join("; "));
+  }
+  if (project.notes && project.notes.length) {
+    parts.push("Project notes: " + project.notes.join("; "));
+  }
+  return parts;
+}
+
+// The character parts of a continuity line, in the EXACT formats of
+// novaContinuitySceneLine — including the 3.5A wardrobe / hair /
+// accessories blocks (after permanent details, before character
+// notes). The context must have been enriched by
+// novaAttachAppearanceToContext for those fields to appear.
+function novaCharacterContinuityParts(context) {
+  const parts = [];
+  if (!context || !context.character) return parts;
+  const character = context.character;
+  if (character.name) {
+    parts.push(
+      "Character: " +
+        character.name +
+        " (version " +
+        (character.version || 1) +
+        ")" +
+        (character.description ? " — " + character.description : "")
+    );
+  } else if (character.description) {
+    parts.push("Character: " + character.description);
+  }
+  if (character.species) {
+    parts.push("Species: " + character.species);
+  }
+  if (character.colors) {
+    parts.push("Colors: " + character.colors);
+  }
+  if (character.distinctiveFeatures) {
+    parts.push("Distinctive features: " + character.distinctiveFeatures);
+  }
+  if (character.permanentDetails && character.permanentDetails.length) {
+    parts.push(
+      "Permanent details: " + character.permanentDetails.join("; ")
+    );
+  }
+  if (character.wardrobe) {
+    parts.push("Wardrobe: " + character.wardrobe);
+  }
+  if (character.hair) {
+    parts.push("Hair: " + character.hair);
+  }
+  if (character.accessories && character.accessories.length) {
+    parts.push("Accessories: " + character.accessories.join("; "));
+  }
+  if (character.continuityNotes && character.continuityNotes.length) {
+    parts.push("Character notes: " + character.continuityNotes.join("; "));
+  }
+  return parts;
+}
+
+// The cast identity lines for one scene (Section 5.1, Correction 1):
+// ONE line per character, in cast order, each carrying the scene
+// number — "Saved continuity (Scene N): ...". Project parts appear
+// exactly ONCE, on the first character's line: A6 counts "both
+// lines" for a two-character scene, so a separate project line
+// (three lines for two characters) would contradict it, and the
+// first line then keeps the 3.4E assembly order (project parts
+// first, then the character segment). A character with no parts at
+// all gets no line (there is nothing to say about them).
+// The single-character case is EXACTLY the 3.4E line: it calls
+// novaContinuitySceneLine directly (no scene number), so the A12
+// byte-identity invariant holds by construction, not by parallel
+// implementation. Returns an array of line strings (possibly
+// empty); an explicitly empty presence list yields no lines.
+function novaCastIdentityLines(contexts, sceneNumber) {
+  if (!Array.isArray(contexts) || contexts.length === 0) return [];
+  const valid = contexts.filter(
+    (c) => c && c.character && c.project
+  );
+  if (valid.length === 0) return [];
+  if (valid.length === 1) {
+    const line = novaContinuitySceneLine(valid[0]);
+    return line ? [line] : [];
+  }
+  const n =
+    Number.isInteger(sceneNumber) && sceneNumber > 0 ? sceneNumber : 1;
+  const projectParts = novaProjectContinuityParts(valid[0].project);
+  const lines = [];
+  valid.forEach((context, i) => {
+    const charParts = novaCharacterContinuityParts(context);
+    const parts = i === 0 ? projectParts.concat(charParts) : charParts;
+    if (!parts.length) return;
+    lines.push(
+      "Saved continuity (Scene " + n + "): " + parts.join(". ") + "."
+    );
+  });
+  return lines;
+}
+
+// Builds + enriches continuity contexts for a character list.
+// Returns { contexts, error }. The error is a context-building
+// error (from the protected builder) — the caller reports it.
+function novaBuildCastContexts(project, characters) {
+  if (!Array.isArray(characters) || characters.length === 0) {
+    return { contexts: [], error: null };
+  }
+  const contexts = [];
+  for (const character of characters) {
+    const result = novaBuildContinuityContext(project.id, character.id);
+    if (result.error) return { contexts: [], error: result.error };
+    contexts.push(novaAttachAppearanceToContext(result.context, character));
+  }
+  return { contexts, error: null };
+}
+
+// Builds the identity lines for one scene from its characters:
+// one line per character, in cast order (Correction 1). Returns
+// { lines, error }. `lines` is an array (possibly empty); a
+// single character yields the 3.4E line; an empty list yields
+// no lines.
+function novaBuildCastLines(project, characters, sceneNumber) {
+  if (!Array.isArray(characters) || characters.length === 0) {
+    return { lines: [], error: null };
+  }
+  const built = novaBuildCastContexts(project, characters);
+  if (built.error) return { lines: [], error: built.error };
+  return {
+    lines: novaCastIdentityLines(built.contexts, sceneNumber),
+    error: null
+  };
+}
+
+// ---- Appearance enrichment (Section 5.2) ------------------------------
+
+// The protected 3.4E context builder does not carry wardrobe / hair /
+// accessories, so this enricher attaches them from the stored
+// character record. Missing fields coerce to "" / [] (never throw).
+// Returns the same context object, enriched.
+function novaAttachAppearanceToContext(context, character) {
+  if (!context || !context.character) return context;
+  const appearance =
+    character &&
+    character.appearance &&
+    typeof character.appearance === "object" &&
+    !Array.isArray(character.appearance)
+      ? character.appearance
+      : {};
+  context.character.wardrobe =
+    typeof appearance.wardrobe === "string" ? appearance.wardrobe : "";
+  context.character.hair =
+    typeof appearance.hair === "string" ? appearance.hair : "";
+  context.character.accessories = Array.isArray(appearance.accessories)
+    ? appearance.accessories.filter((a) => typeof a === "string")
+    : [];
+  return context;
+}
+
+// ---- Appearance checks (Section 5.2) ----------------------------------
+
+// Canonicalizes a matcher feature key: "braid" is hair, so a saved
+// "black braid" and a prompt "blonde hair" compare on the same
+// feature. Every other key passes through unchanged — the 3.4E
+// matcher already singularizes its keys.
+function novaAppearanceCanonicalFeature(feature) {
+  const f = String(feature).toLowerCase();
+  if (f === "braid") return "hair";
+  return f;
+}
+
+// The feature a saved appearance part refers to: the last word of
+// the part, SINGULARIZED ("leather boots" -> "boot", "iron ring" ->
+// "ring", "long black braid" -> "braid"). The singular form is what
+// the 3.4E matcher needs: it matches a plural token against a
+// singular feature, and keys the result by the singular.
+function novaAppearancePartFeature(part) {
+  const words = String(part)
+    .toLowerCase()
+    .split(/[^a-z]+/)
+    .filter(Boolean);
+  if (!words.length) return "";
+  const last = words[words.length - 1];
+  if (last.endsWith("s") && last.length > 2) return last.slice(0, -1);
+  return last;
+}
+
+// Hair length words (Section 5.2 lexicon).
+const NOVA_HAIR_LENGTH_WORDS = ["long", "short"];
+
+// Extracts a hair length word from text, within 4 tokens of a hair
+// word ("hair" or "braid"). Returns the length word or null.
+function novaHairLengthNearHair(text) {
+  const tokens = String(text)
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] === "hair" || tokens[i] === "braid" || tokens[i] === "braids") {
+      for (let j = Math.max(0, i - 4); j < Math.min(tokens.length, i + 5); j++) {
+        if (NOVA_HAIR_LENGTH_WORDS.includes(tokens[j])) return tokens[j];
+      }
+    }
+  }
+  return null;
+}
+
+// Appearance checks, called from novaCheckContinuityConflicts. The
+// saved side gains wardrobe + hair + accessories, checked with the
+// SAME 3.4E colour matcher (plus a dedicated hair-length check).
+// Warnings follow the same { key, message } shape; the field-aware
+// message says which saved field the contradiction is in. The
+// `existingKeys` set guards against double-reporting a key the base
+// checks already raised.
+function novaCheckAppearanceConflicts(context, promptText, existingKeys) {
+  const warnings = [];
+  const character = context && context.character ? context.character : {};
+  const prompt = typeof promptText === "string" ? promptText : "";
+
+  const savedParts = [];
+  if (character.wardrobe) {
+    savedParts.push({ text: character.wardrobe, field: "wardrobe" });
+  }
+  if (character.hair) {
+    savedParts.push({ text: character.hair, field: "hair" });
+  }
+  if (Array.isArray(character.accessories)) {
+    character.accessories.forEach((a) => {
+      if (a) savedParts.push({ text: a, field: "accessories" });
+    });
+  }
+  if (savedParts.length === 0) return warnings;
+
+  // --- Colour conflicts: 3.4E matcher, derived features ---------------
+  // The matcher returns Map<feature, Set<color>>; both sides are
+  // folded to canonical features ("braid" -> "hair") BEFORE the
+  // comparison, so a saved "black braid" and a prompt "blonde hair"
+  // meet on the same feature. The dedupe checks the canonical key
+  // AND every raw-feature key, so a contradiction the base checker
+  // already raised (under its raw feature) is never reported twice.
+  const derivedFeatures = new Set();
+  savedParts.forEach((part) => {
+    const f = novaAppearancePartFeature(part.text);
+    if (f) derivedFeatures.add(f);
+  });
+  if (derivedFeatures.size > 0) {
+    const savedText = savedParts.map((p) => p.text).join(". ");
+    const savedRaw = novaContinuityFeatureColors(
+      savedText,
+      Array.from(derivedFeatures)
+    );
+    const promptRaw = novaContinuityFeatureColors(
+      prompt,
+      Array.from(derivedFeatures)
+    );
+    const fold = (raw) => {
+      const folded = new Map();
+      raw.forEach((colorSet, feature) => {
+        const canonical = novaAppearanceCanonicalFeature(feature);
+        if (!folded.has(canonical)) {
+          folded.set(canonical, { colors: new Set(), raw: new Set() });
+        }
+        folded.get(canonical).raw.add(feature);
+        colorSet.forEach((color) => folded.get(canonical).colors.add(color));
+      });
+      return folded;
+    };
+    const saved = fold(savedRaw);
+    const promptMap = fold(promptRaw);
+    saved.forEach((savedEntry, canonical) => {
+      const promptEntry = promptMap.get(canonical);
+      if (!promptEntry) return;
+      promptEntry.colors.forEach((promptColor) => {
+        if (savedEntry.colors.has(promptColor)) return;
+        savedEntry.colors.forEach((savedColor) => {
+          const key =
+            "color:" + canonical + ":" + savedColor + ":" + promptColor;
+          const rawKeys = new Set([key]);
+          savedEntry.raw.forEach((f) => {
+            rawKeys.add("color:" + f + ":" + savedColor + ":" + promptColor);
+          });
+          promptEntry.raw.forEach((f) => {
+            rawKeys.add("color:" + f + ":" + savedColor + ":" + promptColor);
+          });
+          if (
+            existingKeys &&
+            Array.from(rawKeys).some((k) => existingKeys.has(k))
+          ) {
+            return;
+          }
+          if (warnings.some((w) => w.key === key)) return;
+          const part = savedParts.find((p) => {
+            const pf = novaAppearanceCanonicalFeature(
+              novaAppearancePartFeature(p.text)
+            );
+            return pf === canonical;
+          });
+          const field = part ? part.field : "wardrobe";
+          warnings.push({
+            key,
+            kind: "appearance",
+            message:
+              "Prompt describes the " + canonical + " as " + promptColor +
+              ", but the saved " + field + " says " + savedColor + "."
+          });
+        });
+      });
+    });
+  }
+
+  // --- Hair length conflicts ------------------------------------------
+  if (character.hair) {
+    const savedLength = novaHairLengthNearHair(character.hair);
+    const promptLength = novaHairLengthNearHair(prompt);
+    if (
+      savedLength &&
+      promptLength &&
+      savedLength !== promptLength
+    ) {
+      const key = "length:hair:" + savedLength + ":" + promptLength;
+      if (!existingKeys || !existingKeys.has(key)) {
+        warnings.push({
+          key,
+          kind: "appearance",
+          message:
+            "Prompt describes the hair as " + promptLength +
+            ", but the saved hair says " + savedLength + "."
+        });
+      }
+    }
+  }
+  return warnings;
+}
+
+// ---- Style continuity check (Sections 7.1, 7.2, 7.4, 7.5) -------------
+
+// Directive patterns (Section 7.1, fixed list). A marker warns
+// ONLY inside one of these frames:
+//   "in <style> style" / "in the style of <style>"
+//   "render as <style>" / "rendered in <style>"
+//   "<style> style:" at the start of the prompt or direction
+//   "make it look like <style>" / "shot in <style>"
+// "in X style" and "X style:" are covered by the bare "X style"
+// pattern. Patterns are checked longest-first with an overlap
+// guard, so "in the style of X" wins over "X style".
+const NOVA_STYLE_DIRECTIVE_PATTERNS = [
+  /render(?:ed|s|ing)?\s+as\s+(.+?)(?:\.|,|;|$)/ig,
+  /render(?:ed|s|ing)?\s+in\s+(.+?)(?:\s+style\b|\.|,|;|$)/ig,
+  /make\s+it\s+look\s+like\s+(.+?)(?:\s+style\b|\.|,|;|$)/ig,
+  /shot\s+in\s+(.+?)(?:\s+style\b|\.|,|;|$)/ig,
+  /in\s+the\s+style\s+of\s+(.+?)(?:\.|,|;|$)/ig,
+  /\b(\S+)\s+style\b/ig
+];
+
+// Finds directive frames in the scene text. Each frame carries
+// its matched text and character offsets. The marker test runs on
+// the frame's token range (see novaCheckStyleContinuity).
+function novaStyleDirectiveFrames(sceneText) {
+  const text = typeof sceneText === "string" ? sceneText : "";
+  const frames = [];
+  const usedRanges = [];
+  NOVA_STYLE_DIRECTIVE_PATTERNS.forEach((re) => {
+    let m;
+    re.lastIndex = 0;
+    while ((m = re.exec(text)) !== null) {
+      const start = m.index;
+      const end = start + m[0].length;
+      const overlaps = usedRanges.some((r) => start < r[1] && end > r[0]);
+      if (overlaps) continue;
+      usedRanges.push([start, end]);
+      frames.push({ text: m[0], start, end });
+    }
+  });
+  return frames;
+}
+
+// Tokenizes to lowercase word tokens with their character offsets
+// (offsets are against the ORIGINAL text, so they align with the
+// directive-frame offsets). Contractions are normalised ("don't"
+// -> "dont") so the negation list can match them, and possessives
+// are stripped ("dragon's" -> "dragon") so they do not match the
+// plural "dragons" marker. Hyphens are token boundaries, so
+// "pixar-style" and "pixar style" tokenize identically — hyphen vs
+// space is orthography, not a different marker (the design's 7.5
+// example "rendered in a pixar style" must resolve to the
+// "pixar-style" marker).
+function novaStyleTokens(text) {
+  const tokens = [];
+  const re = /[a-z0-9]+(?:'[a-z]+)?/g;
+  let m;
+  const lower = String(text).toLowerCase();
+  while ((m = re.exec(lower)) !== null) {
+    tokens.push({
+      word: m[0].replace(/'s\b/g, "").replace(/'/g, ""),
+      start: m.index,
+      end: m.index + m[0].length
+    });
+  }
+  return tokens;
+}
+
+// The distinctive-marker occurrences in a text, with the token
+// index of each. Multi-word markers ("3d animation", "epic
+// fantasy", "pixar-style") match on consecutive tokens; a
+// hyphenated marker matches its space-separated form and vice
+// versa.
+function novaStyleMarkerOccurrences(text, markers) {
+  const tokens = novaStyleTokens(text);
+  const occurrences = [];
+  markers.forEach((marker) => {
+    const markerWords = marker.toLowerCase().split(/[\s-]+/).filter(Boolean);
+    if (markerWords.length === 0) return;
+    for (let i = 0; i + markerWords.length <= tokens.length; i++) {
+      let match = true;
+      for (let j = 0; j < markerWords.length; j++) {
+        if (tokens[i + j].word !== markerWords[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        occurrences.push({ marker, tokenIndex: i, wordCount: markerWords.length });
+      }
+    }
+  });
+  return { tokens, occurrences };
+}
+
+// Suppression grounds (Section 7.2, exact lists).
+const NOVA_STYLE_NEGATION_WORDS = [
+  "not", "no", "never", "dont", "doesnt", "isnt", "avoid", "unlike"
+];
+const NOVA_STYLE_NEGATION_PHRASES = [["instead", "of"], ["rather", "than"]];
+const NOVA_STYLE_NARRATIVE_WORDS = ["imagines", "remembers"];
+const NOVA_STYLE_NARRATIVE_PHRASES = [
+  ["dreams", "of"],
+  ["a", "story", "about"],
+  ["a", "tale", "of"]
+];
+const NOVA_STYLE_PROP_WORDS = [
+  "poster", "painting", "picture", "book",
+  "screen", "television", "photo", "photograph"
+];
+
+// True when a phrase (list of words) appears consecutively and
+// OVERLAPS the token window [windowStart, windowEnd). A phrase
+// counts as "within N tokens before the marker" when any of its
+// words falls in the window — so "a story about" ending 2 tokens
+// before the marker suppresses even though it starts 5 back.
+function novaStylePhraseInWindow(tokens, phraseWords, windowStart, windowEnd) {
+  const start = Math.max(0, windowStart);
+  const end = Math.min(tokens.length, windowEnd);
+  for (let i = 0; i + phraseWords.length <= tokens.length; i++) {
+    if (i >= end) break;
+    if (i + phraseWords.length <= start) continue;
+    let match = true;
+    for (let j = 0; j < phraseWords.length; j++) {
+      if (tokens[i + j].word !== phraseWords[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+// The four suppression grounds (Section 7.2), checked around a
+// marker occurrence at token index `markerIndex` (wordCount tokens
+// long) in the FULL scene text. `frameStartIndex` is the token
+// index where the directive frame begins (needed by the negation
+// ground, which also covers the directive itself).
+// (a) negation: a negation word or phrase within 3 tokens BEFORE
+//     the marker OR before the directive ("Don't make it look
+//     like a cartoon" negates the directive, not the marker);
+// (b) quoted dialogue: the marker falls inside a quoted span
+//     (odd quote count before it, counting both " and ' — the
+//     documented approximate heuristic);
+// (c) narrative frame: a narrative word or phrase within 4 tokens
+//     BEFORE the marker;
+// (d) prop reference: a prop word within 2 tokens before OR after
+//     the marker. The design's rule text says "before", but its
+//     own example ("A cartoon poster on the wall") has the prop
+//     word AFTER the marker — the example governs, so both sides
+//     are checked.
+// Returns the ground name, or null when nothing suppresses.
+function novaStyleSuppressionGround(tokens, fullText, markerIndex, wordCount, frameStartIndex) {
+  // (a) negation — before the marker OR before the directive.
+  const negationBefore = (endIndex) => {
+    for (let j = Math.max(0, endIndex - 3); j < endIndex; j++) {
+      if (NOVA_STYLE_NEGATION_WORDS.includes(tokens[j].word)) return true;
+    }
+    return NOVA_STYLE_NEGATION_PHRASES.some((phrase) =>
+      novaStylePhraseInWindow(tokens, phrase, endIndex - 3, endIndex)
+    );
+  };
+  if (negationBefore(markerIndex)) return "negation";
+  if (
+    typeof frameStartIndex === "number" &&
+    frameStartIndex < markerIndex &&
+    negationBefore(frameStartIndex)
+  ) {
+    return "negation";
+  }
+  // (b) quoted dialogue (odd-quote heuristic — documented in 7.2)
+  const markerStart = tokens[markerIndex]
+    ? tokens[markerIndex].start
+    : fullText.length;
+  const before = String(fullText).slice(0, markerStart);
+  const quoteCount = (before.match(/["'\u201c\u201d\u2018\u2019]/g) || []).length;
+  if (quoteCount % 2 === 1) return "quoted dialogue";
+  // (c) narrative frame
+  for (let j = Math.max(0, markerIndex - 4); j < markerIndex; j++) {
+    if (NOVA_STYLE_NARRATIVE_WORDS.includes(tokens[j].word)) {
+      return "narrative frame";
+    }
+  }
+  if (
+    NOVA_STYLE_NARRATIVE_PHRASES.some((phrase) =>
+      novaStylePhraseInWindow(tokens, phrase, markerIndex - 4, markerIndex)
+    )
+  ) {
+    return "narrative frame";
+  }
+  // (d) prop reference (either side — see the note above)
+  for (
+    let j = Math.max(0, markerIndex - 2);
+    j < Math.min(tokens.length, markerIndex + wordCount + 2);
+    j++
+  ) {
+    if (j >= markerIndex && j < markerIndex + wordCount) continue;
+    if (NOVA_STYLE_PROP_WORDS.includes(tokens[j].word)) {
+      return "prop reference";
+    }
+  }
+  return null;
+}
+
+// The style continuity check (Sections 7.1, 7.2, 7.5).
+// effectiveStyle is a { preset, customDirection } record (from
+// novaEffectiveSceneStyle). A warning is raised ONLY when a
+// DISTINCTIVE marker of another preset appears inside a directive
+// frame, and none of the four suppression grounds applies. Shared
+// markers ("realistic", "cinematic", ...) never warn in either
+// realistic preset — they are not distinctive of any preset.
+// Returns { warnings: [{ key, message, sceneNumber }] } — the key
+// is "style:<effectivePreset>:<directedPreset>".
+function novaCheckStyleContinuity(effectiveStyle, sceneText, sceneNumber) {
+  const warnings = [];
+  const preset =
+    effectiveStyle && typeof effectiveStyle === "object"
+      ? effectiveStyle.preset
+      : NOVA_VISUAL_STYLE_DEFAULT_PRESET;
+  // Custom styles have no markers: a custom scene's directives are
+  // the user's own direction, not a contradiction.
+  if (preset === "custom") return { warnings };
+  const text = typeof sceneText === "string" ? sceneText : "";
+  const frames = novaStyleDirectiveFrames(text);
+  if (frames.length === 0) return { warnings };
+  const tokens = novaStyleTokens(text);
+  // Every distinctive-marker occurrence in the full text.
+  const occurrences = [];
+  NOVA_VISUAL_STYLE_PRESET_KEYS.forEach((markerPreset) => {
+    const spec = NOVA_VISUAL_STYLE_PRESETS[markerPreset];
+    if (!spec || !spec.distinctiveMarkers) return;
+    const result = novaStyleMarkerOccurrences(text, spec.distinctiveMarkers);
+    result.occurrences.forEach((o) => {
+      occurrences.push({
+        preset: markerPreset,
+        marker: o.marker,
+        tokenIndex: o.tokenIndex,
+        wordCount: o.wordCount
+      });
+    });
+  });
+  const seenKeys = new Set();
+  frames.forEach((frame) => {
+    // The token index where this frame begins (for the negation
+    // ground's "before the directive" window).
+    let frameStartIndex = 0;
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i].start >= frame.start) {
+        frameStartIndex = i;
+        break;
+      }
+      frameStartIndex = i;
+    }
+    occurrences.forEach((occ) => {
+      // The occurrence must OVERLAP this frame's character range.
+      // Overlap (not containment) is the right test: a multi-word
+      // marker such as "3d animation" spans the word before the
+      // "X style" frame ("animation style"), so containment would
+      // miss it. A marker fully outside the frame never warns.
+      const first = tokens[occ.tokenIndex];
+      const last = tokens[occ.tokenIndex + occ.wordCount - 1];
+      if (!first || !last) return;
+      if (last.end <= frame.start || first.start >= frame.end) return;
+      if (occ.preset === preset) return;
+      const ground = novaStyleSuppressionGround(
+        tokens,
+        text,
+        occ.tokenIndex,
+        occ.wordCount,
+        frameStartIndex
+      );
+      if (ground) return;
+      const key = "style:" + preset + ":" + occ.preset;
+      if (seenKeys.has(key)) return;
+      seenKeys.add(key);
+      warnings.push({
+        key,
+        message:
+          "This scene asks for " + novaPresetDisplayName(occ.preset) +
+          " style, but the project style is " + novaPresetDisplayName(preset) +
+          ". Set a scene override if the change is intended.",
+        sceneNumber: sceneNumber || null
+      });
+    });
+  });
+  return { warnings };
+}
+
+// ---- Scene prompt rebuild (Sections 4.2, 5.1) -------------------------
+
+// Rebuilds one scene's generation prompt from the plan + scene
+// records, applying the scene's current presence and override. The
+// assembly mirrors buildMotionPlan exactly (same lines, same
+// order): identity first, then style, then the fixed closing lines.
+// The legacy "Visual style: <motionStyle>" line is preserved
+// verbatim (locked tests pin it); the 3.5A style block is an
+// additional separate line after the identity lines.
+// Returns { prompt, error }.
+function novaBuildScenePrompt(plan, scene) {
+  if (!plan || !scene) return { prompt: "", error: "Plan or scene is missing." };
+  const project =
+    plan.projectId ? novaGetProject(plan.projectId) : null;
+  let identityLines = [];
+  let styleBlock = "";
+  if (project) {
+    const presence = novaSceneCharacters(project, plan, scene);
+    if (presence.error) return { prompt: "", error: presence.error };
+    // The scene number for the identity lines (Correction 1): the
+    // scene's own number when set (the rebuild path sets it), else
+    // its position in the plan — a freshly built plan's scenes
+    // carry no number field.
+    let sceneNumber = 1;
+    if (Number.isInteger(scene.number) && scene.number > 0) {
+      sceneNumber = scene.number;
+    } else if (plan.scenes) {
+      const at = plan.scenes.indexOf(scene);
+      if (at >= 0) sceneNumber = at + 1;
+    }
+    const castLines = novaBuildCastLines(
+      project,
+      presence.characters,
+      sceneNumber
+    );
+    if (castLines.error) return { prompt: "", error: castLines.error };
+    identityLines = castLines.lines;
+    const effective = novaEffectiveSceneStyle(plan, project, scene);
+    styleBlock =
+      "Visual style: " +
+      novaVisualStyleFragment(effective.preset, effective.customDirection);
+  }
+  const parts = [
+    "Create a cinematic video scene.",
+    "Original concept: " + (plan.prompt || ""),
+    "Scene direction: " + (scene.direction || ""),
+    "Visual style: " + (plan.style || ""),
+    "Camera direction: " + (scene.camera || ""),
+    "Preferred camera movement: " + (plan.camera || ""),
+    "Subject movement: " + (scene.motion || ""),
+    "Character continuity: " +
+      (plan.character ||
+        "Maintain the same subject identity and appearance throughout the sequence."),
+    ...identityLines,
+    ...(styleBlock ? [styleBlock] : []),
+    "Environment and visual continuity must remain consistent with previous scenes.",
+    "Aspect ratio: " + (plan.ratio || "")
+  ];
+  return { prompt: parts.join(" "), error: null };
+}
+
+// Rebuilds scene `index` of the current plan (after a presence or
+// override change) and patches the displayed brief in place. The
+// brief is patched by replacing the escaped old prompt with the
+// escaped new prompt — the old prompt is unique to its scene.
+// Returns true on success, false when the rebuild fails (the error
+// is shown and the scene is left untouched).
+function novaRebuildScenePrompt(index) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return false;
+  const scene = novaMotionPlan.scenes[index];
+  if (!scene) return false;
+  scene.number = index + 1;
+  const oldPrompt = scene.prompt;
+  const rebuilt = novaBuildScenePrompt(novaMotionPlan, scene);
+  if (rebuilt.error) {
+    alert(rebuilt.error);
+    return false;
+  }
+  scene.prompt = rebuilt.prompt;
+  const output = document.getElementById("motionOutput");
+  if (output && oldPrompt && oldPrompt !== rebuilt.prompt) {
+    output.innerHTML = output.innerHTML.replace(
+      novaEscape(oldPrompt),
+      novaEscape(rebuilt.prompt)
+    );
+  }
+  return true;
+}
+
+// ---- Style warnings for the current plan (Sections 7, 8) --------------
+
+// Collects style-continuity warnings for every scene of a plan.
+// Custom-override scenes are SKIPPED (Section 7.4) and reported
+// separately in the skip list. Returns { warnings, skipped }.
+function novaCollectStyleWarnings(plan, project) {
+  const warnings = [];
+  const skipped = [];
+  if (!plan || !Array.isArray(plan.scenes) || !project) {
+    return { warnings, skipped };
+  }
+  plan.scenes.forEach((scene, index) => {
+    const sceneNumber = index + 1;
+    const effective = novaEffectiveSceneStyle(plan, project, scene);
+    const isCustomOverride =
+      scene &&
+      scene.styleOverride &&
+      typeof scene.styleOverride === "object" &&
+      scene.styleOverride.preset === "custom";
+    if (isCustomOverride) {
+      skipped.push(sceneNumber);
+      return;
+    }
+    const result = novaCheckStyleContinuity(
+      effective,
+      scene.prompt || "",
+      sceneNumber
+    );
+    result.warnings.forEach((w) => warnings.push(w));
+  });
+  return { warnings, skipped };
+}
+
+// ---- Style picker (Sections 4.1, 4.3, 4.4) ----------------------------
+
+// The style-selection control: all five presets with one-line
+// descriptions, plus a custom-direction textarea shown when the
+// custom preset is selected. `idPrefix` distinguishes the project
+// setup form ("wsNewStyle") from the workspace change flow
+// ("wsChangeStyle"). `disabled` renders the locked (read-only)
+// picker used by the workspace Visual Style section.
+function novaStylePickerHtml(selectedPreset, customDirection, idPrefix, disabled) {
+  const selected =
+    NOVA_VISUAL_STYLE_PRESETS[selectedPreset] ? selectedPreset : NOVA_VISUAL_STYLE_DEFAULT_PRESET;
+  const options = NOVA_VISUAL_STYLE_PRESET_KEYS.map((key) => {
+    const spec = NOVA_VISUAL_STYLE_PRESETS[key];
+    return (
+      `<option value="${key}"${key === selected ? " selected" : ""}>` +
+      `${novaEscape(spec.name)} — ${novaEscape(spec.description)}</option>`
+    );
+  }).join("");
+  const customShown = selected === "custom";
+  return (
+    `<div class="motion-field">` +
+    `<label class="motion-label" for="${idPrefix}Preset">Visual style</label>` +
+    `<select class="motion-select" id="${idPrefix}Preset"${disabled ? " disabled" : ""} onchange="novaStylePickerChanged('${idPrefix}')">` +
+    options +
+    `</select></div>` +
+    `<div class="motion-field" id="${idPrefix}CustomWrap" style="display:${customShown ? "block" : "none"};">` +
+    `<label class="motion-label" for="${idPrefix}Custom">Custom direction</label>` +
+    `<textarea class="motion-textarea" id="${idPrefix}Custom" rows="3" placeholder="Describe the look in your own words."${disabled ? " disabled" : ""}>${novaEscape(customDirection || "")}</textarea></div>`
+  );
+}
+
+function novaStylePickerChanged(idPrefix) {
+  const select = document.getElementById(idPrefix + "Preset");
+  const wrap = document.getElementById(idPrefix + "CustomWrap");
+  if (!select || !wrap) return;
+  wrap.style.display = select.value === "custom" ? "block" : "none";
+}
+
+// Reads the picker's current value as a style record. Returns
+// { preset, customDirection } — or null when the custom preset is
+// selected but the direction is empty.
+function novaReadStylePicker(idPrefix) {
+  const select = document.getElementById(idPrefix + "Preset");
+  if (!select) return null;
+  const preset = select.value;
+  if (!NOVA_VISUAL_STYLE_PRESETS[preset]) return null;
+  let customDirection = "";
+  if (preset === "custom") {
+    const textarea = document.getElementById(idPrefix + "Custom");
+    customDirection = textarea ? textarea.value.trim() : "";
+    if (!customDirection) return null;
+  }
+  return { preset, customDirection };
+}
+
+// ---- Workspace Visual Style section (Sections 4.3, 4.4, 4.6) ----------
+
+let novaStyleChangeOpen = false;
+
+function novaStartStyleChange() {
+  novaStyleChangeOpen = true;
+  novaRenderWorkspace();
+}
+
+function novaCancelStyleChange() {
+  novaStyleChangeOpen = false;
+  novaRenderWorkspace();
+}
+
+// Saves the new style from the change picker. The picker is
+// read-only by default and unlocks for ONE change, then re-locks
+// after save (Section 4.4). A redundant change (same preset +
+// same custom text as the current style) is refused with the
+// design's message.
+function novaSaveStyleChange() {
+  const project = novaGetProject(novaWorkspaceProjectId);
+  if (!project) return;
+  const picked = novaReadStylePicker("wsChangeStyle");
+  if (!picked) {
+    const select = document.getElementById("wsChangeStylePreset");
+    if (select && select.value === "custom") {
+      alert("Enter a custom direction for the Custom style.");
+    } else {
+      alert("Choose a visual style.");
+    }
+    return;
+  }
+  const current = novaGetProjectVisualStyle(project);
+  if (
+    picked.preset === current.preset &&
+    (picked.customDirection || "") === (current.customDirection || "")
+  ) {
+    alert(NOVA_STYLE_REDUNDANT_OVERRIDE);
+    return;
+  }
+  const continuity =
+    project.continuity && typeof project.continuity === "object"
+      ? project.continuity
+      : {};
+  const updated = novaUpdateProject(project.id, {
+    continuity: Object.assign({}, continuity, { visualStyle: picked })
+  });
+  if (!updated) {
+    alert("The style could not be saved. Try again.");
+    return;
+  }
+  novaStyleChangeOpen = false;
+  novaRenderWorkspace();
+}
+
+// The Visual Style section of the project workspace: the locked
+// picker (read-only by default, with a lock indicator), the
+// "Change style" flow with the EXACT consequence text, and the
+// style-basis note for in-progress plans.
+function novaWorkspaceStyleSectionHtml(project) {
+  if (!project) return "";
+  const style = novaGetProjectVisualStyle(project);
+  let html =
+    `<div class="ws-continuity"><h3>Visual Style</h3>`;
+  if (!novaStyleChangeOpen) {
+    html +=
+      `<p>Current style: <span class="ws-style-lock">Locked</span></p>` +
+      novaStylePickerHtml(style.preset, style.customDirection, "wsChangeStyle", true) +
+      `<p class="ws-style-fragment">${novaEscape(novaVisualStyleFragment(style.preset, style.customDirection))}</p>` +
+      `<p><button class="motion-btn motion-btn-secondary" onclick="novaStartStyleChange()">Change style</button></p>`;
+  } else {
+    html +=
+      `<p>${novaEscape(NOVA_STYLE_CHANGE_CONSEQUENCES)}</p>` +
+      novaStylePickerHtml(style.preset, style.customDirection, "wsChangeStyle", false) +
+      `<p><button class="motion-btn motion-btn-primary" onclick="novaSaveStyleChange()">Save style</button> ` +
+      `<button class="motion-btn motion-btn-ghost" onclick="novaCancelStyleChange()">Cancel</button></p>`;
+  }
+  html +=
+    `<p class="motion-note">In-progress plans keep the style they were created with until you update them (Section 4.6).</p>` +
+    `</div>`;
+  return html;
+}
+
+// ---- Production Identity style section (Sections 4.2, 4.6, 7, 8) ------
+
+// The style section appended to the Production Identity review:
+// the effective preset, the style-basis difference (when the plan
+// was created under a different style), per-scene override flags,
+// style warnings, and the custom-skip notes. Rendered only when a
+// project is selected.
+function novaProductionStyleSectionHtml(selected, project) {
+  if (!selected || !project) return "";
+  const plan = novaMotionPlan;
+  if (!plan || !Array.isArray(plan.scenes)) return "";
+  const basis = plan.styleBasis
+    ? novaCoerceVisualStyle(plan.styleBasis)
+    : novaGetProjectVisualStyle(project);
+  const live = novaGetProjectVisualStyle(project);
+  let html = `<div class="ws-continuity"><h3>Visual Style</h3>`;
+  html +=
+    `<p>Plan style: <strong>${novaEscape(novaPresetDisplayName(basis.preset))}</strong>` +
+    (basis.preset === "custom" && basis.customDirection
+      ? ` — ${novaEscape(basis.customDirection)}`
+      : "") +
+    `</p>`;
+  // Basis difference (Section 4.6): the plan keeps the style it
+  // was created under; adopting the live project style is explicit.
+  if (
+    basis.preset !== live.preset ||
+    (basis.customDirection || "") !== (live.customDirection || "")
+  ) {
+    html +=
+      `<p>Project style: ${novaEscape(live.preset)} (this plan uses ${novaEscape(basis.preset)} — created under that style.)</p>`;
+    if (!novaStyleAdoptConfirm) {
+      html +=
+        `<p><button class="motion-btn motion-btn-secondary" onclick="novaAskAdoptProjectStyle()">Use current project style</button></p>`;
+    } else {
+      html +=
+        `<p>Update this plan to the current project style (${novaEscape(novaPresetDisplayName(live.preset))})? Scene prompts will be rebuilt with the new style.</p>` +
+        `<p><button class="motion-btn motion-btn-primary" onclick="novaAdoptProjectStyle()">Yes, update this plan</button> ` +
+        `<button class="motion-btn motion-btn-ghost" onclick="novaCancelAdoptProjectStyle()">Keep the plan style</button></p>`;
+    }
+  }
+  // Override flags (Section 4.2).
+  plan.scenes.forEach((scene, index) => {
+    if (
+      scene &&
+      scene.styleOverride &&
+      typeof scene.styleOverride === "object" &&
+      NOVA_VISUAL_STYLE_PRESETS[scene.styleOverride.preset]
+    ) {
+      html +=
+        `<p>Scene ${index + 1} overrides the project style: ${novaEscape(scene.styleOverride.preset)} — reason: ${novaEscape(scene.styleOverride.reason || "")}.</p>`;
+    }
+  });
+  // Style warnings + custom-skip notes (Sections 7.4, 8).
+  const collected = novaCollectStyleWarnings(plan, project);
+  collected.warnings.forEach((w) => {
+    html +=
+      `<p class="ws-warn">Scene ${w.sceneNumber || "?"}: ${novaEscape(w.message)}</p>`;
+  });
+  collected.skipped.forEach((sceneNumber) => {
+    html +=
+      `<p>Scene ${sceneNumber} uses a custom style — automatic style checks are skipped for this scene.</p>`;
+  });
+  html += `</div>`;
+  return html;
+}
+
+// The job view's reference-image line (Section 6): shown for jobs
+// whose snapshots record image ids — the character reference, the
+// character snapshots, or the continuity context. The string is
+// exact. Returns "" (no line at all) when no image id is recorded.
+function novaJobReferenceImageLine(job) {
+  if (!job) return "";
+  let hasImage = false;
+  if (job.characterRef && job.characterRef.imageAssetId) {
+    hasImage = true;
+  }
+  if (!hasImage && Array.isArray(job.characterSnapshots)) {
+    hasImage = job.characterSnapshots.some(
+      (snap) => snap && snap.imageAssetId
+    );
+  }
+  if (
+    !hasImage &&
+    job.continuityContext &&
+    job.continuityContext.character &&
+    job.continuityContext.character.imageAssetId
+  ) {
+    hasImage = true;
+  }
+  if (!hasImage) return "";
+  return "<br>" + novaEscape(NOVA_REFERENCE_IMAGE_STRINGS.jobView);
+}
+
+// ---- Scene continuity controls (Sections 4.2, 5.1) ---------------------
+
+// Per-scene presence + style-override controls, rendered into
+// #motionSceneContinuity after a plan is built. Project plans only:
+// standalone plans have no cast and no styleBasis, so nothing is
+// rendered for them.
+function novaRenderSceneContinuityControls() {
+  const container = document.getElementById("motionSceneContinuity");
+  if (!container) return;
+  const plan = novaMotionPlan;
+  if (!plan || !plan.projectId || !Array.isArray(plan.scenes)) {
+    container.innerHTML = "";
+    return;
+  }
+  const project = novaGetProject(plan.projectId);
+  if (!project) {
+    container.innerHTML = "";
+    return;
+  }
+  const cast = Array.isArray(plan.cast) ? plan.cast : [];
+  const castCharacters = cast
+    .map((id) => novaGetCharacter(id))
+    .filter((c) => c !== null && c !== undefined);
+  let html = `<div class="ws-continuity"><h3>Scene Continuity</h3>`;
+  plan.scenes.forEach((scene, index) => {
+    html += novaSceneContinuityControlHtml(scene, index, castCharacters);
+  });
+  html += `</div>`;
+  container.innerHTML = html;
+}
+
+// One scene's presence + override controls.
+function novaSceneContinuityControlHtml(scene, index, castCharacters) {
+  const sceneNumber = index + 1;
+  const presence =
+    scene.charactersPresent === undefined || scene.charactersPresent === null
+      ? "inherit"
+      : Array.isArray(scene.charactersPresent) && scene.charactersPresent.length === 0
+        ? "none"
+        : "choose";
+  let html =
+    `<div class="ws-scene-control"><h4>Scene ${sceneNumber}: ${novaEscape(scene.title || "")}</h4>` +
+    `<div class="motion-field"><label class="motion-label" for="wsScenePresence_${index}">Characters in this scene</label>` +
+    `<select class="motion-select" id="wsScenePresence_${index}" onchange="novaSetScenePresence(${index}, this.value)">` +
+    `<option value="inherit"${presence === "inherit" ? " selected" : ""}>Inherit cast (all characters)</option>` +
+    `<option value="choose"${presence === "choose" ? " selected" : ""}>Choose characters</option>` +
+    `<option value="none"${presence === "none" ? " selected" : ""}>No characters</option>` +
+    `</select></div>`;
+  if (presence === "choose") {
+    const present = Array.isArray(scene.charactersPresent)
+      ? scene.charactersPresent
+      : [];
+    html += `<div class="ws-scene-cast">`;
+    castCharacters.forEach((character) => {
+      const checked = present.includes(character.id);
+      html +=
+        `<label class="ws-cast-check"><input type="checkbox" ${checked ? "checked" : ""} ` +
+        `onchange="novaSetSceneCharacters(${index}, '${novaEscape(character.id)}', this.checked)"> ` +
+        `${novaEscape(character.name)}</label>`;
+    });
+    html += `</div>`;
+  }
+  html += novaSceneOverrideControlHtml(scene, index);
+  html += `</div>`;
+  return html;
+}
+
+// One scene's style-override control. The select lists "No override"
+// plus the five presets; a chosen preset shows the reason input
+// (required) and, for the custom preset, the custom-direction
+// textarea. A scene that already has an override shows its values
+// pre-filled, with Save (to update) and Clear buttons.
+function novaSceneOverrideControlHtml(scene, index) {
+  const override =
+    scene.styleOverride &&
+    typeof scene.styleOverride === "object" &&
+    NOVA_VISUAL_STYLE_PRESETS[scene.styleOverride.preset]
+      ? scene.styleOverride
+      : null;
+  const selected = override ? override.preset : "none";
+  let html =
+    `<div class="motion-field"><label class="motion-label" for="wsSceneOverridePreset_${index}">Style override</label>` +
+    `<select class="motion-select" id="wsSceneOverridePreset_${index}" onchange="novaSceneOverrideChanged(${index})">` +
+    `<option value="none"${selected === "none" ? " selected" : ""}>No override — use the plan style</option>`;
+  NOVA_VISUAL_STYLE_PRESET_KEYS.forEach((key) => {
+    const spec = NOVA_VISUAL_STYLE_PRESETS[key];
+    html +=
+      `<option value="${key}"${key === selected ? " selected" : ""}>${novaEscape(spec.name)}</option>`;
+  });
+  html += `</select></div>`;
+  const fieldsShown = selected !== "none";
+  html +=
+    `<div id="wsSceneOverrideFields_${index}" style="display:${fieldsShown ? "block" : "none"};">` +
+    `<div class="motion-field" id="wsSceneOverrideCustomWrap_${index}" style="display:${selected === "custom" ? "block" : "none"};">` +
+    `<label class="motion-label" for="wsSceneOverrideCustom_${index}">Custom direction</label>` +
+    `<textarea class="motion-textarea" id="wsSceneOverrideCustom_${index}" rows="2" placeholder="Describe the look in your own words.">${novaEscape(override && override.customDirection ? override.customDirection : "")}</textarea></div>` +
+    `<div class="motion-field"><label class="motion-label" for="wsSceneOverrideReason_${index}">Reason (required)</label>` +
+    `<input class="motion-input" id="wsSceneOverrideReason_${index}" type="text" placeholder="Why does this scene need a different style?" value="${novaEscape(override && override.reason ? override.reason : "")}"></div>` +
+    `<p><button class="motion-btn motion-btn-primary" onclick="novaSaveSceneOverride(${index})">Save override</button>` +
+    (override
+      ? ` <button class="motion-btn motion-btn-ghost" onclick="novaClearSceneOverride(${index})">Clear override</button>`
+      : "") +
+    `</p></div>`;
+  return html;
+}
+
+function novaSceneOverrideChanged(index) {
+  const select = document.getElementById("wsSceneOverridePreset_" + index);
+  const fields = document.getElementById("wsSceneOverrideFields_" + index);
+  const customWrap = document.getElementById("wsSceneOverrideCustomWrap_" + index);
+  if (!select || !fields) return;
+  fields.style.display = select.value === "none" ? "none" : "block";
+  if (customWrap) {
+    customWrap.style.display = select.value === "custom" ? "block" : "none";
+  }
+}
+
+// Presence selection (Section 5.1). "inherit" clears the scene's
+// charactersPresent (whole cast); "none" sets an empty list (no
+// characters); "choose" starts from the whole cast so the user can
+// uncheck the ones that are absent. The scene prompt is rebuilt
+// and the review + controls refresh.
+function novaSetScenePresence(index, value) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const scene = novaMotionPlan.scenes[index];
+  if (!scene) return;
+  if (value === "inherit") {
+    delete scene.charactersPresent;
+  } else if (value === "none") {
+    scene.charactersPresent = [];
+  } else if (value === "choose") {
+    const cast = Array.isArray(novaMotionPlan.cast) ? novaMotionPlan.cast : [];
+    scene.charactersPresent = cast.slice();
+  } else {
+    return;
+  }
+  novaRebuildScenePrompt(index);
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+}
+
+// Toggles one character in a scene's charactersPresent list. The
+// list is created (from the whole cast) if the scene was inheriting.
+function novaSetSceneCharacters(index, characterId, checked) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const scene = novaMotionPlan.scenes[index];
+  if (!scene) return;
+  if (!Array.isArray(scene.charactersPresent)) {
+    const cast = Array.isArray(novaMotionPlan.cast) ? novaMotionPlan.cast : [];
+    scene.charactersPresent = cast.slice();
+  }
+  if (checked) {
+    if (!scene.charactersPresent.includes(characterId)) {
+      scene.charactersPresent.push(characterId);
+    }
+  } else {
+    scene.charactersPresent = scene.charactersPresent.filter(
+      (id) => id !== characterId
+    );
+  }
+  novaRebuildScenePrompt(index);
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+}
+
+// Saves a scene's style override (Section 4.2). Refusals:
+// - empty reason ("A reason is required for a style override.");
+// - custom preset without a custom direction;
+// - named preset carrying a custom direction (cannot happen via
+//   the UI — the textarea is hidden — but the save path enforces
+//   it anyway);
+// - override identical to the inherited style (the design's exact
+//   message).
+// On success the scene prompt is rebuilt and the review +
+// controls refresh.
+function novaSaveSceneOverride(index) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const scene = novaMotionPlan.scenes[index];
+  if (!scene) return;
+  const select = document.getElementById("wsSceneOverridePreset_" + index);
+  const reasonInput = document.getElementById("wsSceneOverrideReason_" + index);
+  const customInput = document.getElementById("wsSceneOverrideCustom_" + index);
+  if (!select || select.value === "none") {
+    alert("Choose a style to override with, or leave the scene on the plan style.");
+    return;
+  }
+  const preset = select.value;
+  if (!NOVA_VISUAL_STYLE_PRESETS[preset]) {
+    alert("That style is not available.");
+    return;
+  }
+  const reason = reasonInput ? reasonInput.value.trim() : "";
+  if (!reason) {
+    alert("A reason is required for a style override.");
+    return;
+  }
+  let customDirection = "";
+  if (preset === "custom") {
+    customDirection = customInput ? customInput.value.trim() : "";
+    if (!customDirection) {
+      alert("Enter a custom direction for the Custom style.");
+      return;
+    }
+  } else if (customInput && customInput.value.trim()) {
+    alert("A named style does not take a custom direction. Choose Custom to write your own direction.");
+    return;
+  }
+  // Redundancy: an override identical to the inherited style is
+  // refused (Section 4.2).
+  const project = novaMotionPlan.projectId
+    ? novaGetProject(novaMotionPlan.projectId)
+    : null;
+  const inherited = novaMotionPlan.styleBasis
+    ? novaCoerceVisualStyle(novaMotionPlan.styleBasis)
+    : project
+      ? novaGetProjectVisualStyle(project)
+      : {
+          preset: NOVA_VISUAL_STYLE_DEFAULT_PRESET,
+          customDirection: ""
+        };
+  if (
+    preset === inherited.preset &&
+    (customDirection || "") === (inherited.customDirection || "")
+  ) {
+    alert(NOVA_STYLE_REDUNDANT_OVERRIDE);
+    return;
+  }
+  scene.styleOverride = { preset, customDirection, reason };
+  novaRebuildScenePrompt(index);
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+}
+
+function novaClearSceneOverride(index) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const scene = novaMotionPlan.scenes[index];
+  if (!scene) return;
+  delete scene.styleOverride;
+  novaRebuildScenePrompt(index);
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+}
+
+/* ---- End of Stage 3.5A: Visual Identity Manager ---------------------- */
 
 /* ---------- Provider Interface (contract only, Stage 3.1) ----------
    Correction 5: interface definitions + a safe unavailable adapter —
@@ -5094,6 +6977,7 @@ function novaRenderJobs() {
         Status: ${novaEscape(job.status)}<br>
         Scenes: ${novaEscape(sceneSummary)}<br>
         Character: ${novaEscape(job.characterRef ? job.characterRef.id : "none")}
+        ${novaJobReferenceImageLine(job)}
       </div>`;
     })
     .join("");
