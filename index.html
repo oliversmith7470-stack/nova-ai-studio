@@ -789,6 +789,143 @@
   }
 }
 
+/* NOVA PROJECT WORKSPACE (Stage 3.4D) */
+
+.workspace-studio {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  overflow-y: auto;
+  background: var(--bg);
+  color: var(--text);
+  padding: 22px;
+}
+
+.ws-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.ws-card {
+  min-width: 0;
+  background: var(--panel2);
+  border: 1px solid #343d5c;
+  border-radius: 10px;
+  padding: 16px;
+  overflow-wrap: anywhere;
+}
+
+.ws-card h3 {
+  font-size: 15px;
+  margin-bottom: 8px;
+}
+
+.ws-text {
+  color: #aab2c8;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.ws-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.ws-btn {
+  padding: 10px 12px;
+  background: var(--panel2);
+  border: 1px solid #343d5c;
+  color: #c5cce0;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.ws-btn-primary {
+  background: linear-gradient(100deg, #7047d8, #9875ff);
+  border: none;
+  color: white;
+  font-weight: bold;
+}
+
+.ws-btn-danger {
+  background: #2a1215;
+  border-color: #7a3a3a;
+  color: #ffb3b3;
+}
+
+.ws-confirm {
+  margin-top: 12px;
+  padding: 12px;
+  background: #2a1215;
+  border: 1px solid #7a3a3a;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.ws-thumb {
+  width: 100%;
+  aspect-ratio: 1;
+  background: #0b1021;
+  border: 1px solid #343d5c;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+
+.ws-thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.ws-identity {
+  display: flex;
+  gap: 14px;
+  margin-top: 14px;
+  padding: 14px;
+  background: #0b1021;
+  border: 1px solid #483577;
+  border-radius: 9px;
+  line-height: 1.6;
+  font-size: 12px;
+}
+
+.ws-thumb-small {
+  width: 84px;
+  min-width: 84px;
+  margin-bottom: 0;
+}
+
+.ws-identity-button {
+  margin-top: 14px;
+}
+
+@media (max-width: 750px) {
+  .workspace-studio {
+    padding: 12px;
+  }
+}
+
+@media (max-width: 380px) {
+  .ws-identity {
+    flex-direction: column;
+  }
+
+  .ws-thumb-small {
+    width: 100%;
+  }
+}
+
 </style>
 </head>
 
@@ -806,6 +943,10 @@
 
     <button class="nav-item active" onclick="showNotice('Dashboard')">
       <span class="nav-icon">⌂</span> Dashboard
+    </button>
+
+    <button class="nav-item" onclick="openProjectWorkspace()">
+      <span class="nav-icon">▦</span> Projects
     </button>
 
     <p class="nav-label">AI CREATION TOOLS</p>
@@ -1017,6 +1158,26 @@
 
       <div>
         <section class="motion-panel">
+          <h2>🧭 Production Identity</h2>
+
+          <label class="motion-label" for="motionProject">Project</label>
+          <select class="motion-select" id="motionProject" onchange="novaSelectProductionProject(this.value)">
+            <option value="">Standalone Production</option>
+          </select>
+
+          <label class="motion-label" for="motionCharacterSelect">Character</label>
+          <select class="motion-select" id="motionCharacterSelect" onchange="novaSelectProductionCharacter(this.value)" disabled>
+            <option value="">No character</option>
+          </select>
+
+          <div id="motionIdentityReview"></div>
+
+          <button type="button" class="tool-button ws-identity-button" onclick="novaOpenWorkspaceFromMotion()">Manage Projects &amp; Characters →</button>
+
+          <p class="motion-note">A project character brings its saved identity and reference image into your production. Standalone Production uses only the description and image on this page.</p>
+        </section>
+
+        <section class="motion-panel">
           <h2>🎬 Create Your Video</h2>
 
           <label class="motion-label">Generation Mode</label>
@@ -1202,6 +1363,23 @@
   </div>
 </section>
 <!-- END NOVA AI WRITING STUDIO -->  
+
+
+<!-- NOVA PROJECT WORKSPACE -->
+<section id="projectWorkspace" class="workspace-studio">
+  <div class="motion-container">
+
+    <header class="motion-header">
+      <div class="motion-logo">NOVA <span>PROJECTS</span></div>
+      <button class="motion-close" onclick="closeProjectWorkspace()">✕ Close</button>
+    </header>
+
+    <div id="workspaceBody"></div>
+    <p id="workspaceStatus" class="motion-note" aria-live="polite"></p>
+
+  </div>
+</section>
+<!-- END NOVA PROJECT WORKSPACE -->
   
 <script>
 
@@ -1223,6 +1401,7 @@ function openMotionStudio() {
   document.body.style.overflow = "hidden";
   document.getElementById("sidebar").classList.remove("open");
   novaRenderJobs();
+  novaRenderProductionIdentity();
 }
 
 function closeMotionStudio() {
@@ -3242,6 +3421,918 @@ async function novaCreateProjectJob(plan, projectId, characterId) {
   }
 
   return persistedJob;
+}
+
+/* =====================================================================
+   NOVA MOTION — Stage 3.4D: Project Workspace UI
+   ---------------------------------------------------------------------
+   User-facing management for the Stage 3.4A project/character memory
+   foundation, integrated with the Stage 3.4C production system.
+
+   Views render into #workspaceBody and switch on novaWorkspaceView:
+   "projects" (list), "projectForm" (create/edit project),
+   "project" (detail: characters + continuity editor),
+   "characterForm" (create/edit character).
+
+   Data protection rules:
+   - A project or character referenced by ANY production job can
+     never be deleted. Its identity is part of production history.
+   - A project with ANY characters cannot be deleted (no cascade).
+     Delete its characters first.
+   - Deleting an unreferenced character or an empty project needs
+     an inline two-step confirmation (no confirm() dialogs).
+   - Replacing a character image only changes the character record.
+     Image assets are never deleted from IndexedDB, so historical
+     job snapshots keep resolving.
+   - Archive is a plain `archived` flag on the project record.
+     Archived projects are hidden from the list (unless toggled)
+     and from the Motion Studio selectors.
+   - All persistence goes through the Stage 3.4A helpers; all
+     production goes through novaCreateJob / novaCreateProjectJob.
+   ===================================================================== */
+
+let novaWorkspaceView = "projects";
+let novaWorkspaceProjectId = null;
+let novaWorkspaceCharacterId = null;
+let novaWorkspaceDeleteTarget = null;
+let novaWorkspaceShowArchived = false;
+
+function openProjectWorkspace() {
+  novaWorkspaceView = "projects";
+  novaWorkspaceProjectId = null;
+  novaWorkspaceCharacterId = null;
+  novaWorkspaceDeleteTarget = null;
+  document.getElementById("projectWorkspace").style.display = "block";
+  document.body.style.overflow = "hidden";
+  document.getElementById("sidebar").classList.remove("open");
+  novaRenderWorkspace();
+}
+
+function closeProjectWorkspace() {
+  document.getElementById("projectWorkspace").style.display = "none";
+  document.body.style.overflow = "";
+}
+
+function novaOpenWorkspaceFromMotion() {
+  closeMotionStudio();
+  openProjectWorkspace();
+}
+
+function novaWorkspaceSetStatus(message) {
+  const status = document.getElementById("workspaceStatus");
+  if (status) status.textContent = message || "";
+}
+
+function novaWorkspaceLines(text) {
+  return String(text || "")
+    .split("\n")
+    .map(line => line.trim())
+    .filter(line => line.length > 0);
+}
+
+function novaWorkspaceJobsForProject(projectId) {
+  return novaLoadJobs().filter(job => job.projectId === projectId);
+}
+
+function novaWorkspaceJobsForCharacter(characterId) {
+  return novaLoadJobs().filter(job =>
+    (Array.isArray(job.characterIds) &&
+      job.characterIds.includes(characterId)) ||
+    (Array.isArray(job.characterSnapshots) &&
+      job.characterSnapshots.some(
+        snapshot => snapshot.characterId === characterId
+      )) ||
+    (job.characterRef && job.characterRef.id === characterId)
+  );
+}
+
+function novaWorkspaceLoadImageInto(elementId, assetId) {
+  novaGetImage(assetId)
+    .then(blob => {
+      const element = document.getElementById(elementId);
+      if (!element || !blob) return;
+      element.innerHTML =
+        `<img src="${URL.createObjectURL(blob)}" ` +
+        `alt="Character reference" class="ws-thumb-img">`;
+    })
+    .catch(() => {});
+}
+
+function novaRenderWorkspace() {
+  const body = document.getElementById("workspaceBody");
+  if (!body) return;
+
+  if (novaWorkspaceView === "projectForm") {
+    body.innerHTML = novaWorkspaceProjectFormHtml();
+  } else if (novaWorkspaceView === "project") {
+    body.innerHTML = novaWorkspaceProjectDetailHtml();
+    novaWorkspaceLoadDetailImages();
+  } else if (novaWorkspaceView === "characterForm") {
+    body.innerHTML = novaWorkspaceCharacterFormHtml();
+    novaWorkspaceLoadCharacterFormImage();
+  } else {
+    body.innerHTML = novaWorkspaceProjectsHtml();
+  }
+}
+
+function novaWorkspaceDeleteConfirmHtml(type, id, text) {
+  const confirmFn =
+    type === "project"
+      ? "novaWorkspaceConfirmDeleteProject"
+      : "novaWorkspaceConfirmDeleteCharacter";
+  return `<div class="ws-confirm">
+    <p>${novaEscape(text)}</p>
+    <div class="ws-row">
+      <button type="button" class="ws-btn ws-btn-danger" onclick="${confirmFn}('${id}')">Delete</button>
+      <button type="button" class="ws-btn" onclick="novaWorkspaceCancelDelete()">Cancel</button>
+    </div>
+  </div>`;
+}
+
+function novaWorkspaceProjectsHtml() {
+  const projects = novaLoadProjects();
+  const visible = novaWorkspaceShowArchived
+    ? projects
+    : projects.filter(project => !project.archived);
+  const archivedCount = projects.filter(project => project.archived).length;
+
+  let cards = "";
+  if (!visible.length) {
+    cards = `<p class="motion-note">No projects yet. Create your first project to start building characters and worlds.</p>`;
+  } else {
+    cards = visible
+      .map(project => {
+        const characters = novaLoadCharacters().filter(
+          character => character.projectId === project.id
+        );
+        const jobs = novaWorkspaceJobsForProject(project.id);
+        const confirming =
+          novaWorkspaceDeleteTarget &&
+          novaWorkspaceDeleteTarget.type === "project" &&
+          novaWorkspaceDeleteTarget.id === project.id;
+        return `<div class="ws-card">
+        <h3>${novaEscape(project.name)}</h3>
+        <p class="ws-text">${novaEscape(project.description || "")}</p>
+        <p class="motion-note">${characters.length} character${characters.length === 1 ? "" : "s"} · ${jobs.length} production job${jobs.length === 1 ? "" : "s"}${project.archived ? " · Archived" : ""}</p>
+        <div class="ws-row">
+          <button type="button" class="ws-btn" onclick="novaWorkspaceOpenProject('${project.id}')">Open</button>
+          <button type="button" class="ws-btn" onclick="novaWorkspaceEditProject('${project.id}')">Edit</button>
+          ${project.archived
+            ? `<button type="button" class="ws-btn" onclick="novaWorkspaceUnarchiveProject('${project.id}')">Unarchive</button>`
+            : `<button type="button" class="ws-btn" onclick="novaWorkspaceArchiveProject('${project.id}')">Archive</button>`}
+          <button type="button" class="ws-btn ws-btn-danger" onclick="novaWorkspaceAskDeleteProject('${project.id}')">Delete</button>
+        </div>
+        ${confirming ? novaWorkspaceDeleteConfirmHtml("project", project.id, "Delete this project? This cannot be undone.") : ""}
+      </div>`;
+      })
+      .join("");
+  }
+
+  return `<section class="motion-panel">
+    <h2>📁 Projects</h2>
+    <p class="motion-note">Projects hold your characters, worlds and production history. Archived projects are hidden from Motion Studio.</p>
+    <div class="ws-row">
+      <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceNewProject()">+ New Project</button>
+      ${archivedCount ? `<button type="button" class="ws-btn" onclick="novaWorkspaceToggleArchived()">${novaWorkspaceShowArchived ? "Hide archived" : "Show archived (" + archivedCount + ")"}</button>` : ""}
+    </div>
+    <div class="ws-grid">${cards}</div>
+  </section>`;
+}
+
+function novaWorkspaceProjectFormHtml() {
+  const editing = novaWorkspaceProjectId
+    ? novaGetProject(novaWorkspaceProjectId)
+    : null;
+  return `<section class="motion-panel">
+    <h2>${editing ? "Edit Project" : "New Project"}</h2>
+    <label class="motion-label" for="wsProjectName">Project name</label>
+    <input class="motion-input" id="wsProjectName" type="text" value="${editing ? novaEscape(editing.name) : ""}" placeholder="Example: Ashfall — Fantasy Film Universe">
+    <label class="motion-label" for="wsProjectDescription">Description</label>
+    <textarea class="motion-input" id="wsProjectDescription" rows="3" placeholder="What is this project about?">${editing ? novaEscape(editing.description || "") : ""}</textarea>
+    <div class="ws-row">
+      <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceSaveProject()">Save Project</button>
+      <button type="button" class="ws-btn" onclick="novaWorkspaceBackToProjects()">Cancel</button>
+    </div>
+  </section>`;
+}
+
+function novaWorkspaceProjectDetailHtml() {
+  const project = novaGetProject(novaWorkspaceProjectId);
+  if (!project) {
+    return `<section class="motion-panel">
+      <p class="motion-note">This project no longer exists.</p>
+      <button type="button" class="ws-btn" onclick="novaWorkspaceBackToProjects()">Back to Projects</button>
+    </section>`;
+  }
+
+  const characters = novaLoadCharacters().filter(
+    character => character.projectId === project.id
+  );
+  const continuity = project.continuity || {
+    worldDescription: "",
+    visualStyle: "",
+    rules: [],
+    notes: []
+  };
+  const confirmingDelete =
+    novaWorkspaceDeleteTarget &&
+    novaWorkspaceDeleteTarget.type === "project" &&
+    novaWorkspaceDeleteTarget.id === project.id;
+
+  let characterCards = "";
+  if (!characters.length) {
+    characterCards = `<p class="motion-note">No characters yet. Add the first character of this project.</p>`;
+  } else {
+    characterCards = characters
+      .map(character => {
+        const appearance = character.appearance || {};
+        const traits = [appearance.species, appearance.colors, appearance.distinctiveFeatures]
+          .filter(Boolean)
+          .join(" · ");
+        const confirming =
+          novaWorkspaceDeleteTarget &&
+          novaWorkspaceDeleteTarget.type === "character" &&
+          novaWorkspaceDeleteTarget.id === character.id;
+        return `<div class="ws-card">
+        <div class="ws-thumb" id="ws-thumb-${character.id}">${character.imageAssetId ? "" : "<span class=\"motion-note\">No reference image</span>"}</div>
+        <h3>${novaEscape(character.name)}</h3>
+        <p class="ws-text">${novaEscape(character.description || "")}</p>
+        ${traits ? `<p class="motion-note">${novaEscape(traits)}</p>` : ""}
+        <p class="motion-note">Version ${character.version || 1}</p>
+        <div class="ws-row">
+          <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceUseInMotionStudio('${project.id}', '${character.id}')">Use in Motion Studio</button>
+          <button type="button" class="ws-btn" onclick="novaWorkspaceEditCharacter('${character.id}')">Edit</button>
+          <button type="button" class="ws-btn ws-btn-danger" onclick="novaWorkspaceAskDeleteCharacter('${character.id}')">Delete</button>
+        </div>
+        ${confirming ? novaWorkspaceDeleteConfirmHtml("character", character.id, "Delete this character? This cannot be undone.") : ""}
+      </div>`;
+      })
+      .join("");
+  }
+
+  return `<section class="motion-panel">
+    <h2>${novaEscape(project.name)}</h2>
+    <p class="ws-text">${novaEscape(project.description || "")}</p>
+    <div class="ws-row">
+      <button type="button" class="ws-btn" onclick="novaWorkspaceBackToProjects()">← All Projects</button>
+      <button type="button" class="ws-btn" onclick="novaWorkspaceEditProject('${project.id}')">Edit Project</button>
+      <button type="button" class="ws-btn ws-btn-danger" onclick="novaWorkspaceAskDeleteProject('${project.id}')">Delete Project</button>
+    </div>
+    ${confirmingDelete ? novaWorkspaceDeleteConfirmHtml("project", project.id, "Delete this project? This cannot be undone.") : ""}
+  </section>
+
+  <section class="motion-panel">
+    <h2>🎭 Characters</h2>
+    <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceNewCharacter()">+ New Character</button>
+    <div class="ws-grid">${characterCards}</div>
+  </section>
+
+  <section class="motion-panel">
+    <h2>🌍 Project Continuity</h2>
+    <p class="motion-note">These fields describe the world every character in this project shares. They are frozen into each production job as its continuity snapshot.</p>
+    <label class="motion-label" for="wsContinuityWorld">World description</label>
+    <textarea class="motion-input" id="wsContinuityWorld" rows="3">${novaEscape(continuity.worldDescription || "")}</textarea>
+    <label class="motion-label" for="wsContinuityStyle">Visual style</label>
+    <input class="motion-input" id="wsContinuityStyle" type="text" value="${novaEscape(continuity.visualStyle || "")}">
+    <label class="motion-label" for="wsContinuityRules">Continuity rules (one per line)</label>
+    <textarea class="motion-input" id="wsContinuityRules" rows="4">${novaEscape((continuity.rules || []).join("\n"))}</textarea>
+    <label class="motion-label" for="wsContinuityNotes">Project notes (one per line)</label>
+    <textarea class="motion-input" id="wsContinuityNotes" rows="4">${novaEscape((continuity.notes || []).join("\n"))}</textarea>
+    <div class="ws-row">
+      <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceSaveContinuity()">Save Continuity</button>
+    </div>
+  </section>`;
+}
+
+function novaWorkspaceCharacterFormHtml() {
+  const project = novaGetProject(novaWorkspaceProjectId);
+  if (!project) {
+    return `<section class="motion-panel">
+      <p class="motion-note">This project no longer exists.</p>
+      <button type="button" class="ws-btn" onclick="novaWorkspaceBackToProjects()">Back to Projects</button>
+    </section>`;
+  }
+
+  const editing = novaWorkspaceCharacterId
+    ? novaGetCharacter(novaWorkspaceCharacterId)
+    : null;
+  const appearance = (editing && editing.appearance) || {};
+
+  return `<section class="motion-panel">
+    <h2>${editing ? "Edit Character" : "New Character"}</h2>
+    <p class="motion-note">Project: ${novaEscape(project.name)}</p>
+    <label class="motion-label" for="wsCharacterName">Character name</label>
+    <input class="motion-input" id="wsCharacterName" type="text" value="${editing ? novaEscape(editing.name) : ""}" placeholder="Example: Cinder">
+    <label class="motion-label" for="wsCharacterDescription">Description</label>
+    <textarea class="motion-input" id="wsCharacterDescription" rows="3" placeholder="Who is this character?">${editing ? novaEscape(editing.description || "") : ""}</textarea>
+    <div class="motion-two">
+      <div>
+        <label class="motion-label" for="wsCharacterSpecies">Species</label>
+        <input class="motion-input" id="wsCharacterSpecies" type="text" value="${novaEscape(appearance.species || "")}" placeholder="Example: Dragon">
+      </div>
+      <div>
+        <label class="motion-label" for="wsCharacterColors">Colours</label>
+        <input class="motion-input" id="wsCharacterColors" type="text" value="${novaEscape(appearance.colors || "")}" placeholder="Example: Ash-grey, ember cracks">
+      </div>
+    </div>
+    <label class="motion-label" for="wsCharacterFeatures">Distinctive features</label>
+    <input class="motion-input" id="wsCharacterFeatures" type="text" value="${novaEscape(appearance.distinctiveFeatures || "")}" placeholder="Example: Scar on left cheek">
+    <label class="motion-label" for="wsCharacterDetails">Permanent details (one per line)</label>
+    <textarea class="motion-input" id="wsCharacterDetails" rows="4" placeholder="Details that never change about this character.">${novaEscape(((appearance.permanentDetails) || []).join("\n"))}</textarea>
+    <label class="motion-label" for="wsCharacterNotes">Continuity notes (one per line)</label>
+    <textarea class="motion-input" id="wsCharacterNotes" rows="4">${novaEscape(((editing && editing.continuityNotes) || []).join("\n"))}</textarea>
+    <label class="motion-label">Reference image</label>
+    <div class="ws-thumb" id="wsCharacterImagePreview">${editing && editing.imageAssetId ? "" : "<span class=\"motion-note\">No reference image saved</span>"}</div>
+    <label class="motion-label" for="wsCharacterImage">${editing && editing.imageAssetId ? "Replace reference image (optional — leave empty to keep the current image)" : "Upload reference image (optional)"}</label>
+    <input class="motion-upload" id="wsCharacterImage" type="file" accept="image/*">
+    <p class="motion-note">Replacing the image only changes this character. Images already recorded in production jobs stay exactly as they were.</p>
+    <div class="ws-row">
+      <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceSaveCharacter()">Save Character</button>
+      <button type="button" class="ws-btn" onclick="novaWorkspaceBackToProject()">Cancel</button>
+    </div>
+  </section>`;
+}
+
+function novaWorkspaceLoadDetailImages() {
+  if (novaWorkspaceView !== "project") return;
+  const characters = novaLoadCharacters().filter(
+    character => character.projectId === novaWorkspaceProjectId
+  );
+  characters.forEach(character => {
+    if (character.imageAssetId) {
+      novaWorkspaceLoadImageInto(
+        "ws-thumb-" + character.id,
+        character.imageAssetId
+      );
+    }
+  });
+}
+
+function novaWorkspaceLoadCharacterFormImage() {
+  if (novaWorkspaceView !== "characterForm") return;
+  const editing = novaWorkspaceCharacterId
+    ? novaGetCharacter(novaWorkspaceCharacterId)
+    : null;
+  if (editing && editing.imageAssetId) {
+    novaWorkspaceLoadImageInto(
+      "wsCharacterImagePreview",
+      editing.imageAssetId
+    );
+  }
+}
+
+function novaWorkspaceNewProject() {
+  novaWorkspaceProjectId = null;
+  novaWorkspaceCharacterId = null;
+  novaWorkspaceDeleteTarget = null;
+  novaWorkspaceView = "projectForm";
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceEditProject(projectId) {
+  novaWorkspaceProjectId = projectId;
+  novaWorkspaceCharacterId = null;
+  novaWorkspaceDeleteTarget = null;
+  novaWorkspaceView = "projectForm";
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceSaveProject() {
+  const name = document.getElementById("wsProjectName").value.trim();
+  const description = document
+    .getElementById("wsProjectDescription")
+    .value.trim();
+
+  if (!name) {
+    novaWorkspaceSetStatus("Give the project a name before saving.");
+    return;
+  }
+
+  if (novaWorkspaceProjectId) {
+    const saved = novaUpdateProject(novaWorkspaceProjectId, {
+      name,
+      description
+    });
+    if (!saved) {
+      novaWorkspaceSetStatus("That project could not be saved.");
+      return;
+    }
+    novaWorkspaceSetStatus("Project saved.");
+  } else {
+    const created = novaCreateProject(name, description);
+    if (!created) {
+      novaWorkspaceSetStatus("That project could not be created.");
+      return;
+    }
+    novaWorkspaceProjectId = created.id;
+    novaWorkspaceSetStatus("Project created.");
+  }
+
+  novaWorkspaceView = "project";
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceOpenProject(projectId) {
+  novaWorkspaceProjectId = projectId;
+  novaWorkspaceCharacterId = null;
+  novaWorkspaceDeleteTarget = null;
+  novaWorkspaceView = "project";
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceBackToProjects() {
+  novaWorkspaceProjectId = null;
+  novaWorkspaceCharacterId = null;
+  novaWorkspaceDeleteTarget = null;
+  novaWorkspaceView = "projects";
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceBackToProject() {
+  novaWorkspaceCharacterId = null;
+  novaWorkspaceDeleteTarget = null;
+  novaWorkspaceView = "project";
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceToggleArchived() {
+  novaWorkspaceShowArchived = !novaWorkspaceShowArchived;
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceArchiveProject(projectId) {
+  const archived = novaUpdateProject(projectId, { archived: true });
+  if (!archived) {
+    novaWorkspaceSetStatus("That project could not be archived.");
+    return;
+  }
+  if (novaSelectedProjectId === projectId) {
+    novaSelectedProjectId = null;
+    novaSelectedCharacterId = null;
+  }
+  novaWorkspaceSetStatus(
+    "Project archived. It is hidden from Motion Studio."
+  );
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceUnarchiveProject(projectId) {
+  const restored = novaUpdateProject(projectId, { archived: false });
+  if (!restored) {
+    novaWorkspaceSetStatus("That project could not be restored.");
+    return;
+  }
+  novaWorkspaceSetStatus("Project restored.");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceAskDeleteProject(projectId) {
+  const jobs = novaWorkspaceJobsForProject(projectId);
+  if (jobs.length) {
+    novaWorkspaceSetStatus(
+      "This project cannot be deleted: it is used by " +
+        jobs.length +
+        " production job" +
+        (jobs.length === 1 ? "" : "s") +
+        ". Production history is never destroyed."
+    );
+    return;
+  }
+
+  const characters = novaLoadCharacters().filter(
+    character => character.projectId === projectId
+  );
+  if (characters.length) {
+    novaWorkspaceSetStatus(
+      "Delete this project\u2019s " +
+        characters.length +
+        " character" +
+        (characters.length === 1 ? "" : "s") +
+        " first. Projects are never deleted with characters inside them."
+    );
+    return;
+  }
+
+  novaWorkspaceDeleteTarget = { type: "project", id: projectId };
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceConfirmDeleteProject(projectId) {
+  const jobs = novaWorkspaceJobsForProject(projectId);
+  const characters = novaLoadCharacters().filter(
+    character => character.projectId === projectId
+  );
+  if (jobs.length || characters.length) {
+    novaWorkspaceDeleteTarget = null;
+    novaWorkspaceSetStatus("This project can no longer be deleted.");
+    novaRenderWorkspace();
+    return;
+  }
+
+  const saved = novaSaveProjects(
+    novaLoadProjects().filter(project => project.id !== projectId)
+  );
+
+  if (!saved) {
+    novaWorkspaceSetStatus("Project deletion failed. Your project was preserved.");
+    novaRenderWorkspace();
+    return;
+  }
+
+  if (novaSelectedProjectId === projectId) {
+    novaSelectedProjectId = null;
+    novaSelectedCharacterId = null;
+  }
+
+  novaWorkspaceDeleteTarget = null;
+  novaWorkspaceProjectId = null;
+  novaWorkspaceCharacterId = null;
+  novaWorkspaceView = "projects";
+  novaWorkspaceSetStatus("Project deleted.");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceCancelDelete() {
+  novaWorkspaceDeleteTarget = null;
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceNewCharacter() {
+  if (!novaGetProject(novaWorkspaceProjectId)) {
+    novaWorkspaceSetStatus("Select a project first.");
+    return;
+  }
+  novaWorkspaceCharacterId = null;
+  novaWorkspaceDeleteTarget = null;
+  novaWorkspaceView = "characterForm";
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceEditCharacter(characterId) {
+  const character = novaGetCharacter(characterId);
+  if (!character) {
+    novaWorkspaceSetStatus("That character no longer exists.");
+    return;
+  }
+  novaWorkspaceProjectId = character.projectId;
+  novaWorkspaceCharacterId = characterId;
+  novaWorkspaceDeleteTarget = null;
+  novaWorkspaceView = "characterForm";
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+async function novaWorkspaceSaveCharacter() {
+  const name = document.getElementById("wsCharacterName").value.trim();
+  const description = document
+    .getElementById("wsCharacterDescription")
+    .value.trim();
+  const species = document.getElementById("wsCharacterSpecies").value.trim();
+  const colors = document.getElementById("wsCharacterColors").value.trim();
+  const distinctiveFeatures = document
+    .getElementById("wsCharacterFeatures")
+    .value.trim();
+  const permanentDetails = novaWorkspaceLines(
+    document.getElementById("wsCharacterDetails").value
+  );
+  const continuityNotes = novaWorkspaceLines(
+    document.getElementById("wsCharacterNotes").value
+  );
+
+  if (!name) {
+    novaWorkspaceSetStatus("Give the character a name before saving.");
+    return;
+  }
+
+  const editing = novaWorkspaceCharacterId
+    ? novaGetCharacter(novaWorkspaceCharacterId)
+    : null;
+  const projectId = editing
+    ? editing.projectId
+    : novaWorkspaceProjectId;
+
+  if (!novaGetProject(projectId)) {
+    novaWorkspaceSetStatus("Select a project first.");
+    return;
+  }
+
+  let imageAssetId = editing ? editing.imageAssetId || null : null;
+  const fileInput = document.getElementById("wsCharacterImage");
+  const file =
+    fileInput && fileInput.files.length ? fileInput.files[0] : null;
+
+  if (file) {
+    if (file.size > 5 * 1024 * 1024) {
+      novaWorkspaceSetStatus(
+        "Reference images must be 5 MB or smaller for this prototype."
+      );
+      return;
+    }
+    const uploaded = await novaStoreImage(file);
+    if (!uploaded || !uploaded.id) {
+      novaWorkspaceSetStatus(
+        "NOVA could not save the uploaded reference image. Please check browser storage."
+      );
+      return;
+    }
+    imageAssetId = uploaded.id;
+  }
+
+  const appearance = {
+    species,
+    colors,
+    distinctiveFeatures,
+    permanentDetails
+  };
+
+  if (editing) {
+    const saved = novaUpdateCharacter(editing.id, {
+      name,
+      description,
+      appearance,
+      imageAssetId,
+      continuityNotes
+    });
+    if (!saved) {
+      novaWorkspaceSetStatus("That character could not be saved.");
+      return;
+    }
+    novaWorkspaceSetStatus("Character saved.");
+  } else {
+    const created = novaCreateCharacter(projectId, {
+      name,
+      description,
+      appearance,
+      imageAssetId,
+      continuityNotes
+    });
+    if (!created) {
+      novaWorkspaceSetStatus("That character could not be created.");
+      return;
+    }
+    novaWorkspaceCharacterId = created.id;
+    novaWorkspaceSetStatus("Character created.");
+  }
+
+  novaWorkspaceView = "project";
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceAskDeleteCharacter(characterId) {
+  const jobs = novaWorkspaceJobsForCharacter(characterId);
+  if (jobs.length) {
+    novaWorkspaceSetStatus(
+      "This character cannot be deleted: it is used by " +
+        jobs.length +
+        " production job" +
+        (jobs.length === 1 ? "" : "s") +
+        ". Production history is never destroyed."
+    );
+    return;
+  }
+
+  novaWorkspaceDeleteTarget = { type: "character", id: characterId };
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceConfirmDeleteCharacter(characterId) {
+  const jobs = novaWorkspaceJobsForCharacter(characterId);
+  if (jobs.length) {
+    novaWorkspaceDeleteTarget = null;
+    novaWorkspaceSetStatus("This character can no longer be deleted.");
+    novaRenderWorkspace();
+    return;
+  }
+
+  const character = novaGetCharacter(characterId);
+  if (!character) {
+    novaWorkspaceSetStatus(
+      "This character no longer exists. Refresh the workspace before continuing."
+    );
+    novaRenderWorkspace();
+    return;
+  }
+
+  // Inconsistent-data safeguard: never delete one side of a broken
+  // character/project relationship. If the character's project is
+  // missing, the project's character mirror is not a list, or the
+  // mirror does not contain this character, block the deletion
+  // before anything is written and say the relationship needs repair.
+  const project = novaGetProject(character.projectId);
+  if (!project) {
+    novaWorkspaceSetStatus(
+      "This character's project could not be found. Deletion is blocked until the character's project relationship is repaired."
+    );
+    novaRenderWorkspace();
+    return;
+  }
+  if (!Array.isArray(project.characterIds)) {
+    novaWorkspaceSetStatus(
+      "This character's project record is damaged. Deletion is blocked until the character's project relationship is repaired."
+    );
+    novaRenderWorkspace();
+    return;
+  }
+  if (!project.characterIds.includes(characterId)) {
+    novaWorkspaceSetStatus(
+      "This character is missing from its project's character list. Repair the relationship before deleting."
+    );
+    novaRenderWorkspace();
+    return;
+  }
+
+  const originalCharacters = novaLoadCharacters();
+  const saved = novaSaveCharacters(
+    originalCharacters.filter(item => item.id !== characterId)
+  );
+
+  if (!saved) {
+    novaWorkspaceSetStatus("Character deletion failed. Your character was preserved.");
+    novaRenderWorkspace();
+    return;
+  }
+
+  const updated = novaUpdateProject(project.id, {
+    characterIds: project.characterIds.filter(id => id !== characterId)
+  });
+  if (!updated) {
+    const restored = novaSaveCharacters(originalCharacters);
+    novaWorkspaceSetStatus(
+      restored
+        ? "Character deletion failed. Your character was preserved."
+        : "Character deletion failed and the character could not be restored. Please check browser storage."
+    );
+    novaRenderWorkspace();
+    return;
+  }
+
+  if (novaSelectedCharacterId === characterId) {
+    novaSelectedCharacterId = null;
+  }
+
+  novaWorkspaceDeleteTarget = null;
+  novaWorkspaceCharacterId = null;
+  novaWorkspaceView = "project";
+  novaWorkspaceSetStatus("Character deleted.");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceSaveContinuity() {
+  const project = novaGetProject(novaWorkspaceProjectId);
+  if (!project) {
+    novaWorkspaceSetStatus("That project no longer exists.");
+    return;
+  }
+
+  const continuity = {
+    worldDescription: document
+      .getElementById("wsContinuityWorld")
+      .value.trim(),
+    visualStyle: document.getElementById("wsContinuityStyle").value.trim(),
+    rules: novaWorkspaceLines(
+      document.getElementById("wsContinuityRules").value
+    ),
+    notes: novaWorkspaceLines(
+      document.getElementById("wsContinuityNotes").value
+    )
+  };
+
+  const saved = novaUpdateProject(project.id, { continuity });
+  if (!saved) {
+    novaWorkspaceSetStatus("Continuity could not be saved.");
+    return;
+  }
+
+  novaWorkspaceSetStatus("Continuity saved.");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceUseInMotionStudio(projectId, characterId) {
+  const project = novaGetProject(projectId);
+  const character = novaGetCharacter(characterId);
+  if (
+    !project ||
+    project.archived ||
+    !character ||
+    character.projectId !== projectId
+  ) {
+    novaWorkspaceSetStatus(
+      "That character is not available for production."
+    );
+    return;
+  }
+  novaSelectedProjectId = projectId;
+  novaSelectedCharacterId = characterId;
+  closeProjectWorkspace();
+  openMotionStudio();
+}
+
+/* ---------- Motion Studio production identity ---------- */
+
+function novaRenderProductionIdentity() {
+  const projectSelect = document.getElementById("motionProject");
+  const characterSelect = document.getElementById("motionCharacterSelect");
+  const review = document.getElementById("motionIdentityReview");
+  if (!projectSelect || !characterSelect || !review) return;
+
+  // Self-healing: drop a selection whose project or character is gone,
+  // archived, or no longer belongs to the selected project.
+  const project = novaSelectedProjectId
+    ? novaGetProject(novaSelectedProjectId)
+    : null;
+  if (novaSelectedProjectId && (!project || project.archived)) {
+    novaSelectedProjectId = null;
+    novaSelectedCharacterId = null;
+  }
+  const character = novaSelectedCharacterId
+    ? novaGetCharacter(novaSelectedCharacterId)
+    : null;
+  if (
+    novaSelectedCharacterId &&
+    (!character || character.projectId !== novaSelectedProjectId)
+  ) {
+    novaSelectedCharacterId = null;
+  }
+
+  const projects = novaLoadProjects().filter(item => !item.archived);
+  projectSelect.innerHTML =
+    `<option value="">Standalone Production</option>` +
+    projects
+      .map(
+        item =>
+          `<option value="${item.id}"${item.id === novaSelectedProjectId ? " selected" : ""}>${novaEscape(item.name)}</option>`
+      )
+      .join("");
+
+  if (!novaSelectedProjectId) {
+    characterSelect.innerHTML = `<option value="">No character</option>`;
+    characterSelect.disabled = true;
+    review.innerHTML = `<p class="motion-note">Standalone production: no project identity. Your video uses the description and reference image you provide here.</p>`;
+    return;
+  }
+
+  const characters = novaLoadCharacters().filter(
+    item => item.projectId === novaSelectedProjectId
+  );
+  characterSelect.disabled = false;
+  characterSelect.innerHTML =
+    `<option value="">Select a character</option>` +
+    characters
+      .map(
+        item =>
+          `<option value="${item.id}"${item.id === novaSelectedCharacterId ? " selected" : ""}>${novaEscape(item.name)}</option>`
+      )
+      .join("");
+
+  const selected = novaSelectedCharacterId
+    ? novaGetCharacter(novaSelectedCharacterId)
+    : null;
+  if (!selected) {
+    review.innerHTML = `<p class="motion-note">Select a character to use this project\u2019s saved identity for your production.</p>`;
+    return;
+  }
+
+  const appearance = selected.appearance || {};
+  const traits = [appearance.species, appearance.colors, appearance.distinctiveFeatures]
+    .filter(Boolean)
+    .join(" \u00b7 ");
+  review.innerHTML = `<div class="ws-identity">
+    <div class="ws-thumb ws-thumb-small" id="motionIdentityThumb">${selected.imageAssetId ? "" : "<span class=\"motion-note\">No reference image</span>"}</div>
+    <div>
+      <strong>${novaEscape(selected.name)}</strong><br>
+      <span class="motion-note">${novaEscape(selected.description || "")}</span><br>
+      ${traits ? `<span class="motion-note">${novaEscape(traits)}</span><br>` : ""}
+      <span class="motion-note">Version ${selected.version || 1}</span>
+    </div>
+  </div>`;
+  if (selected.imageAssetId) {
+    novaWorkspaceLoadImageInto("motionIdentityThumb", selected.imageAssetId);
+  }
+}
+
+function novaSelectProductionProject(projectId) {
+  if (!projectId) {
+    novaSelectedProjectId = null;
+    novaSelectedCharacterId = null;
+  } else {
+    novaSelectedProjectId = projectId;
+    novaSelectedCharacterId = null;
+  }
+  novaRenderProductionIdentity();
+}
+
+function novaSelectProductionCharacter(characterId) {
+  novaSelectedCharacterId = characterId || null;
+  novaRenderProductionIdentity();
 }
 
 /* ---------- Provider Interface (contract only, Stage 3.1) ----------
