@@ -926,6 +926,59 @@
   }
 }
 
+
+/* Stage 3.4E — Continuity Intelligence review (additive; the 3.4D
+   identity card above is untouched). Stacked, mobile-first. */
+
+.ws-continuity {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.ws-continuity p {
+  margin: 0 0 8px;
+}
+
+.ws-summary-list {
+  margin: 0 0 10px 18px;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.ws-warn {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--purple);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ws-warn-dismiss {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
+@media (max-width: 380px) {
+  .ws-warn {
+    flex-direction: column;
+  }
+
+  .ws-warn-dismiss {
+    align-self: flex-end;
+  }
+}
+
 </style>
 </head>
 
@@ -1665,6 +1718,20 @@ function buildMotionPlan() {
   const beats = novaChooseBeats(prompt, sceneCount);
   const timings = novaDistributeTime(duration, sceneCount);
 
+  // Stage 3.4E: when a project + character are selected, the
+  // saved continuity strengthens each scene prompt. The user's
+  // original prompt text is never modified.
+  let continuityLine = "";
+  if (novaSelectedProjectId && novaSelectedCharacterId) {
+    const built = novaBuildContinuityContext(
+      novaSelectedProjectId,
+      novaSelectedCharacterId
+    );
+    if (built && built.context) {
+      continuityLine = novaContinuitySceneLine(built.context);
+    }
+  }
+
   let elapsed = 0;
 
   const scenes = beats.map((beat, index) => {
@@ -1685,6 +1752,7 @@ function buildMotionPlan() {
         character ||
         "Maintain the same subject identity and appearance throughout the sequence."
       ),
+      ...(continuityLine ? [continuityLine] : []),
       "Environment and visual continuity must remain consistent with previous scenes.",
       "Aspect ratio: " + ratio
     ].join(" ");
@@ -1782,6 +1850,10 @@ if (generateButton) {
 
   empty.style.display = "none";
   output.style.display = "block";
+
+  // Stage 3.4E: refresh the identity review so continuity
+  // warnings reflect the final prompt text.
+  novaRenderProductionIdentity();
 }
 
 
@@ -3336,6 +3408,19 @@ async function novaCreateProjectJob(plan, projectId, characterId) {
     createdAt: character.createdAt
   };
 
+  // Stage 3.4E: build the continuity context fresh at creation,
+  // so the job snapshot reflects the records at this moment.
+  // The validation above already guarantees the context builds;
+  // the null guard is defence only.
+  const continuityBuilt = novaBuildContinuityContext(
+    project.id,
+    character.id
+  );
+  const continuityContext =
+    continuityBuilt && continuityBuilt.context
+      ? JSON.parse(JSON.stringify(continuityBuilt.context))
+      : null;
+
   const job = {
     id: novaNewId("nova-job"),
     createdAt: new Date().toISOString(),
@@ -3400,7 +3485,12 @@ async function novaCreateProjectJob(plan, projectId, characterId) {
           notes: []
         }
       )
-    )
+    ),
+
+    // Stage 3.4E: the continuity context used at the moment of
+    // creation, built fresh from the current records. Immutable:
+    // later edits to the project or character never rewrite it.
+    continuityContext
   };
 
   novaSaveJob(job);
@@ -4313,7 +4403,7 @@ function novaRenderProductionIdentity() {
       ${traits ? `<span class="motion-note">${novaEscape(traits)}</span><br>` : ""}
       <span class="motion-note">Version ${selected.version || 1}</span>
     </div>
-  </div>`;
+  </div>` + novaContinuityReviewHtml(selected, project);
   if (selected.imageAssetId) {
     novaWorkspaceLoadImageInto("motionIdentityThumb", selected.imageAssetId);
   }
@@ -4333,6 +4423,618 @@ function novaSelectProductionProject(projectId) {
 function novaSelectProductionCharacter(characterId) {
   novaSelectedCharacterId = characterId || null;
   novaRenderProductionIdentity();
+}
+
+/* =====================================================================
+   NOVA MOTION — Stage 3.4E: Continuity Intelligence
+   ---------------------------------------------------------------------
+   Project + character memory becomes active planning input instead of
+   inert storage. All helpers here are read-only: nothing in this
+   section writes a project, character, or job record.
+
+   - novaBuildContinuityContext(projectId, characterId) gathers the
+     saved project + character memory into one structured, deep-copied
+     context, or returns a clear error when the relationship is
+     invalid.
+   - novaCheckContinuityConflicts(context, promptText) compares the
+     user's prompt against the saved memory with deterministic
+     keyword/phrase rules and returns warnings. It is NOT AI
+     reasoning and never claims to be; warnings are for the user to
+     review and never block generation.
+   - novaContinuitySceneLine(context) builds one additive sentence
+     for the generated scene prompts. The user's original prompt
+     text is never modified.
+   - novaDismissContinuityWarning(key) hides one warning for the
+     current session only; a reload shows warnings again.
+
+   Integration points (see 34e-design.md):
+   - buildMotionPlan() adds the scene line + refreshes the review.
+   - novaCreateProjectJob() snapshots a fresh context at creation.
+   - novaRenderProductionIdentity() shows the continuity summary
+     and warnings via novaContinuityReviewHtml().
+   ===================================================================== */
+
+// Dismissed warning keys, current session only. A reload starts
+// with an empty set, so a dismissed warning never hides a conflict
+// from a future session silently.
+let novaDismissedContinuityWarnings = new Set();
+
+// Fixed lexicons for the deterministic conflict checks. Deliberately
+// small: these are era/feature words, not a language model.
+const NOVA_CONTINUITY_COLORS = [
+  "black", "white", "red", "blue", "green", "yellow", "orange",
+  "purple", "pink", "brown", "grey", "gray", "silver", "gold",
+  "golden", "bronze", "copper", "crimson", "azure", "emerald",
+  "scarlet", "violet", "amber", "ivory", "obsidian"
+];
+
+const NOVA_CONTINUITY_FEATURES = [
+  "scales", "scale", "eyes", "eye", "eyed", "hair", "skin", "fur",
+  "wings", "wing", "horns", "horn", "claws", "claw", "teeth",
+  "tooth", "feathers", "feather", "tail", "armor", "armour",
+  "cloak", "robe", "dress", "crown", "beard", "ears", "ear",
+  "nose", "face", "hands", "hand"
+];
+
+const NOVA_CONTINUITY_NUMBER_WORDS = {
+  one: 1, two: 2, three: 3, four: 4, five: 5
+};
+
+// Era markers are era-denoting words only. Genre words (dragon,
+// magic, village, forest) are deliberately excluded: a dragon can
+// appear in any era, but a castle or a skyscraper places one.
+const NOVA_CONTINUITY_MEDIEVAL_MARKERS = [
+  "medieval", "castle", "knight", "sword", "throne", "kingdom",
+  "dungeon", "drawbridge", "moat", "blacksmith", "peasant"
+];
+
+const NOVA_CONTINUITY_MODERN_MARKERS = [
+  "modern", "skyscraper", "smartphone", "computer", "airplane",
+  "aeroplane", "subway", "neon", "laptop", "internet", "car", "phone"
+];
+
+function novaContinuityText(value) {
+  return typeof value === "string" ? value : "";
+}
+
+function novaContinuityList(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter(item => typeof item === "string");
+}
+
+function novaContinuityTokens(text) {
+  if (typeof text !== "string") return [];
+  const found = text.toLowerCase().match(/[a-z0-9]+/g);
+  return found || [];
+}
+
+function novaBuildContinuityContext(projectId, characterId) {
+  const project = novaGetProject(projectId);
+
+  if (!project) {
+    return { context: null, error: "The selected project does not exist." };
+  }
+
+  const character = novaGetCharacter(characterId);
+
+  if (!character) {
+    return { context: null, error: "The selected character does not exist." };
+  }
+
+  // Belonging is decided by the character's own projectId, the same
+  // rule as 3.4C. The characterIds mirror is never consulted here.
+  if (character.projectId !== project.id) {
+    return {
+      context: null,
+      error: "The selected character does not belong to the selected project."
+    };
+  }
+
+  // Malformed records coerce to safe defaults; the builder never
+  // throws on stored data.
+  const continuity =
+    project.continuity &&
+    typeof project.continuity === "object" &&
+    !Array.isArray(project.continuity)
+      ? project.continuity
+      : {};
+  const appearance =
+    character.appearance &&
+    typeof character.appearance === "object" &&
+    !Array.isArray(character.appearance)
+      ? character.appearance
+      : {};
+
+  return {
+    context: {
+      project: {
+        id: project.id,
+        name: novaContinuityText(project.name),
+        description: novaContinuityText(project.description),
+        worldDescription: novaContinuityText(continuity.worldDescription),
+        visualStyle: novaContinuityText(continuity.visualStyle),
+        rules: novaContinuityList(continuity.rules),
+        notes: novaContinuityList(continuity.notes)
+      },
+      character: {
+        id: character.id,
+        name: novaContinuityText(character.name),
+        description: novaContinuityText(character.description),
+        species: novaContinuityText(appearance.species),
+        colors: novaContinuityText(appearance.colors),
+        distinctiveFeatures: novaContinuityText(appearance.distinctiveFeatures),
+        permanentDetails: novaContinuityList(appearance.permanentDetails),
+        continuityNotes: novaContinuityList(character.continuityNotes),
+        imageAssetId: character.imageAssetId || null,
+        version:
+          typeof character.version === "number" && character.version > 0
+            ? character.version
+            : 1
+      },
+      builtAt: new Date().toISOString()
+    },
+    error: null
+  };
+}
+
+// Maps a feature token to its canonical (singular) form so "scales"
+// in the prompt matches "scale" in a saved detail.
+function novaContinuityFeatureKey(token, features) {
+  if (token.endsWith("s") && features.has(token.slice(0, -1))) {
+    return token.slice(0, -1);
+  }
+  return token;
+}
+
+// True when the token names a feature (a lexicon word, the species
+// word, or the plural of one of those).
+function novaContinuityIsFeature(token, features) {
+  if (features.has(token)) return true;
+  return token.endsWith("s") && features.has(token.slice(0, -1));
+}
+
+// True when a stretch of text contains at least one feature token.
+// Used by the guarded splitter: a boundary only separates two
+// descriptions when both sides describe a feature.
+function novaContinuityHasFeature(text, features) {
+  return novaContinuityTokens(text).some(token =>
+    novaContinuityIsFeature(token, features)
+  );
+}
+
+// Splits text at boundaries matched by `pattern`, but only where
+// BOTH sides contain a feature. A boundary inside one description
+// (a colour list such as "red, black and silver scales", or "black
+// and silver scales") is left alone, so no colour is orphaned.
+// The split recurses on both halves, so every qualifying boundary
+// is honoured. `pattern` must be non-global (exec always restarts
+// from the beginning of the text it is given).
+function novaContinuitySplitGuarded(text, pattern, features) {
+  const match = pattern.exec(text);
+  if (!match) return [text];
+  const before = text.slice(0, match.index);
+  const after = text.slice(match.index + match[0].length);
+  if (
+    novaContinuityHasFeature(before, features) &&
+    novaContinuityHasFeature(after, features)
+  ) {
+    return novaContinuitySplitGuarded(before, pattern, features).concat(
+      novaContinuitySplitGuarded(after, pattern, features)
+    );
+  }
+  // This boundary does not qualify; try the next one. The text up
+  // to and including this boundary is prepended to the first piece
+  // of the recursion, so nothing is lost.
+  const rest = novaContinuitySplitGuarded(after, pattern, features);
+  rest[0] = text.slice(0, match.index + match[0].length) + rest[0];
+  return rest;
+}
+
+// Returns a Map: canonical feature -> Set of colors attached to that
+// feature in the text.
+//
+// CORRECTION 2 — punctuation-aware, feature-aware matching. The old
+// fixed token window dropped punctuation entirely, so in a comma
+// list a colour could attach to the wrong feature ("blue" in "red
+// scales, blue eyes" attached to scales) or mask a real
+// contradiction ("blue" in saved "red scales, blue eyes" attached
+// to scales, hiding blue-vs-red). Matching now works in two steps:
+//
+// 1. SEGMENT: split the text at punctuation and conjunctions, but
+//    only where both sides describe a feature — so "red scales,
+//    blue eyes" splits into two descriptions, while "black and
+//    silver scales" and "red, black and silver scales" stay whole
+//    (a colour list, not two descriptions).
+// 2. ASSIGN: within a segment, each colour attaches to the NEAREST
+//    feature (max 4 tokens away, so "black and silver scales",
+//    "scales of red" and "eyes of deep blue" all match). On a tie
+//    the colour goes to the FOLLOWING feature — adjectives precede
+//    nouns in English ("blue" in "red scales blue eyes" belongs
+//    to eyes). A colour with no feature nearby is left unassigned;
+//    on the saved side the bare-colour fallback still attaches
+//    feature-less statements to the species.
+function novaContinuityFeatureColors(text, extraFeatures) {
+  const features = new Set(NOVA_CONTINUITY_FEATURES.concat(extraFeatures || []));
+  const colors = new Set(NOVA_CONTINUITY_COLORS);
+  const found = new Map();
+
+  // Punctuation boundaries first (sentence/clause breaks are the
+  // strongest separators), then conjunctions within each part.
+  const segments = novaContinuitySplitGuarded(text, /[,;:.!?\n]/, features)
+    .map(part =>
+      novaContinuitySplitGuarded(part, /\b(?:and|but|or)\b/i, features)
+    )
+    .reduce((all, parts) => all.concat(parts), []);
+
+  segments.forEach(segment => {
+    const tokens = novaContinuityTokens(segment);
+    const featureAt = [];
+    const colorAt = [];
+    tokens.forEach((token, i) => {
+      if (novaContinuityIsFeature(token, features)) {
+        featureAt.push({
+          index: i,
+          key: novaContinuityFeatureKey(token, features)
+        });
+      } else if (colors.has(token)) {
+        colorAt.push({ index: i, value: token });
+      }
+    });
+    colorAt.forEach(color => {
+      let best = null;
+      let bestDistance = Infinity;
+      featureAt.forEach(feature => {
+        const distance = Math.abs(feature.index - color.index);
+        if (
+          distance <= 4 &&
+          (distance < bestDistance ||
+            (distance === bestDistance && feature.index > best.index))
+        ) {
+          best = feature;
+          bestDistance = distance;
+        }
+      });
+      if (best) {
+        if (!found.has(best.key)) found.set(best.key, new Set());
+        found.get(best.key).add(color.value);
+      }
+    });
+  });
+
+  return found;
+}
+
+// Finds a count (number word or digit) near eye/eyes/eyed, or null.
+function novaContinuityEyeCount(text) {
+  const tokens = novaContinuityTokens(text);
+
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] !== "eye" && tokens[i] !== "eyes" && tokens[i] !== "eyed") {
+      continue;
+    }
+    for (let j = Math.max(0, i - 2); j <= Math.min(tokens.length - 1, i + 2); j++) {
+      if (j === i) continue;
+      if (
+        Object.prototype.hasOwnProperty.call(
+          NOVA_CONTINUITY_NUMBER_WORDS,
+          tokens[j]
+        )
+      ) {
+        return NOVA_CONTINUITY_NUMBER_WORDS[tokens[j]];
+      }
+      if (/^[1-5]$/.test(tokens[j])) return Number(tokens[j]);
+    }
+  }
+
+  return null;
+}
+
+function novaContinuityEra(text) {
+  const tokens = new Set(novaContinuityTokens(text));
+  const medieval = NOVA_CONTINUITY_MEDIEVAL_MARKERS.some(marker =>
+    tokens.has(marker)
+  );
+  const modern = NOVA_CONTINUITY_MODERN_MARKERS.some(marker =>
+    tokens.has(marker)
+  );
+  if (medieval && !modern) return "medieval";
+  if (modern && !medieval) return "modern";
+  return null;
+}
+
+function novaCheckContinuityConflicts(context, promptText) {
+  const warnings = [];
+
+  if (!context || !context.character || !context.project) return warnings;
+
+  const prompt = typeof promptText === "string" ? promptText : "";
+  if (!prompt.trim()) return warnings;
+
+  // The character's own kind (last species word, e.g. "dragon" in
+  // "fire dragon") counts as a feature, so a colors statement like
+  // "black and silver" can be compared against "red dragon".
+  const speciesTokens = novaContinuityTokens(context.character.species || "");
+  const speciesFeature = speciesTokens.length
+    ? speciesTokens[speciesTokens.length - 1]
+    : null;
+  const extraFeatures = speciesFeature ? [speciesFeature] : [];
+
+  // --- 1. Color vs feature ---
+  const promptColors = novaContinuityFeatureColors(prompt, extraFeatures);
+  const savedStatements = context.character.permanentDetails.concat(
+    context.character.colors ? [context.character.colors] : []
+  );
+  const savedColors = new Map();
+
+  savedStatements.forEach(statement => {
+    const found = novaContinuityFeatureColors(statement, extraFeatures);
+    let anyFeature = false;
+    found.forEach((colors, feature) => {
+      anyFeature = true;
+      if (!savedColors.has(feature)) savedColors.set(feature, new Set());
+      colors.forEach(color => savedColors.get(feature).add(color));
+    });
+    // Colors with no feature noun attach to the species.
+    if (!anyFeature && speciesFeature) {
+      const bare = novaContinuityTokens(statement).filter(token =>
+        NOVA_CONTINUITY_COLORS.includes(token)
+      );
+      if (bare.length) {
+        if (!savedColors.has(speciesFeature)) {
+          savedColors.set(speciesFeature, new Set());
+        }
+        bare.forEach(color => savedColors.get(speciesFeature).add(color));
+      }
+    }
+  });
+
+  const seen = new Set();
+  promptColors.forEach((promptSet, feature) => {
+    if (!savedColors.has(feature)) return;
+    const savedSet = savedColors.get(feature);
+    promptSet.forEach(promptColor => {
+      if (savedSet.has(promptColor)) return;
+      savedSet.forEach(savedColor => {
+        const key = "color:" + feature + ":" + savedColor + ":" + promptColor;
+        if (seen.has(key)) return;
+        seen.add(key);
+        warnings.push({
+          key,
+          kind: "appearance",
+          message:
+            "Prompt describes the " +
+            feature +
+            " as " +
+            promptColor +
+            ", but the saved permanent details say " +
+            savedColor +
+            "."
+        });
+      });
+    });
+  });
+
+  // --- 2. Eye count ---
+  const promptEyes = novaContinuityEyeCount(prompt);
+  let savedEyes = null;
+  for (const statement of context.character.permanentDetails) {
+    savedEyes = novaContinuityEyeCount(statement);
+    if (savedEyes !== null) break;
+  }
+  if (promptEyes !== null && savedEyes !== null && promptEyes !== savedEyes) {
+    warnings.push({
+      key: "eyes:" + savedEyes + ":" + promptEyes,
+      kind: "count",
+      message:
+        "Prompt describes " +
+        promptEyes +
+        (promptEyes === 1 ? " eye" : " eyes") +
+        ", but the saved permanent details say " +
+        savedEyes +
+        (savedEyes === 1 ? " eye" : " eyes") +
+        "."
+    });
+  }
+
+  // --- 3. Era / setting ---
+  const projectEra = novaContinuityEra(
+    (context.project.worldDescription || "") +
+      " " +
+      (context.project.visualStyle || "")
+  );
+  const promptEra = novaContinuityEra(prompt);
+  if (projectEra && promptEra && projectEra !== promptEra) {
+    warnings.push({
+      key: "era:" + projectEra + ":" + promptEra,
+      kind: "setting",
+      message:
+        "The project world is " +
+        projectEra +
+        ", but this prompt reads as " +
+        promptEra +
+        ". Check the setting matches the world you established."
+    });
+  }
+
+  return warnings;
+}
+
+function novaContinuitySceneLine(context) {
+  if (!context || !context.character || !context.project) return "";
+
+  // Every memory category the context retrieves reaches the scene
+  // prompt, each under a clear label so the model can tell permanent
+  // character traits apart from project-world rules and general
+  // notes. Only non-empty values are included, and no category is
+  // repeated. The project's visual style is labelled "Project visual
+  // style" so it cannot be confused with the scene's own
+  // "Visual style" line (the selected plan style).
+  const parts = [];
+  const project = context.project;
+  const character = context.character;
+
+  if (project.name) {
+    parts.push(
+      "Project: " +
+        project.name +
+        (project.description ? " — " + project.description : "")
+    );
+  } else if (project.description) {
+    parts.push("Project: " + project.description);
+  }
+  if (project.worldDescription) {
+    parts.push("World: " + project.worldDescription);
+  }
+  if (project.visualStyle) {
+    parts.push("Project visual style: " + project.visualStyle);
+  }
+  if (project.rules.length) {
+    parts.push("Project rules: " + project.rules.join("; "));
+  }
+  if (project.notes.length) {
+    parts.push("Project notes: " + project.notes.join("; "));
+  }
+
+  if (character.name) {
+    parts.push(
+      "Character: " +
+        character.name +
+        " (version " +
+        (character.version || 1) +
+        ")" +
+        (character.description ? " — " + character.description : "")
+    );
+  } else if (character.description) {
+    parts.push("Character: " + character.description);
+  }
+  if (character.species) {
+    parts.push("Species: " + character.species);
+  }
+  if (character.colors) {
+    parts.push("Colors: " + character.colors);
+  }
+  if (character.distinctiveFeatures) {
+    parts.push("Distinctive features: " + character.distinctiveFeatures);
+  }
+  if (character.permanentDetails.length) {
+    parts.push(
+      "Permanent details: " + character.permanentDetails.join("; ")
+    );
+  }
+  if (character.continuityNotes.length) {
+    parts.push("Character notes: " + character.continuityNotes.join("; "));
+  }
+
+  if (!parts.length) return "";
+  return "Saved continuity: " + parts.join(". ") + ".";
+}
+
+function novaDismissContinuityWarning(key) {
+  novaDismissedContinuityWarnings.add(key);
+  novaRenderProductionIdentity();
+}
+
+// Builds the continuity summary + warnings HTML appended to the
+// Production Identity card. Warning keys contain only [a-z0-9:],
+// so they are safe inside the single-quoted onclick argument.
+function novaContinuityReviewHtml(character, project) {
+  const built = novaBuildContinuityContext(project.id, character.id);
+
+  if (!built || !built.context) {
+    return (
+      `<div class="ws-continuity"><p class="motion-note">` +
+      novaEscape(
+        built && built.error
+          ? built.error
+          : "Continuity information is unavailable."
+      ) +
+      `</p></div>`
+    );
+  }
+
+  const context = built.context;
+  const promptField = document.getElementById("motionPrompt");
+  const promptText = promptField ? promptField.value : "";
+  const warnings = novaCheckContinuityConflicts(context, promptText).filter(
+    warning => !novaDismissedContinuityWarnings.has(warning.key)
+  );
+
+  let html = `<div class="ws-continuity">`;
+  html += `<p><strong>Continuity review — ${novaEscape(context.project.name)}</strong></p>`;
+  html += `<p class="motion-note">Character version ${context.character.version}</p>`;
+
+  if (context.project.description) {
+    html += `<p class="motion-note">Project description: ${novaEscape(context.project.description)}</p>`;
+  } else {
+    html += `<p class="motion-note">No project description saved yet.</p>`;
+  }
+  if (context.project.worldDescription) {
+    html += `<p class="motion-note">World: ${novaEscape(context.project.worldDescription)}</p>`;
+  }
+  if (context.project.visualStyle) {
+    html += `<p class="motion-note">Visual style: ${novaEscape(context.project.visualStyle)}</p>`;
+  } else {
+    html += `<p class="motion-note">No visual style saved for this project yet.</p>`;
+  }
+
+  if (context.character.permanentDetails.length) {
+    html +=
+      `<p class="motion-note">Permanent details:</p><ul class="ws-summary-list">` +
+      context.character.permanentDetails
+        .map(detail => `<li>${novaEscape(detail)}</li>`)
+        .join("") +
+      `</ul>`;
+  } else {
+    html += `<p class="motion-note">No permanent details saved for this character yet.</p>`;
+  }
+
+  if (context.character.continuityNotes.length) {
+    html +=
+      `<p class="motion-note">Character notes:</p><ul class="ws-summary-list">` +
+      context.character.continuityNotes
+        .map(note => `<li>${novaEscape(note)}</li>`)
+        .join("") +
+      `</ul>`;
+  } else {
+    html += `<p class="motion-note">No character notes saved yet.</p>`;
+  }
+
+  if (context.project.rules.length) {
+    html +=
+      `<p class="motion-note">Continuity rules:</p><ul class="ws-summary-list">` +
+      context.project.rules
+        .map(rule => `<li>${novaEscape(rule)}</li>`)
+        .join("") +
+      `</ul>`;
+  } else {
+    html += `<p class="motion-note">No continuity rules saved for this project yet.</p>`;
+  }
+
+  if (context.project.notes.length) {
+    html +=
+      `<p class="motion-note">Project notes:</p><ul class="ws-summary-list">` +
+      context.project.notes
+        .map(note => `<li>${novaEscape(note)}</li>`)
+        .join("") +
+      `</ul>`;
+  } else {
+    html += `<p class="motion-note">No project notes saved yet.</p>`;
+  }
+
+  html += `<p class="motion-note">Reference image: ${context.character.imageAssetId ? "saved" : "none saved"}</p>`;
+
+  if (warnings.length) {
+    html += `<p><strong>Possible continuity conflicts</strong> <span class="motion-note">(rule-based checks — review them; warnings never block generation)</span></p>`;
+    warnings.forEach(warning => {
+      html +=
+        `<div class="ws-warn"><span>${novaEscape(warning.message)}</span> ` +
+        `<button class="ws-btn ws-warn-dismiss" onclick="novaDismissContinuityWarning('${warning.key}')">Dismiss</button></div>`;
+    });
+  }
+
+  html += `<p><button class="ws-btn" onclick="novaRenderProductionIdentity()">Refresh continuity review</button></p>`;
+  html += `</div>`;
+  return html;
 }
 
 /* ---------- Provider Interface (contract only, Stage 3.1) ----------
