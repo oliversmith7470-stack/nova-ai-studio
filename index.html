@@ -1209,13 +1209,198 @@ function setMotionMode(mode) {
     mode === "image" ? "block" : "none";
 }
 
+
+// ==========================================
+// NOVA INTELLIGENCE 2.0 — PROMPT BRAIN
+// Browser-based cinematic scene planner
+// ==========================================
+
+function novaExtractSubject(prompt) {
+  const clean = prompt
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const match = clean.match(
+    /(?:a|an|the)\s+((?:[\w'-]+\s+){0,4}[\w'-]+)/
+  );
+
+  return match ? match[1].trim() : "Main subject";
+}
+
+function novaDetectActions(prompt) {
+  const p = prompt.toLowerCase();
+
+  const patterns = [
+    {
+      name: "Emergence",
+      words: ["emerges", "emerge", "appears", "rises", "awakens", "comes out", "steps out"]
+    },
+    {
+      name: "Flight",
+      words: ["flies", "flying", "takes flight", "soars", "wings", "airborne"]
+    },
+    {
+      name: "Movement",
+      words: ["runs", "running", "walks", "walking", "moves", "approaches", "chases"]
+    },
+    {
+      name: "Combat",
+      words: ["fights", "attacks", "strikes", "battles", "explodes", "destroys", "clashes"]
+    },
+    {
+      name: "Transformation",
+      words: ["transforms", "transformation", "changes into", "turns into", "morphs"]
+    },
+    {
+      name: "Reveal",
+      words: ["reveals", "revealing", "glowing eyes", "opens its eyes", "unveils"]
+    },
+    {
+      name: "Emotion",
+      words: ["cries", "smiles", "laughs", "screams", "looks at", "embraces"]
+    }
+  ];
+
+  return patterns
+    .filter(group =>
+      group.words.some(word => p.includes(word))
+    )
+    .map(group => group.name);
+}
+
+function novaChooseBeats(prompt, count) {
+  const p = prompt.toLowerCase();
+  const actions = novaDetectActions(prompt);
+
+  const beats = [];
+
+  if (
+    p.includes("dragon") ||
+    p.includes("monster") ||
+    p.includes("creature") ||
+    p.includes("giant")
+  ) {
+    beats.push({
+      title: "The World and the Threat",
+      direction: "Establish the environment, scale and atmosphere. Introduce the subject as a powerful presence.",
+      camera: "Wide cinematic establishing shot",
+      motion: "Atmospheric movement with a gradual visual reveal"
+    });
+  } else {
+    beats.push({
+      title: "Establishing Shot",
+      direction: "Introduce the environment, main subject and visual atmosphere.",
+      camera: "Wide cinematic establishing shot",
+      motion: "Slow controlled movement"
+    });
+  }
+
+  if (actions.includes("Emergence")) {
+    beats.push({
+      title: "The Emergence",
+      direction: "Show the subject emerging into view. Make the movement physically convincing and visually dramatic.",
+      camera: "Slow cinematic push-in",
+      motion: "Subject advances into the frame"
+    });
+  } else if (actions.includes("Flight")) {
+    beats.push({
+      title: "The Ascent",
+      direction: "Show the subject taking flight, with convincing movement and a clear sense of scale.",
+      camera: "Dynamic tracking shot",
+      motion: "Subject moves through the environment"
+    });
+  } else if (actions.includes("Combat")) {
+    beats.push({
+      title: "The Conflict",
+      direction: "Develop the main confrontation with readable movement and strong visual impact.",
+      camera: "Dynamic tracking shot",
+      motion: "Controlled action and reaction"
+    });
+  } else if (actions.includes("Transformation")) {
+    beats.push({
+      title: "The Transformation",
+      direction: "Show the subject changing form while preserving recognisable features and visual continuity.",
+      camera: "Gradual cinematic push-in",
+      motion: "Progressive transformation"
+    });
+  } else if (actions.includes("Movement")) {
+    beats.push({
+      title: "The Movement",
+      direction: "Show the subject moving through the environment with clear direction and purpose.",
+      camera: "Smooth tracking shot",
+      motion: "Continuous subject movement"
+    });
+  } else {
+    beats.push({
+      title: "The Main Action",
+      direction: "Develop the central action described in the user's prompt.",
+      camera: "Medium cinematic shot",
+      motion: "Natural, controlled subject movement"
+    });
+  }
+
+  if (actions.includes("Reveal")) {
+    beats.push({
+      title: "The Visual Reveal",
+      direction: "Bring attention to the important visual detail and make the reveal unmistakable.",
+      camera: "Close-up push-in",
+      motion: "Controlled reveal with a brief visual hold"
+    });
+  }
+
+  beats.push({
+    title: "The Cinematic Payoff",
+    direction: "Deliver the strongest visual moment from the prompt and finish with a memorable composition.",
+    camera: "Hero shot",
+    motion: "Powerful final movement followed by a brief hold"
+  });
+
+  while (beats.length < count) {
+    beats.splice(beats.length - 1, 0, {
+      title: "Action Development",
+      direction: "Continue the main action while preserving the subject's appearance, environment and spatial continuity.",
+      camera: "Cinematic tracking shot",
+      motion: "Progressive movement"
+    });
+  }
+
+  return beats.slice(0, count);
+}
+
+function novaDistributeTime(total, count) {
+  const base = Math.floor(total / count);
+  const remainder = total % count;
+
+  return Array.from(
+    { length: count },
+    (_, index) => base + (index < remainder ? 1 : 0)
+  );
+}
+
+function novaEscape(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[char]);
+}
+
 function buildMotionPlan() {
-  const prompt = document.getElementById("motionPrompt").value.trim();
-  const character = document.getElementById("motionCharacter").value.trim();
+  const prompt = document
+    .getElementById("motionPrompt")
+    .value.trim();
+
+  const character = document
+    .getElementById("motionCharacter")
+    .value.trim();
+
   const ratio = document.getElementById("motionRatio").value;
   const duration = Number(document.getElementById("motionDuration").value);
   const style = document.getElementById("motionStyle").value;
   const camera = document.getElementById("motionCamera").value;
+
   const image = document.getElementById("motionImage").files[0];
 
   const output = document.getElementById("motionOutput");
@@ -1226,54 +1411,110 @@ function buildMotionPlan() {
     return;
   }
 
-  if (novaMotionMode === "image" && !image) {
-    alert("Please upload a reference image for Image to Video mode.");
+  if (prompt.length > 4000) {
+    alert("Please shorten your video description to 4,000 characters.");
     return;
   }
 
-  const sceneCount = Math.max(1, Math.ceil(duration / 5));
-  const scenes = [];
-
-  for (let i = 0; i < sceneCount; i++) {
-    const sceneDuration = Math.min(5, duration - i * 5);
-
-    let direction = [
-      "Establish the environment and introduce the main subject.",
-      "Develop the action with expressive subject movement.",
-      "Build visual intensity and deepen the cinematic atmosphere.",
-      "Deliver the main visual moment and emotional payoff.",
-      "Finish with a memorable cinematic closing shot."
-    ][Math.min(i, 4)];
-
-    scenes.push(
-      `<div class="motion-scene">
-        <strong>SCENE ${i + 1}</strong><br>
-        Duration: ${sceneDuration} seconds<br>
-        Direction: ${direction}
-      </div>`
-    );
+  if (
+    novaMotionMode === "image" &&
+    !image
+  ) {
+    alert("Please upload a reference image.");
+    return;
   }
 
-  const safe = value => String(value).replace(/[&<>"']/g, char => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;"
-  })[char]);
+  const sceneCount = Math.min(
+    6,
+    Math.max(1, Math.ceil(duration / 5))
+  );
+
+  const subject = novaExtractSubject(prompt);
+  const actions = novaDetectActions(prompt);
+
+  const beats = novaChooseBeats(prompt, sceneCount);
+  const timings = novaDistributeTime(duration, sceneCount);
+
+  let elapsed = 0;
+
+  const scenes = beats.map((beat, index) => {
+    const start = elapsed;
+    const end = elapsed + timings[index];
+
+    elapsed = end;
+
+    const scenePrompt = [
+      "Create a cinematic video scene.",
+      "Original concept: " + prompt,
+      "Scene direction: " + beat.direction,
+      "Visual style: " + style,
+      "Camera direction: " + beat.camera,
+      "Preferred camera movement: " + camera,
+      "Subject movement: " + beat.motion,
+      "Character continuity: " + (
+        character ||
+        "Maintain the same subject identity and appearance throughout the sequence."
+      ),
+      "Environment and visual continuity must remain consistent with previous scenes.",
+      "Aspect ratio: " + ratio
+    ].join(" ");
+
+    return {
+      title: beat.title,
+      start,
+      end,
+      duration: timings[index],
+      direction: beat.direction,
+      camera: beat.camera,
+      motion: beat.motion,
+      prompt: scenePrompt
+    };
+  });
+
+  const sceneHTML = scenes.map((scene, index) => `
+    <div class="motion-scene">
+      <h3>SCENE ${index + 1}: ${novaEscape(scene.title)}</h3>
+      <p><strong>Timeline:</strong> ${scene.start}s – ${scene.end}s</p>
+      <p><strong>Duration:</strong> ${scene.duration} seconds</p>
+      <p><strong>Visual direction:</strong> ${novaEscape(scene.direction)}</p>
+      <p><strong>Camera:</strong> ${novaEscape(scene.camera)}</p>
+      <p><strong>Subject movement:</strong> ${novaEscape(scene.motion)}</p>
+      <p><strong>Generation prompt:</strong></p>
+      <p>${novaEscape(scene.prompt)}</p>
+    </div>
+  `).join("");
+
+  const actionText = actions.length
+    ? actions.join(", ")
+    : "General subject action";
 
   output.innerHTML = `
-    <h3>Cinematic Production Brief</h3>
-    <p><strong>Concept:</strong> ${safe(prompt)}</p>
-    <p><strong>Mode:</strong> ${novaMotionMode === "text" ? "Text to Video" : "Image to Video"}</p>
-    <p><strong>Visual style:</strong> ${safe(style)}</p>
-    <p><strong>Camera:</strong> ${safe(camera)}</p>
-    <p><strong>Aspect ratio:</strong> ${safe(ratio)}</p>
-    <p><strong>Duration:</strong> ${duration} seconds</p>
-    <p><strong>Character:</strong> ${safe(character || "No character description supplied")}</p>
-    <h3 style="margin-top:18px;">Scene Breakdown</h3>
-    ${scenes.join("")}
-    <p class="motion-note">This is an initial structured scene plan, not a generated video or an AI-interpreted screenplay.</p>
+    <h3>NOVA INTELLIGENCE PRODUCTION BRIEF</h3>
+
+    <p><strong>Detected subject:</strong> ${novaEscape(subject)}</p>
+    <p><strong>Detected actions:</strong> ${novaEscape(actionText)}</p>
+    <p><strong>Generation mode:</strong> ${novaMotionMode === "text" ? "Text to Video" : "Image to Video"}</p>
+    <p><strong>Visual style:</strong> ${novaEscape(style)}</p>
+    <p><strong>Preferred camera:</strong> ${novaEscape(camera)}</p>
+    <p><strong>Aspect ratio:</strong> ${novaEscape(ratio)}</p>
+    <p><strong>Total duration:</strong> ${duration} seconds</p>
+    <p><strong>Number of scenes:</strong> ${scenes.length}</p>
+    <p><strong>Character identity:</strong> ${novaEscape(character || "Continuity instructions enabled")}</p>
+
+    <h3 style="margin-top:20px;">CINEMATIC SCENE BREAKDOWN</h3>
+    ${sceneHTML}
+
+    <div class="motion-scene">
+      <strong>GLOBAL CONTINUITY RULES</strong>
+      <p>Maintain consistent subject identity, anatomy, colours, proportions, environment and lighting across all scenes.</p>
+      <p>Preserve the intended action and spatial relationships. Avoid unexplained changes in character appearance or location.</p>
+      <p>Final timeline: ${elapsed} seconds.</p>
+    </div>
+
+    <p class="motion-note">
+      NOVA Prompt Brain 2.0 · Rule-based cinematic planning.
+      AI model interpretation and actual video rendering are not yet connected.
+    </p>
   `;
 
   empty.style.display = "none";
