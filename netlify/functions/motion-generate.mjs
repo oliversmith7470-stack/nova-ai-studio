@@ -194,13 +194,34 @@ export default async (request, context) => {
     );
   }
 
+  const accessToken =
+    request.headers.get("X-NOVA-JOB-TOKEN") || "";
+
+  if (!/^[0-9a-f]{64}$/i.test(accessToken)) {
+    return respond(400, {
+      jobId,
+      status: "failed",
+      message:
+        "A valid 64-character NOVA job access token is required."
+    });
+  }
+
   try {
     let job = await jobStore.getJob(jobId);
-    let accessToken = null;
 
-    if (!job) {
-      accessToken = crypto.randomBytes(32).toString("hex");
-
+    if (job) {
+      if (
+        job.id !== jobId ||
+        !tokenMatches(accessToken, job.accessTokenHash)
+      ) {
+        return respond(401, {
+          jobId,
+          status: "failed",
+          message:
+            "A valid NOVA job access token is required."
+        });
+      }
+    } else {
       const now = new Date().toISOString();
 
       const newJob = {
@@ -218,48 +239,27 @@ export default async (request, context) => {
       const result = await jobStore.createJob(newJob);
       job = result.job;
 
-      if (!result.created) {
-        accessToken = null;
-      }
-    }
-
-    if (!job || job.id !== jobId) {
-      return respond(500, {
-        jobId,
-        status: "failed",
-        message: "NOVA could not verify the saved job."
-      });
-    }
-
-    if (accessToken === null) {
-      const suppliedToken =
-        request.headers.get("X-NOVA-JOB-TOKEN") || "";
-
-      if (!tokenMatches(
-        suppliedToken,
-        job.accessTokenHash
-      )) {
-        return respond(401, {
+      if (
+        !job ||
+        job.id !== jobId ||
+        !tokenMatches(accessToken, job.accessTokenHash)
+      ) {
+        return respond(409, {
           jobId,
           status: "failed",
           message:
-            "A valid NOVA job access token is required."
+            "NOVA could not verify the existing job credentials. Please retry using the original job details."
         });
       }
     }
 
-    const response = {
+    return respond(503, {
       jobId: job.id,
       status: job.status,
       provider: job.provider,
       message: job.error || UNAVAILABLE_MESSAGE
-    };
+    });
 
-    if (accessToken) {
-      response.accessToken = accessToken;
-    }
-
-    return respond(503, response);
   } catch (error) {
     console.error(
       "[NOVA MOTION] Job creation/storage error:",
