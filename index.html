@@ -1090,12 +1090,28 @@
             Build Cinematic Scene Plan →
           </button>
 
+          <button
+            id="motionGenerateButton"
+            class="tool-button"
+            type="button"
+            onclick="generateMotionVideo()"
+            disabled
+          >
+            Generate Video →
+          </button>
+
+          <p class="motion-note">
+            Generate Video will connect to an available licensed video-generation provider.
+            Generation is unavailable until a provider is configured.
+          </p>
+
           <p class="motion-note">Scene planning is available in this preview. Actual video rendering will be enabled when a compatible generation engine is connected.</p>
         </section>
 
         <section class="motion-panel">
           <h2>📋 Your Scene Plan</h2>
           <div id="motionOutput" class="motion-output"></div>
+          <div id="motionStatus" aria-live="polite"></div>
           <p id="motionEmpty" class="motion-note">Your scene breakdown will appear here after you build a plan.</p>
         </section>
       </div>
@@ -1103,7 +1119,7 @@
       <div>
         <section class="motion-panel">
           <h2>Video Preview</h2>
-          <div class="motion-preview">
+          <div class="motion-preview" id="motionPreview">
             <div>
               <strong>▶</strong>
               Your cinematic preview will appear here when video generation is connected.
@@ -1187,6 +1203,9 @@
 // NOVA MOTION 4.0 FUNCTIONS
 
 let novaMotionMode = "text";
+let novaMotionPlan = null;
+let novaMotionJob = null;
+let novaMotionImageFile = null;
 
 function openMotionStudio() {
   document.getElementById("motionStudio").style.display = "block";
@@ -1491,6 +1510,39 @@ function buildMotionPlan() {
     };
   });
 
+
+// Save the accepted production plan for the generation engine.
+const imageInput = document.getElementById("motionImage");
+
+novaMotionImageFile =
+  imageInput && imageInput.files.length
+    ? imageInput.files[0]
+    : null;
+
+novaMotionPlan = {
+  scenes: scenes,
+  prompt: prompt,
+  character: character,
+  mode: novaMotionMode,
+  ratio: ratio,
+  duration: duration,
+  style: style,
+  camera: camera,
+  image: novaMotionImageFile
+    ? {
+        name: novaMotionImageFile.name,
+        type: novaMotionImageFile.type,
+        size: novaMotionImageFile.size
+      }
+    : null
+};
+
+const generateButton = document.getElementById("motionGenerateButton");
+
+if (generateButton) {
+  generateButton.disabled = false;
+}
+
   const sceneHTML = scenes.map((scene, index) => `
     <div class="motion-scene">
       <h3>SCENE ${index + 1}: ${novaEscape(scene.title)}</h3>
@@ -1541,6 +1593,142 @@ function buildMotionPlan() {
   output.style.display = "block";
 }
 
+
+
+/* =========================================
+   NOVA MOTION PRODUCTION ENGINE
+   Stage 3 — Integration Foundation
+========================================= */
+
+function updateMotionStatus(message, state = "idle") {
+  const status = document.getElementById("motionStatus");
+  const preview = document.getElementById("motionPreview");
+
+  if (status) {
+    status.textContent = message;
+    status.dataset.state = state;
+  }
+
+  if (preview && state !== "completed") {
+    preview.textContent = message;
+  }
+}
+
+async function generateMotionVideo() {
+  if (!novaMotionPlan || !novaMotionPlan.scenes.length) {
+    updateMotionStatus(
+      "Build a cinematic scene plan before generating.",
+      "failed"
+    );
+    return;
+  }
+
+  const button = document.getElementById("motionGenerateButton");
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Submitting...";
+  }
+
+  updateMotionStatus("Submitting production request...", "queued");
+
+  try {
+    let imageDataUrl = null;
+
+    // Convert an uploaded reference image when one exists.
+    if (novaMotionImageFile) {
+      if (novaMotionImageFile.size > 5 * 1024 * 1024) {
+        throw new Error(
+          "Reference images must be 5 MB or smaller for this prototype."
+        );
+      }
+
+      imageDataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(
+          new Error("Could not read the reference image.")
+        );
+
+        reader.readAsDataURL(novaMotionImageFile);
+      });
+    }
+
+    const response = await fetch(
+      "/.netlify/functions/motion-generate",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          plan: novaMotionPlan,
+          imageDataUrl: imageDataUrl
+        })
+      }
+    );
+
+    const result = await response.json();
+
+    novaMotionJob = result;
+
+    if (!response.ok) {
+      throw new Error(
+        result.message || "The video provider is not available."
+      );
+    }
+
+    updateMotionStatus(
+      result.message || "Production request accepted.",
+      result.status || "queued"
+    );
+
+    if (result.videoUrl) {
+      displayMotionVideo(result.videoUrl);
+    }
+
+    if (result.status === "completed" && button) {
+      button.textContent = "Generate Again";
+    }
+
+  } catch (error) {
+    updateMotionStatus(
+      error.message || "Production request failed.",
+      "failed"
+    );
+
+    if (button) {
+      button.textContent = "Retry Generation →";
+    }
+
+  } finally {
+    if (button) {
+      button.disabled = false;
+    }
+  }
+}
+
+function displayMotionVideo(videoUrl) {
+  const preview = document.getElementById("motionPreview");
+
+  if (!preview || !videoUrl) return;
+
+  preview.replaceChildren();
+
+  const video = document.createElement("video");
+
+  video.src = videoUrl;
+  video.controls = true;
+  video.playsInline = true;
+  video.preload = "metadata";
+  video.style.width = "100%";
+  video.style.borderRadius = "12px";
+
+  preview.appendChild(video);
+
+  updateMotionStatus("Video generation completed.", "completed");
+}
 
   function toggleMenu() {
     document.getElementById("sidebar")
