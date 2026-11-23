@@ -1042,6 +1042,114 @@
   }
 }
 
+/* Stage 3.5B — Production State Manager (additive; the 3.4D/3.4E/3.5A
+   styles above are untouched). Stacked, mobile-first. */
+
+.nova-prod-continuity {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.nova-prod-continuity h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.nova-prod-scene-group {
+  margin-bottom: 10px;
+}
+
+.nova-prod-scene-group h4 {
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+
+.nova-prod-warning {
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--purple);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.nova-prod-warning-info {
+  border-left-color: var(--muted);
+}
+
+.nova-prod-warning-message {
+  margin: 0 0 8px;
+}
+
+.nova-mark-intended-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.nova-mark-intended-form label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.nova-mark-intended-form input[type="text"] {
+  flex: 1 1 200px;
+  min-width: 0;
+  padding: 6px 8px;
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: inherit;
+}
+
+.nova-continuity-error {
+  padding: 10px 12px;
+  background: #2a1215;
+  border: 1px solid #7a3a3a;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.nova-continuity-notice {
+  padding: 10px 12px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--purple);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.nova-continuity-note {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.ws-state-list {
+  margin: 0 0 10px 18px;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.ws-state-list li {
+  margin-bottom: 4px;
+}
+
+@media (max-width: 380px) {
+  .nova-mark-intended-form {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
 </style>
 </head>
 
@@ -1288,6 +1396,7 @@
 
           <div id="motionIdentityReview"></div>
           <div id="motionSceneContinuity"></div>
+          <div id="motionSceneState"></div>
 
           <button type="button" class="tool-button ws-identity-button" onclick="novaOpenWorkspaceFromMotion()">Manage Projects &amp; Characters →</button>
 
@@ -1377,6 +1486,8 @@
           >
             Generate Video →
           </button>
+
+          <div id="motionCreationConfirm"></div>
 
           <p class="motion-note">
             Generate Video will connect to an available licensed video-generation provider.
@@ -1949,6 +2060,12 @@ novaMotionPlan = {
   cast: planCast,
   styleBasis: planStyleBasis,
   version: 1,
+  // Stage 3.5B: continuity decisions + the revalidation
+  // watermark (Section 16.2). A fresh plan starts with no
+  // decisions; the watermark is set below to the current
+  // versions (a fresh plan owes no revalidation).
+  continuityDecisions: [],
+  decisionsCheckedAt: null,
   image: novaMotionImageFile
     ? {
         name: novaMotionImageFile.name,
@@ -1957,6 +2074,42 @@ novaMotionPlan = {
       }
     : null
 };
+
+  // Stage 3.5B: stable scene IDs (Section 11) + the state
+  // chain (Section 14). New scenes get ids at creation;
+  // the watermark is set to the current versions (a fresh
+  // plan owes no revalidation); the chain is built once
+  // and the scene prompts are rebuilt through the shared
+  // builder (which includes the state line) so the plan's
+  // prompts and the snapshot agree. A chain error blocks
+  // the build and clears the plan (defensive only — a
+  // fresh plan declares no changes, so its chain cannot
+  // be invalid; the cast was already validated above).
+  if (novaMotionPlan.projectId) {
+    const planProject = novaGetProject(novaMotionPlan.projectId);
+    if (planProject) {
+      const assigned = novaAssignSceneIds(novaMotionPlan);
+      if (assigned.notices.length) {
+        alert(assigned.notices.join("\n"));
+      }
+      novaMotionPlan.decisionsCheckedAt = {
+        planVersion: novaMotionPlan.version,
+        canonVersion: novaGetProjectCanonVersion(planProject)
+      };
+      const planChain = novaBuildProductionState(planProject, novaMotionPlan);
+      if (planChain.error) {
+        alert(planChain.error);
+        novaMotionPlan = null;
+        return;
+      }
+      const rebuiltPlan = novaRebuildPlanPrompts(novaMotionPlan, planChain);
+      if (rebuiltPlan.error) {
+        alert(rebuiltPlan.error);
+        novaMotionPlan = null;
+        return;
+      }
+    }
+  }
 
 const generateButton = document.getElementById("motionGenerateButton");
 
@@ -2020,6 +2173,10 @@ if (generateButton) {
   // Stage 3.5A: render the per-scene presence + override
   // controls for the new plan.
   novaRenderSceneContinuityControls();
+
+  // Stage 3.5B: render the per-scene state controls for
+  // the new plan.
+  novaRenderSceneStateControls();
 }
 
 
@@ -2073,6 +2230,44 @@ async function generateMotionVideo() {
     if (!job) {
       const selection = novaGetProjectSelection();
 
+      // Stage 3.5B: pre-creation continuity check
+      // (trigger 3, Section 16.2). When the revalidation
+      // removed decisions, the user confirms before the
+      // job is created.
+      if (selection) {
+        // A deleted project is creation's error to report
+        // ("The selected project does not exist.") — the
+        // pre-check runs only when the project exists.
+        const preCheckProject = novaGetProject(selection.projectId);
+        if (preCheckProject) {
+        // A plan that never went through the planner may
+        // lack scene ids and continuity fields (a legacy
+        // plan, or a plan built programmatically). Assign
+        // them now — the Section 11 first-open — so the
+        // pre-check can key warnings and decisions.
+        novaAssignSceneIds(novaMotionPlan);
+        novaEnsurePlanContinuityFields(
+          novaMotionPlan,
+          preCheckProject
+        );
+        const preCheck = novaPreCreateContinuityCheck(
+          preCheckProject,
+          novaMotionPlan
+        );
+        if (preCheck.error) {
+          throw new Error(preCheck.error);
+        }
+        if (preCheck.removed > 0 && !novaMotionCreationConfirmed) {
+          novaShowCreationConfirm(preCheck.message);
+          if (button) {
+            button.disabled = false;
+            button.textContent = "Generate Video →";
+          }
+          return;
+        }
+        }
+      }
+
       job = selection
         ? await novaCreateProjectJob(
             novaMotionPlan,
@@ -2091,7 +2286,15 @@ async function generateMotionVideo() {
       );
     }
 
+    // Stage 3.5B: the one-shot confirmation is spent,
+    // and the review refreshes so the post-revalidation
+    // decisions + warnings show.
+    novaMotionCreationConfirmed = false;
+    novaRenderProductionIdentity();
+
   } catch (error) {
+    // Stage 3.5B: a failed creation spends no confirmation.
+    novaMotionCreationConfirmed = false;
     updateMotionStatus(
       error.message || "Could not create the production job.",
       "failed"
@@ -2430,6 +2633,14 @@ function novaUpdateProject(id, patch) {
     updatedAt: new Date().toISOString()
   };
 
+  // Stage 3.5B: the canon version (Section 16.2)
+  // increments on every save changing anything the
+  // checks read (continuity fields, objects, locations,
+  // visual style) — not on name/description edits.
+  if (novaContinuityCanonChanged(project.continuity, updated.continuity)) {
+    updated.canonVersion = novaGetProjectCanonVersion(project) + 1;
+  }
+
   if (!novaSaveProject(updated)) return null;
 
   return updated;
@@ -2556,6 +2767,20 @@ function novaUpdateCharacter(id, patch) {
     updatedAt: new Date().toISOString(),
     version: (character.version || 1) + 1
   };
+
+  // Stage 3.5B: an appearance change bumps the OWNING
+  // project's canon version (Section 16.2) — the checks
+  // read the character's appearance, so a wardrobe or
+  // hair change invalidates the plan's decisions
+  // watermark.
+  if (novaAppearanceCanonChanged(character.appearance, updated.appearance)) {
+    const owning = novaGetProject(character.projectId);
+    if (owning) {
+      owning.canonVersion = novaGetProjectCanonVersion(owning) + 1;
+      owning.updatedAt = new Date().toISOString();
+      novaSaveProject(owning);
+    }
+  }
 
   if (!novaSaveCharacter(updated)) return null;
 
@@ -3572,6 +3797,37 @@ async function novaCreateProjectJob(plan, projectId, characterId) {
 
   const accessToken = novaCreateAccessToken();
 
+  // Stage 3.5B: revalidate decisions BEFORE snapshotting
+  // (trigger 3, Section 16.2) — a stale decision can never
+  // suppress a warning in a created job. The revalidation
+  // mutates the plan in place (removes stale decisions,
+  // updates the watermark), so the productionPlan copy
+  // below and the snapshot both carry post-revalidation
+  // decisions. A broken chain blocks creation with the
+  // chain's error.
+  //
+  // A plan that never went through the planner (a legacy
+  // plan, or a plan built programmatically) may lack scene
+  // ids and continuity fields. Job creation is a plan use:
+  // assign ids now — the Section 11 first-open for this
+  // plan (collisions repaired first, then assignment, in
+  // the fixed order) — and ensure the continuity fields,
+  // so the chain can key warnings and decisions. Without
+  // this, creation would fail closed on a plan the user
+  // could otherwise build.
+  novaAssignSceneIds(plan);
+  novaEnsurePlanContinuityFields(plan, project);
+  const creationCheck = novaRevalidatePlanForCreation(project, plan);
+  if (creationCheck.error) {
+    throw new Error(creationCheck.error);
+  }
+  novaLastCreationRevalidation = creationCheck.revalidation;
+  const productionContinuity = novaBuildProductionContinuitySnapshot(
+    project,
+    plan,
+    creationCheck.result.chain
+  );
+
   const productionPlan = JSON.parse(JSON.stringify(plan));
 
   // The job's character reference names the SELECTED character, so
@@ -3666,7 +3922,12 @@ async function novaCreateProjectJob(plan, projectId, characterId) {
     // Stage 3.4E: the continuity context used at the moment of
     // creation, built fresh from the current records. Immutable:
     // later edits to the project or character never rewrite it.
-    continuityContext
+    continuityContext,
+
+    // Stage 3.5B: the immutable production continuity snapshot
+    // (Section 17) — the full production state at creation,
+    // frozen alongside continuitySnapshot + continuityContext.
+    productionContinuity
   };
 
   novaSaveJob(job);
@@ -3679,7 +3940,8 @@ async function novaCreateProjectJob(plan, projectId, characterId) {
     persistedJob.accessToken !== accessToken ||
     !persistedJob.productionPlan ||
     !persistedJob.characterSnapshots ||
-    !persistedJob.continuitySnapshot
+    !persistedJob.continuitySnapshot ||
+    !persistedJob.productionContinuity
   ) {
     throw new Error(
       "NOVA could not securely save the job credentials. Please check browser storage."
@@ -3968,6 +4230,10 @@ function novaWorkspaceProjectDetailHtml() {
     <div class="ws-row">
       <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceSaveContinuity()">Save Continuity</button>
     </div>
+  </section>
+
+  <section class="motion-panel">
+    ${novaWorkspaceObjectsSectionHtml(project)}
   </section>
 
   <section class="motion-panel">
@@ -4506,7 +4772,13 @@ function novaWorkspaceSaveContinuity() {
     ),
     notes: novaWorkspaceLines(
       document.getElementById("wsContinuityNotes").value
-    )
+    ),
+    // Stage 3.5B: the objects + locations lists live on
+    // the continuity object but have their own section —
+    // carry the stored lists forward, or this save would
+    // wipe them.
+    objects: novaGetProjectObjects(project),
+    locations: novaGetProjectLocations(project)
   };
 
   const saved = novaUpdateProject(project.id, { continuity });
@@ -4601,6 +4873,12 @@ function novaRenderProductionIdentity() {
     : null;
   if (!selected) {
     review.innerHTML = `<p class="motion-note">Select a character to use this project\u2019s saved identity for your production.</p>`;
+    // Stage 3.5B: the production continuity section
+    // (Section 16.3) — a project plan without a selected
+    // character still carries warnings and decisions.
+    if (novaMotionPlan && novaMotionPlan.projectId === novaSelectedProjectId) {
+      review.innerHTML += novaProductionContinuityReviewHtml(project, novaMotionPlan);
+    }
     return;
   }
 
@@ -4622,6 +4900,10 @@ function novaRenderProductionIdentity() {
   // warnings).
   review.innerHTML += `<p class="motion-note">${novaEscape(NOVA_REFERENCE_IMAGE_STRINGS.reviewStatement)}</p>`;
   review.innerHTML += novaProductionStyleSectionHtml(selected, project);
+  // Stage 3.5B: the production continuity section (Section 16.3).
+  if (novaMotionPlan && novaMotionPlan.projectId === novaSelectedProjectId) {
+    review.innerHTML += novaProductionContinuityReviewHtml(project, novaMotionPlan);
+  }
   if (selected.imageAssetId) {
     novaWorkspaceLoadImageInto("motionIdentityThumb", selected.imageAssetId);
   }
@@ -6332,12 +6614,13 @@ function novaCheckStyleContinuity(effectiveStyle, sceneText, sceneNumber) {
 // verbatim (locked tests pin it); the 3.5A style block is an
 // additional separate line after the identity lines.
 // Returns { prompt, error }.
-function novaBuildScenePrompt(plan, scene) {
+function novaBuildScenePrompt(plan, scene, chain) {
   if (!plan || !scene) return { prompt: "", error: "Plan or scene is missing." };
   const project =
     plan.projectId ? novaGetProject(plan.projectId) : null;
   let identityLines = [];
   let styleBlock = "";
+  let stateLine = "";
   if (project) {
     const presence = novaSceneCharacters(project, plan, scene);
     if (presence.error) return { prompt: "", error: presence.error };
@@ -6363,6 +6646,20 @@ function novaBuildScenePrompt(plan, scene) {
     styleBlock =
       "Visual style: " +
       novaVisualStyleFragment(effective.preset, effective.customDirection);
+    // Stage 3.5B: the state line (Section 12.4) — the
+    // state carried into this scene plus its own changes.
+    // A caller that already built the chain passes it in
+    // (one build per plan); otherwise the chain is built
+    // here. A broken chain yields no state line (the
+    // caller that validates the chain reports the error;
+    // the prompt builder never blocks a prompt on it).
+    const stateChain = chain || novaBuildProductionState(project, plan);
+    if (!stateChain.error) {
+      const at = plan.scenes ? plan.scenes.indexOf(scene) : -1;
+      if (at >= 0) {
+        stateLine = novaContinuityStateLine(stateChain, scene, at);
+      }
+    }
   }
   const parts = [
     "Create a cinematic video scene.",
@@ -6376,6 +6673,7 @@ function novaBuildScenePrompt(plan, scene) {
       (plan.character ||
         "Maintain the same subject identity and appearance throughout the sequence."),
     ...identityLines,
+    ...(stateLine ? [stateLine] : []),
     ...(styleBlock ? [styleBlock] : []),
     "Environment and visual continuity must remain consistent with previous scenes.",
     "Aspect ratio: " + (plan.ratio || "")
@@ -6919,6 +7217,3865 @@ function novaClearSceneOverride(index) {
 }
 
 /* ---- End of Stage 3.5A: Visual Identity Manager ---------------------- */
+
+/* =====================================================================
+   NOVA MOTION — Stage 3.5B: Production State Manager
+   ---------------------------------------------------------------------
+   Design: 35-design.md Revision 3, Part II (Sections 11–24).
+   Base: Stage 3.5A, COMMITTED as fe7a3d5.
+
+   What the production remembers, scene by scene: stable scene ids,
+   object + location tracking, character appearance state (wardrobe,
+   hair, injuries, armour, notes) with reversal, the production
+   state chain, deterministic warning fingerprints, user decisions
+   (dismiss / mark intended) with canon-version revalidation, and
+   the complete immutable production snapshot on every job.
+
+   Rules this section follows:
+   - Deterministic rules only. No AI calls, no new dependencies.
+   - Warnings never block and never rewrite the user's prompt.
+     (An INVALID STATE SEQUENCE blocks the build — Section 12.2 —
+     because the chain cannot be computed, not because a warning
+     fired.)
+   - The state chain is PURE: same project + same plan always
+     gives the same chain. It never writes to storage.
+   - Snapshots are immutable; the planner never silently repairs
+     memory. A corrupt plan errors fail-closed with a clear
+     message naming the scene and the object or character.
+   - The 3.4E context builder, conflict checker, scene line and
+     dismissal are UNTOUCHED. The 3.5A functions are UNTOUCHED
+     except novaBuildScenePrompt (extended: the state line) —
+     see apply-35b.py and verify-35b-protected.js.
+   - Reference images are STORED and RECORDED — never SUPPLIED
+     to a provider (Section 6, capability 3 — still a future
+     backend milestone).
+
+   Per-scene check text (decision D22 — see the implementation
+   report): the object, appearance, 3.4E and location checks run
+   against the scene's TITLE + DIRECTION, not the built scene
+   prompt. The built prompt contains the identity lines (canon)
+   and the state line (effective state); scanning it would make
+   every check compare the system's own injected text against
+   itself (the state line mentions a lost object by design; the
+   identity line carries the canon wardrobe). The style check
+   keeps the built prompt (3.5A behaviour — style directives
+   live in the direction and the style block, and the identity
+   and state lines carry no style markers).
+
+   Integration points (see apply-35b.py):
+   - buildMotionPlan() assigns scene ids at creation, builds
+     the state chain once per plan, rebuilds the scene prompts
+     through the shared builder (state line: Identity -> State
+     -> Style), and renders the per-scene state controls.
+   - novaBuildScenePrompt() gains the state line (same builder
+     the plan uses, so the two can never drift).
+   - novaUpdateProject() / novaUpdateCharacter() bump
+     project.canonVersion on canon changes (Section 16.2).
+   - novaWorkspaceSaveContinuity() preserves the objects /
+     locations lists (they are owned by the Objects & Locations
+     section, not the continuity editor).
+   - novaWorkspaceProjectDetailHtml() gains the Objects &
+     Locations section.
+   - novaRenderProductionIdentity() appends the production
+     continuity section (Section 16.3).
+   - novaCreateProjectJob() revalidates decisions BEFORE
+     snapshotting (Section 16.2, trigger 3) and snapshots
+     job.productionContinuity (Section 17).
+   - generateMotionVideo() pre-checks decisions before creating
+     a project job and asks the user to confirm when
+     revalidation removed any.
+   ===================================================================== */
+
+// Dismissed warning fingerprints, current session only. A reload
+// starts with an empty set, so a dismissed warning never hides a
+// conflict from a future session silently. Dismissal is keyed by
+// FINGERPRINT (Section 15.4): a warning is hidden only while its
+// CURRENT fingerprint matches a dismissed fingerprint, so a
+// warning that CHANGED re-appears.
+let novaDismissedWarningFingerprints = new Set();
+
+// The last creation-time revalidation report (Section 16.2,
+// trigger 3): { removed: [...], invalidated: [...] }. Set by
+// novaCreateProjectJob's internal revalidation so the creation
+// flow (and the tests) can report removals.
+let novaLastCreationRevalidation = { removed: [], invalidated: [] };
+
+// One-shot flag: the user confirmed creation after revalidation
+// removed decisions (generateMotionVideo consumes it).
+let novaMotionCreationConfirmed = false;
+
+// The last refresh/lazy revalidation report, shown in the
+// production continuity section: { removed, invalidated } or null.
+let novaLastRevalidationReport = null;
+
+// The warnings from the most recent production-continuity
+// collection, keyed by fingerprint for the Dismiss / Mark-intended
+// handlers. Rebuilt on every review render.
+let novaCurrentPlanWarnings = [];
+
+// Workspace Objects & Locations: the object/location awaiting a
+// two-step delete confirmation, or null.
+// { type: "object" | "location", id: <objectId> | <location name> }
+let novaWorkspaceObjectDeleteTarget = null;
+
+// The object currently being edited in the workspace form, or null.
+let novaWorkspaceEditingObjectId = null;
+
+// The location currently being edited in the workspace form (by
+// name — locations are name-keyed, Section 12.1), or null.
+let novaWorkspaceEditingLocationName = null;
+
+// Notice shown in the state controls after a scene deletion
+// (Section 16.2: "This scene had N continuity decision(s), which
+// will be removed."). Cleared on the next render.
+let novaSceneDeleteNotice = "";
+
+// ---- Fixed lexicons (design Sections 12.2, 14) ----------------------
+
+// The transition table (Section 12.2). `from` is the required
+// pre-state; `to` is the resulting status (null for move —
+// location only, status unchanged).
+const NOVA_OBJECT_TRANSITIONS = {
+  lose: { from: ["present"], to: "lost" },
+  recover: { from: ["lost"], to: "present" },
+  damage: { from: ["present"], to: "damaged" },
+  destroy: { from: ["present", "damaged"], to: "destroyed" },
+  move: { from: ["present"], to: null },
+  repair: { from: ["damaged"], to: "present" }
+};
+
+// Location-transition markers (Section 14 — small fixed lexicon).
+const NOVA_LOCATION_TRANSITION_MARKERS = [
+  "later",
+  "cut to",
+  "the next day",
+  "meanwhile",
+  "arrives at"
+];
+
+// Appearance-change fields (Section 13.1).
+const NOVA_APPEARANCE_FIELDS = [
+  "wardrobe",
+  "hair",
+  "injury",
+  "armour",
+  "general"
+];
+
+// Stop words dropped when extracting descriptive words from an
+// appearance value or a prompt description (Section 13.5 —
+// decision D3 in the implementation report).
+const NOVA_STATE_WORD_STOP = new Set([
+  "the", "a", "an", "and", "or", "but", "of", "at", "in", "on",
+  "with", "to", "from", "by", "for", "is", "it", "its", "his",
+  "her", "their", "he", "she", "they", "as", "was", "were"
+]);
+
+// Verbs that commonly sit next to a garment word in a scene
+// direction ("Theron wears a red cloak") but describe an action,
+// not the garment. Excluded from the PROMPT's descriptive words
+// only (decision D27) — a saved wardrobe value is never a verb
+// phrase, so the value side needs no such list. Participles that
+// double as adjectives (flowing, torn, worn, faded) are NOT here:
+// they are genuine descriptors when they appear. (Rev 5: the
+// closed lexicon below is the deciding filter — of these, torn,
+// worn and faded are lexicon words; flowing is not, so it is
+// ignored at the comparison site.)
+const NOVA_APPEARANCE_VERB_STOP = new Set([
+  "wear", "wears", "wearing", "wore",
+  "walk", "walks", "walking", "walked",
+  "stand", "stands", "standing", "stood",
+  "sit", "sits", "sitting", "sat",
+  "hold", "holds", "holding", "held",
+  "carry", "carries", "carrying", "carried",
+  "put", "puts", "putting",
+  "take", "takes", "taking", "took",
+  "pull", "pulls", "pulling", "pulled",
+  "remove", "removes", "removing", "removed",
+  "adjust", "adjusts", "adjusting", "adjusted"
+]);
+
+// The closed appearance-state lexicon (Section 13.4, Rev 4/5).
+// These ten words — and ONLY these — participate in the
+// state-word comparison in novaCheckAppearanceContinuity. The
+// +/-4-token window and the stop lists above are the pre-filter;
+// this lexicon is the DECIDING filter: a candidate word not in
+// the lexicon is ignored, never a warning. Matching is LITERAL
+// on the listed forms — inflected forms (burn, burning,
+// tearing) are NOT in the list and never match (burning is not
+// burned). Adding a word is a DESIGN CHANGE: do not extend
+// this list in code.
+const NOVA_APPEARANCE_STATE_LEXICON = new Set([
+  "clean", "dirty", "torn", "patched", "burned", "wet",
+  "faded", "worn", "damaged", "stained"
+]);
+
+// ---- Small helpers ---------------------------------------------------
+
+function novaDeepCopy35b(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function novaNewSceneId() {
+  return novaNewId("nova-scene");
+}
+
+function novaNewObjectId() {
+  return novaNewId("nova-object");
+}
+
+function novaNewChangeId(prefix) {
+  return novaNewId(prefix || "nova-objchg");
+}
+
+// Normalised text for name/location matching: lowercase, collapsed
+// whitespace, non-alphanumerics treated as separators.
+function novaNormalize35b(text) {
+  if (typeof text !== "string") return "";
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// True when `name` is mentioned in `text`. Multi-word names match
+// as a normalised substring; single-word names match whole words
+// only (Section 15.2, locked decision).
+function novaObjectNameMentioned(name, text) {
+  const needle = novaNormalize35b(name);
+  if (!needle) return false;
+  const haystack = " " + novaNormalize35b(text) + " ";
+  if (needle.indexOf(" ") < 0) {
+    return haystack.indexOf(" " + needle + " ") >= 0;
+  }
+  return haystack.indexOf(needle) >= 0;
+}
+
+// True when the text contains one of the fixed location-transition
+// markers (Section 14), matched as whole phrases.
+function novaLocationMarkersPresent(text) {
+  const haystack = " " + novaNormalize35b(text) + " ";
+  return NOVA_LOCATION_TRANSITION_MARKERS.some(marker =>
+    haystack.indexOf(" " + marker + " ") >= 0
+  );
+}
+
+// ---- Registry + canon-version helpers (Sections 12.1, 16.2) ----------
+
+// The project's objects, deep-copied; missing coerces to [] (no
+// checks run, no errors — Section 21).
+function novaGetProjectObjects(project) {
+  if (
+    !project ||
+    !project.continuity ||
+    !Array.isArray(project.continuity.objects)
+  ) {
+    return [];
+  }
+  return novaDeepCopy35b(project.continuity.objects).filter(
+    item => item && typeof item === "object" && typeof item.id === "string"
+  );
+}
+
+// The project's locations, deep-copied; missing coerces to [].
+function novaGetProjectLocations(project) {
+  if (
+    !project ||
+    !project.continuity ||
+    !Array.isArray(project.continuity.locations)
+  ) {
+    return [];
+  }
+  return novaDeepCopy35b(project.continuity.locations).filter(
+    item => item && typeof item === "object" && typeof item.name === "string"
+  );
+}
+
+// The project's canon version; legacy projects (no canonVersion)
+// start at 1 (Section 16.2). Null-safe.
+function novaGetProjectCanonVersion(project) {
+  if (
+    !project ||
+    typeof project.canonVersion !== "number" ||
+    project.canonVersion < 1
+  ) {
+    return 1;
+  }
+  return Math.floor(project.canonVersion);
+}
+
+// Bumps the project's canonVersion by one and saves it. Returns
+// true on success, false when the project no longer exists or
+// the save failed.
+function novaBumpProjectCanonVersion(projectId) {
+  const project = projectId ? novaGetProject(projectId) : null;
+  if (!project) return false;
+  const updated = {
+    ...project,
+    canonVersion: novaGetProjectCanonVersion(project) + 1,
+    updatedAt: new Date().toISOString()
+  };
+  return novaSaveProject(updated);
+}
+
+// True when the new continuity record changes anything the checks
+// read (Section 16.2): worldDescription (the era check reads it
+// — decision D6), visualStyle, rules, notes, objects, locations.
+// Deep-compared as JSON; the values are plain data.
+function novaContinuityCanonChanged(oldContinuity, newContinuity) {
+  const oldC =
+    oldContinuity && typeof oldContinuity === "object" ? oldContinuity : {};
+  const newC =
+    newContinuity && typeof newContinuity === "object" ? newContinuity : {};
+  const fields = [
+    "worldDescription",
+    "visualStyle",
+    "rules",
+    "notes",
+    "objects",
+    "locations"
+  ];
+  return fields.some(
+    field =>
+      JSON.stringify(oldC[field] === undefined ? null : oldC[field]) !==
+      JSON.stringify(newC[field] === undefined ? null : newC[field])
+  );
+}
+
+// True when the new appearance record changes anything the checks
+// read (Section 16.2): species, colours, permanent details,
+// wardrobe, hair, accessories. distinctiveFeatures is NOT read by
+// any check and is NOT in the design's list — it does not bump.
+function novaAppearanceCanonChanged(oldAppearance, newAppearance) {
+  const oldA =
+    oldAppearance && typeof oldAppearance === "object" ? oldAppearance : {};
+  const newA =
+    newAppearance && typeof newAppearance === "object" ? newAppearance : {};
+  const fields = [
+    "species",
+    "colors",
+    "permanentDetails",
+    "wardrobe",
+    "hair",
+    "accessories"
+  ];
+  return fields.some(
+    field =>
+      JSON.stringify(oldA[field] === undefined ? null : oldA[field]) !==
+      JSON.stringify(newA[field] === undefined ? null : newA[field])
+  );
+}
+
+// ---- Stable scene IDs (Section 11 / 11.1) ----------------------------
+
+// Assigns stable ids to scenes lacking them and repairs collisions.
+// The fixed first-open sequence (Section 11.1): (1) the plan is
+// already loaded by the caller; (2) validate uniqueness and repair
+// collisions BEFORE assigning new ids and BEFORE saving (the later
+// scene in scene order is re-assigned a fresh id — the repair
+// cannot itself collide with an id assigned in the same pass);
+// (3) assign ids to scenes lacking them; (4) the caller saves once
+// (there is no plan store yet — see decision D1 — so `needsSave`
+// is reported to the caller and the notices are shown).
+// Decisions attached to a colliding id stay with the FIRST scene
+// (the one that keeps the id); the re-assigned scene starts with
+// no decisions — by construction, since decisions are keyed by
+// sceneId and only the first scene keeps it.
+// Returns { needsSave, assigned, collisions, notices } where
+// collisions is [{ sceneId, keptTitle, newTitle }] and notices
+// are the exact Section 11 / 11.1 notice strings.
+function novaAssignSceneIds(plan) {
+  const result = { needsSave: false, assigned: 0, collisions: [], notices: [] };
+  if (!plan || !Array.isArray(plan.scenes)) return result;
+
+  // Step 2: collision repair first.
+  const seen = new Map(); // sceneId -> first scene index
+  plan.scenes.forEach((scene, index) => {
+    if (!scene || typeof scene !== "object") return;
+    const id = scene.id;
+    if (typeof id !== "string" || !id) return;
+    if (!seen.has(id)) {
+      seen.set(id, index);
+      return;
+    }
+    // A later scene shares the id: re-assign it a fresh one.
+    const keptScene = plan.scenes[seen.get(id)];
+    const keptTitle =
+      keptScene && keptScene.title ? keptScene.title : "Scene " + (seen.get(id) + 1);
+    const newTitle = scene.title ? scene.title : "Scene " + (index + 1);
+    let fresh = novaNewSceneId();
+    while (seen.has(fresh)) fresh = novaNewSceneId();
+    scene.id = fresh;
+    seen.set(fresh, index);
+    result.needsSave = true;
+    result.collisions.push({ sceneId: id, keptTitle, newTitle });
+    result.notices.push(
+      "Two scenes shared an ID — '" +
+        newTitle +
+        "' has been given a new ID. Continuity decisions stay with '" +
+        keptTitle +
+        "'."
+    );
+  });
+
+  // Step 3: assign ids to scenes lacking them.
+  plan.scenes.forEach(scene => {
+    if (!scene || typeof scene !== "object") return;
+    if (typeof scene.id === "string" && scene.id) return;
+    let fresh = novaNewSceneId();
+    while (seen.has(fresh)) fresh = novaNewSceneId();
+    scene.id = fresh;
+    seen.set(fresh, true);
+    result.needsSave = true;
+    result.assigned += 1;
+  });
+
+  // The legacy-assignment notice (Section 11, exact text) is owed
+  // when ids were ASSIGNED to existing scenes — not for a fresh
+  // plan, whose scenes get ids at creation (B1). The caller
+  // decides whether the plan is legacy: novaOpenPlan adds the
+  // notice; buildMotionPlan does not (it creates the scenes).
+  return result;
+}
+
+// Copies a plan (Section 11.1): regenerates ALL scene ids in the
+// copy and drops ALL decisions. Decisions belong to the original
+// plan's warnings; the copy's scenes are new scenes, so the old
+// decisions cannot attach to them. The copy starts at version 1
+// with a fresh watermark (no decisions to revalidate).
+function novaCopyPlan(plan) {
+  if (!plan || typeof plan !== "object") return null;
+  const copy = novaDeepCopy35b(plan);
+  if (Array.isArray(copy.scenes)) {
+    copy.scenes.forEach(scene => {
+      if (scene && typeof scene === "object") {
+        scene.id = novaNewSceneId();
+      }
+    });
+  }
+  copy.version = 1;
+  copy.continuityDecisions = [];
+  copy.decisionsCheckedAt = {
+    planVersion: 1,
+    canonVersion:
+      plan.decisionsCheckedAt &&
+      typeof plan.decisionsCheckedAt.canonVersion === "number"
+        ? plan.decisionsCheckedAt.canonVersion
+        : 1
+  };
+  return copy;
+}
+
+// Lazily initialises the 3.5 plan fields on a plan record
+// (Section 3.4 / 21): version starts at 1; styleBasis is set from
+// the current project style; decisionsCheckedAt starts at the
+// current versions (no revalidation is owed for a plan that has
+// no decisions yet); continuityDecisions starts empty. Returns
+// true when anything was initialised.
+function novaEnsurePlanContinuityFields(plan, project) {
+  if (!plan || typeof plan !== "object") return false;
+  let changed = false;
+  if (typeof plan.version !== "number" || plan.version < 1) {
+    plan.version = 1;
+    changed = true;
+  }
+  if (!plan.styleBasis && project) {
+    plan.styleBasis = novaGetProjectVisualStyle(project);
+    changed = true;
+  }
+  if (!Array.isArray(plan.continuityDecisions)) {
+    plan.continuityDecisions = [];
+    changed = true;
+  }
+  if (
+    !plan.decisionsCheckedAt ||
+    typeof plan.decisionsCheckedAt !== "object"
+  ) {
+    plan.decisionsCheckedAt = {
+      planVersion: plan.version,
+      canonVersion: novaGetProjectCanonVersion(project)
+    };
+    changed = true;
+  }
+  return changed;
+}
+
+// The first-open sequence for a plan (Sections 11, 11.1, 16.2
+// trigger 1): assign scene ids + repair collisions, initialise
+// the 3.5 fields, then — if the watermark moved — revalidate the
+// decisions against the current canon + plan. Returns
+// { needsSave, notices, revalidated, removed, invalidated }.
+// `notices` carries the Section 11 assignment notice (when ids
+// were assigned to existing scenes) plus any collision notices.
+function novaOpenPlan(plan, project) {
+  const result = {
+    needsSave: false,
+    notices: [],
+    revalidated: false,
+    removed: [],
+    invalidated: []
+  };
+  if (!plan || typeof plan !== "object") return result;
+
+  const ids = novaAssignSceneIds(plan);
+  if (ids.needsSave) result.needsSave = true;
+  if (ids.assigned > 0) {
+    result.notices.push(
+      "This plan's scenes now have stable IDs, so continuity decisions stay with the right scene if you reorder them."
+    );
+  }
+  ids.notices.forEach(notice => result.notices.push(notice));
+
+  if (novaEnsurePlanContinuityFields(plan, project)) {
+    result.needsSave = true;
+  }
+
+  // Lazy revalidation (trigger 1): compare the watermark with the
+  // current versions; revalidate only if either moved.
+  const lazy = novaLazyRevalidatePlan(project, plan);
+  if (lazy.revalidated && lazy.revalidation) {
+    result.revalidated = true;
+    // The revalidation folds both outcomes into `removed`
+    // (each entry carries reason "vanished" | "changed"); the
+    // open result splits them into the design's vocabulary
+    // (Section 16.2): vanished = removed, changed = invalidated.
+    const removed = lazy.revalidation.removed || [];
+    result.removed = removed.filter(r => r.reason !== "changed");
+    result.invalidated = removed.filter(r => r.reason === "changed");
+    if (removed.length) {
+      result.needsSave = true;
+    }
+  }
+  return result;
+}
+
+// ---- Object transition validation (Section 12.2) ---------------------
+
+// Checks one declaration against the transition table. `object`
+// is the object's CURRENT STATE record ({ status, ... }) — the
+// table is keyed by pre-state — or a plain status string (decision
+// D8: the Section 18 signature says `object`, and the state record
+// is the only object that carries a status). Returns an error
+// string or null. A `move` with no destination is refused;
+// newLocation is ignored for every other transition (a stray
+// value is dropped by the caller, never stored).
+function novaValidateObjectChange(object, transition, newLocation) {
+  const status =
+    typeof object === "string"
+      ? object
+      : object && typeof object === "object"
+        ? object.status
+        : undefined;
+  const spec = NOVA_OBJECT_TRANSITIONS[transition];
+  if (!spec) {
+    return "Unknown object transition: " + transition + ".";
+  }
+  if (spec.from.indexOf(status) < 0) {
+    if (status === "destroyed") {
+      return "A destroyed object cannot change again — destruction is terminal.";
+    }
+    return (
+      "Cannot " +
+      transition +
+      " an object that is " +
+      (status || "unknown") +
+      " — " +
+      transition +
+      " requires the object to be " +
+      spec.from.join(" or ") +
+      "."
+    );
+  }
+  if (transition === "move") {
+    if (typeof newLocation !== "string" || !newLocation.trim()) {
+      return "A move needs a destination — where does the object go?";
+    }
+  }
+  return null;
+}
+
+// Validates a scene's stateChanges array against a starting object
+// state ({ <objectId>: { status, ... } }), applying each change in
+// ARRAY order with running-state validation (Section 12.2). Also
+// refuses an unknown objectId (it must exist in the project
+// registry). Returns an error string or null. `sceneLabel` (e.g.
+// "Scene 3") names the scene in the error.
+function novaValidateObjectChangeList(project, startingState, changes, sceneLabel) {
+  const label = sceneLabel || "This scene";
+  if (!Array.isArray(changes)) return null;
+  const registry = new Set(novaGetProjectObjects(project).map(o => o.id));
+  const running = {};
+  Object.keys(startingState || {}).forEach(id => {
+    running[id] = { status: startingState[id].status };
+  });
+  for (let i = 0; i < changes.length; i++) {
+    const change = changes[i];
+    if (!change || typeof change !== "object") {
+      return label + ": an object change is not a change record.";
+    }
+    if (!registry.has(change.objectId)) {
+      return (
+        label +
+        " names an object that is not in this project's registry: " +
+        change.objectId +
+        "."
+      );
+    }
+    if (!running[change.objectId]) {
+      running[change.objectId] = { status: "present" };
+    }
+    const error = novaValidateObjectChange(
+      running[change.objectId],
+      change.transition,
+      change.newLocation
+    );
+    if (error) {
+      const name = novaObjectNameById(project, change.objectId);
+      return label + ": " + error + " (" + name + ")";
+    }
+    const spec = NOVA_OBJECT_TRANSITIONS[change.transition];
+    if (spec.to) running[change.objectId].status = spec.to;
+  }
+  return null;
+}
+
+// The registry name for an object id (or the id itself when the
+// object is gone — the error still names something).
+function novaObjectNameById(project, objectId) {
+  const found = novaGetProjectObjects(project).find(o => o.id === objectId);
+  return found ? found.name : objectId;
+}
+
+// ---- The production state chain (Section 14) -------------------------
+
+// Pure state-chain builder: objects + appearance + locations.
+// Input: project canon (objects, locations, characters) + plan
+// (scenes in order, each with stateChanges, characterStateChanges,
+// location). Output: per-scene accumulated state — one entry per
+// scene, { sceneId, sceneNumber, location, objects, appearance },
+// where objects/appearance are the state AFTER that scene.
+// `starting` is the canon starting state (all objects present at
+// home locations, characters in default wardrobe, no injuries).
+// Each entry also carries `carriedIn` (the state before the
+// scene's changes — what Section 12.3 checks run against) plus
+// internal provenance maps (appearanceProvenance,
+// appearanceTemporary, objectLastTransition,
+// locationSetBySceneId) used by the state line and the warnings; those internal fields are NOT part of
+// the Section 17 snapshot shape (the snapshot stores only
+// { location, objects, appearance } per scene).
+// The builder validates defensively and reports a clear error
+// naming the scene and the object or character rather than
+// producing a corrupt chain. On error it returns
+// { error, scenes: null, starting: null, sceneNumberById: {} }.
+function novaBuildProductionState(project, plan) {
+  const failure = error => ({
+    error,
+    scenes: null,
+    starting: null,
+    sceneNumberById: {}
+  });
+  if (!project || typeof project !== "object") {
+    return failure("No project was supplied for the state chain.");
+  }
+  if (!plan || !Array.isArray(plan.scenes)) {
+    return failure("No plan scenes were supplied for the state chain.");
+  }
+
+  // Scene ids are required: the chain, the warnings and the
+  // decisions all key by sceneId (Section 11). A scene without
+  // one is a malformed plan — fail closed.
+  for (let i = 0; i < plan.scenes.length; i++) {
+    const scene = plan.scenes[i];
+    if (!scene || typeof scene !== "object") {
+      return failure("Scene " + (i + 1) + " is not a scene record.");
+    }
+    if (typeof scene.id !== "string" || !scene.id) {
+      return failure(
+        "Scene " +
+          (i + 1) +
+          " has no stable ID. Open the plan to assign IDs first."
+      );
+    }
+  }
+
+  // The cast must validate (Section 3.3, fail-closed): every id
+  // must exist AND belong to the project. A standalone plan (no
+  // cast) has no characters to initialise.
+  const cast = Array.isArray(plan.cast) ? plan.cast : [];
+  const castError = novaValidateCast(project, cast);
+  if (castError) {
+    return failure(castError);
+  }
+  const castCharacters = cast
+    .map(id => novaGetCharacter(id))
+    .filter(Boolean);
+
+  // Starting state: canon.
+  const objects = novaGetProjectObjects(project);
+  const startingObjects = {};
+  objects.forEach(object => {
+    startingObjects[object.id] = {
+      objectId: object.id,
+      status: "present",
+      currentLocation:
+        typeof object.homeLocation === "string" ? object.homeLocation : "",
+      lastChangedSceneId: null
+    };
+  });
+  const startingAppearance = {};
+  castCharacters.forEach(character => {
+    const appearance = character.appearance || {};
+    startingAppearance[character.id] = {
+      wardrobe: typeof appearance.wardrobe === "string" ? appearance.wardrobe : "",
+      hair: typeof appearance.hair === "string" ? appearance.hair : "",
+      injuries: [],
+      armour: "",
+      notes: []
+    };
+  });
+  const starting = {
+    location: null,
+    objects: novaDeepCopy35b(startingObjects),
+    appearance: novaDeepCopy35b(startingAppearance)
+  };
+
+  // Running state + history. The history maps changeId ->
+  // { field, previousValue } for single-value fields and
+  // changeId -> the added text for injuries/notes, so a reversal
+  // restores the EXACT pre-change value (Section 13.3). `reversed`
+  // tracks changeIds already reversed (a second reversal of the
+  // same change is refused). `reversalIds` tracks the changeIds
+  // of reversals themselves: a reversal cannot itself be
+  // reversed (decision D23 — the design defines reversal for
+  // forward changes only). `appearanceTemporary` tracks whether
+  // the current value of each field / injury / note came from an
+  // unreversed temporary change (decision D11: the state line
+  // marks it "(temporary)"); the history records the
+  // pre-change temporariness so a reversal restores it exactly.
+  const runningObjects = novaDeepCopy35b(startingObjects);
+  const runningAppearance = novaDeepCopy35b(startingAppearance);
+  const appearanceHistory = {}; // changeId -> { characterId, field, previousValue | addedText, previousTemporary }
+  const appearanceReversed = new Set();
+  const appearanceReversalIds = new Set();
+  const appearanceProvenance = {}; // characterId -> { wardrobe, hair, armour, injuries: {text: sceneId}, notes: {text: sceneId} }
+  const appearanceTemporary = {}; // characterId -> { wardrobe, hair, armour, injuries: {text: bool}, notes: {text: bool} }
+  castCharacters.forEach(character => {
+    appearanceProvenance[character.id] = {
+      wardrobe: null,
+      hair: null,
+      armour: null,
+      injuries: {},
+      notes: {}
+    };
+    appearanceTemporary[character.id] = {
+      wardrobe: false,
+      hair: false,
+      armour: false,
+      injuries: {},
+      notes: {}
+    };
+  });
+  const objectLastTransition = {}; // objectId -> transition
+  let runningLocation = null;
+  let locationSetBySceneId = null;
+
+  const sceneNumberById = {};
+  plan.scenes.forEach((scene, index) => {
+    sceneNumberById[scene.id] = index + 1;
+  });
+
+  const entries = [];
+
+  for (let index = 0; index < plan.scenes.length; index++) {
+    const scene = plan.scenes[index];
+    const sceneNumber = index + 1;
+    const label = "Scene " + sceneNumber;
+
+    // The state carried INTO this scene (Section 12.3, step 1).
+    // The transition and provenance maps are snapshotted here
+    // too: the state line's carried sentences describe the state
+    // BEFORE this scene's changes, so they must read the
+    // carried-in maps, not the entry's after-state maps.
+    const carriedIn = {
+      location: runningLocation,
+      objects: novaDeepCopy35b(runningObjects),
+      appearance: novaDeepCopy35b(runningAppearance),
+      objectLastTransition: { ...objectLastTransition },
+      appearanceProvenance: novaDeepCopy35b(appearanceProvenance),
+      appearanceTemporary: novaDeepCopy35b(appearanceTemporary),
+      locationSetBySceneId
+    };
+
+    // --- Object changes, in array order, with running-state
+    // validation (Section 12.2).
+    const stateChanges = Array.isArray(scene.stateChanges)
+      ? scene.stateChanges
+      : [];
+    for (let c = 0; c < stateChanges.length; c++) {
+      const change = stateChanges[c];
+      if (!change || typeof change !== "object") {
+        return failure(label + ": an object change is not a change record.");
+      }
+      const object = objects.find(o => o.id === change.objectId);
+      if (!object) {
+        return failure(
+          label +
+            " names an object that is not in this project's registry: " +
+            change.objectId +
+            "."
+        );
+      }
+      const current = runningObjects[change.objectId];
+      const error = novaValidateObjectChange(
+        current,
+        change.transition,
+        change.newLocation
+      );
+      if (error) {
+        return failure(label + ": " + error + " (" + object.name + ")");
+      }
+      const spec = NOVA_OBJECT_TRANSITIONS[change.transition];
+      if (spec.to) current.status = spec.to;
+      if (change.transition === "move") {
+        current.currentLocation = change.newLocation.trim();
+      }
+      current.lastChangedSceneId = scene.id;
+      objectLastTransition[change.objectId] = change.transition;
+    }
+
+    // --- Appearance changes, in array order (Section 13).
+    const appearanceChanges = Array.isArray(scene.characterStateChanges)
+      ? scene.characterStateChanges
+      : [];
+    for (let c = 0; c < appearanceChanges.length; c++) {
+      const change = appearanceChanges[c];
+      if (!change || typeof change !== "object") {
+        return failure(label + ": an appearance change is not a change record.");
+      }
+      if (NOVA_APPEARANCE_FIELDS.indexOf(change.field) < 0) {
+        return failure(
+          label + ": unknown appearance field: " + change.field + "."
+        );
+      }
+      if (!cast.includes(change.characterId)) {
+        const name =
+          (novaGetCharacter(change.characterId) || {}).name ||
+          change.characterId;
+        return failure(
+          label +
+            " changes the appearance of " +
+            name +
+            ", who is not in this plan's cast."
+        );
+      }
+      const state = runningAppearance[change.characterId];
+      const provenance = appearanceProvenance[change.characterId];
+      const temporary = appearanceTemporary[change.characterId];
+
+      if (change.reversesChangeId) {
+        // Reversal: the closed five-part refusal list
+        // (Section 13.3, Rev 4/5) — the named change must exist
+        // in the history (an earlier scene, or earlier in this
+        // scene's array), belong to the same character, target
+        // the SAME FIELD, not have been reversed already, and
+        // not itself be a reversal (decision D23). Any failure
+        // refuses the whole build; nothing is modified.
+        if (appearanceReversalIds.has(change.reversesChangeId)) {
+          return failure(
+            label +
+              ": a reversal cannot itself be reversed: " +
+              change.reversesChangeId +
+              "."
+          );
+        }
+        const original = appearanceHistory[change.reversesChangeId];
+        if (!original) {
+          return failure(
+            label +
+              ": reverses a change that was never made: " +
+              change.reversesChangeId +
+              "."
+          );
+        }
+        if (original.characterId !== change.characterId) {
+          return failure(
+            label +
+              ": reverses a change belonging to another character."
+          );
+        }
+        if (original.field !== change.field) {
+          return failure(
+            label +
+              ": reverses a change to another field (" +
+              original.field +
+              ", not " +
+              change.field +
+              ")."
+          );
+        }
+        if (appearanceReversed.has(change.reversesChangeId)) {
+          return failure(
+            label +
+              ": reverses the same change twice: " +
+              change.reversesChangeId +
+              "."
+          );
+        }
+        appearanceReversed.add(change.reversesChangeId);
+        if (typeof change.changeId === "string" && change.changeId) {
+          appearanceReversalIds.add(change.changeId);
+        }
+        // Restore the EXACT pre-change value from history
+        // (decision D4: the reversal's own `change` field is
+        // recorded but does not govern the restored value).
+        // The pre-change temporariness is restored with it.
+        if (change.field === "injury") {
+          const at = state.injuries.indexOf(original.addedText);
+          if (at >= 0) state.injuries.splice(at, 1);
+          delete provenance.injuries[original.addedText];
+          delete temporary.injuries[original.addedText];
+        } else if (change.field === "general") {
+          const at = state.notes.indexOf(original.addedText);
+          if (at >= 0) state.notes.splice(at, 1);
+          delete provenance.notes[original.addedText];
+          delete temporary.notes[original.addedText];
+        } else {
+          state[change.field] = original.previousValue;
+          provenance[change.field] = scene.id;
+          temporary[change.field] = !!original.previousTemporary;
+        }
+        continue;
+      }
+
+      // A non-reversal change states the NEW effective
+      // description (Section 13.1) — it must not be empty.
+      if (typeof change.change !== "string" || !change.change.trim()) {
+        return failure(
+          label + ": an appearance change needs the new description."
+        );
+      }
+      const changeId =
+        typeof change.changeId === "string" && change.changeId
+          ? change.changeId
+          : null;
+      const isTemporary = !!change.temporary;
+      if (change.field === "injury") {
+        state.injuries.push(change.change.trim());
+        provenance.injuries[change.change.trim()] = scene.id;
+        temporary.injuries[change.change.trim()] = isTemporary;
+        if (changeId) {
+          appearanceHistory[changeId] = {
+            characterId: change.characterId,
+            field: "injury",
+            addedText: change.change.trim()
+          };
+        }
+      } else if (change.field === "general") {
+        state.notes.push(change.change.trim());
+        provenance.notes[change.change.trim()] = scene.id;
+        temporary.notes[change.change.trim()] = isTemporary;
+        if (changeId) {
+          appearanceHistory[changeId] = {
+            characterId: change.characterId,
+            field: "general",
+            addedText: change.change.trim()
+          };
+        }
+      } else {
+        if (changeId) {
+          appearanceHistory[changeId] = {
+            characterId: change.characterId,
+            field: change.field,
+            previousValue: state[change.field],
+            previousTemporary: !!temporary[change.field]
+          };
+        }
+        state[change.field] = change.change.trim();
+        provenance[change.field] = scene.id;
+        temporary[change.field] = isTemporary;
+      }
+    }
+
+    // --- Location: the scene's location is free text, optionally
+    // picked from the project list (Section 14). A scene that
+    // sets one moves the production there; otherwise the carried
+    // location continues.
+    if (typeof scene.location === "string" && scene.location.trim()) {
+      runningLocation = scene.location.trim();
+      locationSetBySceneId = scene.id;
+    }
+
+    entries.push({
+      sceneId: scene.id,
+      sceneNumber,
+      location: runningLocation,
+      objects: novaDeepCopy35b(runningObjects),
+      appearance: novaDeepCopy35b(runningAppearance),
+      carriedIn,
+      appearanceProvenance: novaDeepCopy35b(appearanceProvenance),
+      appearanceTemporary: novaDeepCopy35b(appearanceTemporary),
+      objectLastTransition: { ...objectLastTransition },
+      locationSetBySceneId
+    });
+  }
+
+  return { error: null, scenes: entries, starting, sceneNumberById, _project: project };
+}
+
+// The state carried INTO scene `index` (0-based): the starting
+// state for scene 0, else the previous entry's after-state.
+function novaChainCarriedIn(chain, index) {
+  if (!chain || !Array.isArray(chain.scenes)) return null;
+  if (index <= 0) return chain.starting;
+  const previous = chain.scenes[index - 1];
+  if (!previous) return chain.starting;
+  return {
+    location: previous.location,
+    objects: previous.objects,
+    appearance: previous.appearance
+  };
+}
+
+// ---- The state line (Section 12.4) -----------------------------------
+
+// The scene number for a sceneId, from the chain's map
+// ("Scene 3" — display labels only, derived at render time).
+function novaSceneNumberLabel(chain, sceneId) {
+  if (!chain || !chain.sceneNumberById) return "Scene ?";
+  const n = chain.sceneNumberById[sceneId];
+  return "Scene " + (typeof n === "number" ? n : "?");
+}
+
+// The owner name for an object (from the registry), or "".
+function novaObjectOwnerName(project, object) {
+  if (!object || !object.ownerCharacterId) return "";
+  const owner = novaGetCharacter(object.ownerCharacterId);
+  return owner ? owner.name : "";
+}
+
+// One carried-state sentence for an object, or "" when the object
+// is not carried-relevant for this scene. An object is listed
+// when its status is not present, when an earlier scene changed
+// it, or when this scene changes it (Section 12.4: only CHANGED
+// or CARRIED-RELEVANT state is listed).
+function novaStateLineObjectSentence(chain, entry, object, project, sceneChangesObject) {
+  const state = entry.carriedIn.objects[object.id];
+  if (!state) return "";
+  const changedByEarlierScene = state.lastChangedSceneId !== null;
+  const isPresent = state.status === "present";
+  if (isPresent && !changedByEarlierScene && !sceneChangesObject) return "";
+
+  const name = object.name;
+  const sceneLabel = state.lastChangedSceneId
+    ? novaSceneNumberLabel(chain, state.lastChangedSceneId)
+    : null;
+  const lastTransition = entry.carriedIn.objectLastTransition
+    ? entry.carriedIn.objectLastTransition[object.id]
+    : null;
+  const owner = novaObjectOwnerName(project, object);
+  const where = owner
+    ? "with " + owner
+    : state.currentLocation
+      ? "in " + state.currentLocation
+      : "";
+
+  if (state.status === "lost") {
+    return "The " + name + " was lost in " + sceneLabel + ".";
+  }
+  if (state.status === "destroyed") {
+    return "The " + name + " was destroyed in " + sceneLabel + ".";
+  }
+  if (state.status === "damaged") {
+    return "The " + name + " is damaged (" + sceneLabel + ").";
+  }
+  // Present.
+  if (lastTransition === "recover") {
+    return (
+      "The " + name + " is " + (where || "present") +
+      " (recovered in " + sceneLabel + ")."
+    );
+  }
+  if (lastTransition === "repair") {
+    return (
+      "The " + name + " is " + (where || "present") +
+      " (repaired in " + sceneLabel + ")."
+    );
+  }
+  if (lastTransition === "move") {
+    return (
+      "The " + name + " is in " + state.currentLocation +
+      " (moved in " + sceneLabel + ")."
+    );
+  }
+  return "The " + name + " is " + (where || "present") + ".";
+}
+
+// Carried-state sentences for one character's appearance: every
+// field that differs from canon (changed by an earlier scene),
+// every current injury, every note, and every field this scene
+// changes (the carried "before" picture). Each fact names the
+// scene it comes from. `canon` is the character's canon
+// appearance (wardrobe/hair); `temporary` maps field -> true when
+// the current value comes from an unreversed temporary change.
+function novaStateLineAppearanceSentences(chain, entry, character, canon, sceneChangesFields) {
+  const sentences = [];
+  const state = entry.carriedIn.appearance[character.id];
+  if (!state) return sentences;
+  const provenance = entry.carriedIn.appearanceProvenance
+    ? entry.carriedIn.appearanceProvenance[character.id]
+    : null;
+  const temporary = entry.carriedIn.appearanceTemporary
+    ? entry.carriedIn.appearanceTemporary[character.id]
+    : null;
+  const name = character.name || "The character";
+  const fields = [
+    { key: "wardrobe", label: "wardrobe" },
+    { key: "hair", label: "hair" },
+    { key: "armour", label: "armour" }
+  ];
+  fields.forEach(field => {
+    const canonValue =
+      field.key === "armour" ? "" : canon[field.key] || "";
+    const differs = state[field.key] !== canonValue;
+    const changedHere =
+      sceneChangesFields && sceneChangesFields[field.key];
+    if (!differs && !changedHere) return;
+    if (!state[field.key]) return;
+    const sceneId = provenance ? provenance[field.key] : null;
+    const sceneLabel = sceneId
+      ? " (" + novaSceneNumberLabel(chain, sceneId) + ")"
+      : "";
+    // Unreversed temporary changes carry " (temporary)" in the
+    // state line (decision D11).
+    const tempMark =
+      temporary && temporary[field.key] ? " (temporary)" : "";
+    sentences.push(
+      name + "'s " + field.label + ": " + state[field.key] + tempMark + sceneLabel + "."
+    );
+  });
+  state.injuries.forEach(injury => {
+    const sceneId =
+      provenance && provenance.injuries ? provenance.injuries[injury] : null;
+    const sceneLabel = sceneId
+      ? " (" + novaSceneNumberLabel(chain, sceneId) + ")"
+      : "";
+    const tempMark =
+      temporary && temporary.injuries && temporary.injuries[injury]
+        ? " (temporary)"
+        : "";
+    sentences.push(name + " has an injury: " + injury + tempMark + sceneLabel + ".");
+  });
+  state.notes.forEach(note => {
+    const sceneId =
+      provenance && provenance.notes ? provenance.notes[note] : null;
+    const sceneLabel = sceneId
+      ? " (" + novaSceneNumberLabel(chain, sceneId) + ")"
+      : "";
+    const tempMark =
+      temporary && temporary.notes && temporary.notes[note]
+        ? " (temporary)"
+        : "";
+    sentences.push(name + " — " + note + tempMark + sceneLabel + ".");
+  });
+  return sentences;
+}
+
+// The two-part state line for scene `sceneIndex` (0-based):
+// the state carried INTO the scene plus the scene's own changes
+// (Section 12.4). Returns "" when there is no carried state and
+// no changes. `chain` is the novaBuildProductionState result;
+// `scene` is the plan's scene record (its declarations).
+function novaContinuityStateLine(chain, scene, sceneIndex) {
+  if (!chain || !Array.isArray(chain.scenes)) return "";
+  const entry = chain.scenes[sceneIndex];
+  if (!entry) return "";
+  const sceneNumber = entry.sceneNumber || sceneIndex + 1;
+  const project = chain._project || null;
+
+  // Which objects / appearance fields does this scene change?
+  const sceneObjectIds = new Set();
+  (scene && Array.isArray(scene.stateChanges) ? scene.stateChanges : []).forEach(
+    change => {
+      if (change && change.objectId) sceneObjectIds.add(change.objectId);
+    }
+  );
+  const sceneAppearanceFields = {}; // characterId -> { field: true }
+  (scene && Array.isArray(scene.characterStateChanges)
+    ? scene.characterStateChanges
+    : []
+  ).forEach(change => {
+    if (!change || !change.characterId || !change.field) return;
+    if (!sceneAppearanceFields[change.characterId]) {
+      sceneAppearanceFields[change.characterId] = {};
+    }
+    sceneAppearanceFields[change.characterId][change.field] = true;
+  });
+
+  // --- Part 1: carried state.
+  const carried = [];
+  if (project) {
+    novaGetProjectObjects(project).forEach(object => {
+      const sentence = novaStateLineObjectSentence(
+        chain,
+        entry,
+        object,
+        project,
+        sceneObjectIds.has(object.id)
+      );
+      if (sentence) carried.push(sentence);
+    });
+    Object.keys(entry.carriedIn.appearance).forEach(characterId => {
+      const character = novaGetCharacter(characterId);
+      if (!character) return;
+      const canon = character.appearance || {};
+      novaStateLineAppearanceSentences(
+        chain,
+        entry,
+        character,
+        canon,
+        sceneAppearanceFields[characterId] || null
+      ).forEach(sentence => carried.push(sentence));
+    });
+  }
+
+  // --- Part 2: this scene's own changes.
+  const own = [];
+  (scene && Array.isArray(scene.stateChanges) ? scene.stateChanges : []).forEach(
+    change => {
+      if (!change || typeof change !== "object") return;
+      const name = project
+        ? novaObjectNameById(project, change.objectId)
+        : change.objectId;
+      let sentence = "";
+      if (change.transition === "lose") {
+        sentence = "the " + name + " is lost";
+      } else if (change.transition === "recover") {
+        sentence = "the " + name + " is recovered";
+      } else if (change.transition === "damage") {
+        sentence = "the " + name + " is damaged";
+      } else if (change.transition === "destroy") {
+        sentence = "the " + name + " is destroyed";
+      } else if (change.transition === "move") {
+        sentence =
+          "the " + name + " moves to " + (change.newLocation || "").trim();
+      } else if (change.transition === "repair") {
+        sentence = "the " + name + " is repaired";
+      } else {
+        return;
+      }
+      if (typeof change.note === "string" && change.note.trim()) {
+        let note = change.note.trim();
+        if (!/[.!?]$/.test(note)) note += ".";
+        sentence += ". " + note;
+      } else {
+        sentence += ".";
+      }
+      own.push(sentence);
+    }
+  );
+  (scene && Array.isArray(scene.characterStateChanges)
+    ? scene.characterStateChanges
+    : []
+  ).forEach(change => {
+    if (!change || typeof change !== "object") return;
+    const character = novaGetCharacter(change.characterId);
+    const name = character ? character.name : change.characterId;
+    if (change.reversesChangeId) {
+      // The restored value comes from the chain's after-state
+      // (history governs — decision D4).
+      const after = entry.appearance[change.characterId] || {};
+      if (change.field === "injury") {
+        own.push(name + "'s injury heals.");
+      } else if (change.field === "general") {
+        own.push(name + "'s note is removed.");
+      } else {
+        const restored = after[change.field] || "";
+        own.push(
+          name + "'s " + change.field + " is restored" +
+            (restored ? ": " + restored : "") +
+            "."
+        );
+      }
+      return;
+    }
+    const text = (change.change || "").trim();
+    if (!text) return;
+    const temp = change.temporary ? " (temporary)" : "";
+    if (change.field === "injury") {
+      own.push(name + " gains an injury: " + text + temp + ".");
+    } else if (change.field === "general") {
+      own.push(name + " — " + text + temp + ".");
+    } else {
+      own.push(name + "'s " + change.field + " becomes: " + text + temp + ".");
+    }
+  });
+
+  if (!carried.length && !own.length) return "";
+  let line = "Current state (Scene " + sceneNumber + "): ";
+  if (carried.length) line += carried.join(" ");
+  if (own.length) {
+    if (carried.length) line += "\n";
+    line += "In this scene " + own.join(" ");
+    // The own sentences already end with periods (each is a
+    // complete sentence); the join above puts them in sequence.
+  }
+  return line;
+}
+
+// ---- Deterministic warning fingerprints (Section 15.4) ---------------
+
+// FNV-1a 32-bit hash, rendered as 8 lowercase hex characters.
+// ~10 lines of plain JavaScript: no dependency, no crypto API,
+// deterministic across reloads, browsers and sessions.
+function novaFnv1a32(text) {
+  let hash = 0x811c9dc5;
+  const input = typeof text === "string" ? text : "";
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+// fingerprint = "w:" + fnv1a32(kind + "|" + sceneId + "|" + key +
+// "|" + stableRef + "|" + provenance). The rendered message and
+// the scene number are EXCLUDED (renames and reorders never
+// change fingerprints). stableRef is "" when none. Pure.
+function novaComputeWarningFingerprint(kind, sceneId, key, stableRef, provenance) {
+  const canonical =
+    (kind || "") +
+    "|" +
+    (sceneId || "") +
+    "|" +
+    (key || "") +
+    "|" +
+    (stableRef || "") +
+    "|" +
+    (provenance || "canon");
+  return "w:" + novaFnv1a32(canonical);
+}
+
+// Returns a copy of the warning with its fingerprint attached.
+function novaWarningWithFingerprint(warning) {
+  const copy = { ...warning };
+  copy.fingerprint = novaComputeWarningFingerprint(
+    copy.kind,
+    copy.sceneId,
+    copy.key,
+    copy.stableRef,
+    copy.provenance
+  );
+  return copy;
+}
+
+// ---- Per-scene check text (decision D22) ------------------------------
+
+// The text the per-scene checks run against: the scene's title +
+// direction. NOT the built scene prompt (see the module header).
+function novaCheckSceneText(scene) {
+  if (!scene || typeof scene !== "object") return "";
+  const parts = [];
+  if (typeof scene.title === "string" && scene.title.trim()) {
+    parts.push(scene.title.trim());
+  }
+  if (typeof scene.direction === "string" && scene.direction.trim()) {
+    parts.push(scene.direction.trim());
+  }
+  return parts.join(" ");
+}
+
+// ---- Object-state checks (Section 15.2) -------------------------------
+
+// Object-state warnings for one scene. `checkState` is the
+// carried-in object state ({ objects: { <id>: { status,
+// currentLocation, lastChangedSceneId } } }) with the recovery
+// exemption already applied by the collector (Section 12.3: an
+// object recovered in this scene counts as present for this
+// scene's checks). `ctx` carries { project, sceneNumber,
+// numberById }. Returns warnings (each with a fingerprint).
+function novaCheckObjectContinuity(checkState, scene, sceneId, ctx) {
+  const warnings = [];
+  const context = ctx || {};
+  const project = context.project || null;
+  const sceneNumber = context.sceneNumber || null;
+  const numberById = context.numberById || {};
+  if (!project || !checkState || !checkState.objects) return warnings;
+  const text = novaCheckSceneText(scene);
+  if (!text) return warnings;
+  const sceneLocation =
+    scene && typeof scene.location === "string" ? scene.location.trim() : "";
+  const movesHere = new Set();
+  (scene && Array.isArray(scene.stateChanges) ? scene.stateChanges : []).forEach(
+    change => {
+      if (change && change.transition === "move" && change.objectId) {
+        movesHere.add(change.objectId);
+      }
+    }
+  );
+
+  novaGetProjectObjects(project).forEach(object => {
+    if (!novaObjectNameMentioned(object.name, text)) return;
+    const state = checkState.objects[object.id];
+    if (!state) return;
+    const lossSceneId = state.lastChangedSceneId;
+    const lossNumber =
+      lossSceneId && numberById[lossSceneId]
+        ? numberById[lossSceneId]
+        : null;
+    const lossLabel =
+      lossNumber !== null ? "Scene " + lossNumber : "an earlier scene";
+
+    if (state.status === "lost" || state.status === "destroyed") {
+      const verb = state.status === "lost" ? "lost" : "destroyed";
+      warnings.push(
+        novaWarningWithFingerprint({
+          key: "object:" + verb + ":" + object.id,
+          kind: "object",
+          message:
+            "Scene " +
+            (sceneNumber !== null ? sceneNumber : "?") +
+            " mentions the " +
+            object.name +
+            ", but it was " +
+            verb +
+            " in " +
+            lossLabel +
+            (state.status === "lost" ? " and has not been recovered." : "."),
+          sceneId,
+          sceneNumber,
+          severity: "warning",
+          stableRef: object.id,
+          provenance: lossSceneId || "canon"
+        })
+      );
+      return;
+    }
+
+    // Present but elsewhere: an INFO note (Section 15.2). A move
+    // declared in this scene IS the explanation (decision D19).
+    if (
+      state.status === "present" &&
+      state.currentLocation &&
+      sceneLocation &&
+      novaNormalize35b(state.currentLocation) !== novaNormalize35b(sceneLocation) &&
+      !movesHere.has(object.id)
+    ) {
+      warnings.push(
+        novaWarningWithFingerprint({
+          key: "object:location:" + object.id,
+          kind: "object",
+          message:
+            "The " +
+            object.name +
+            " is in " +
+            state.currentLocation +
+            ", but Scene " +
+            (sceneNumber !== null ? sceneNumber : "?") +
+            " is set in " +
+            sceneLocation +
+            ".",
+          sceneId,
+          sceneNumber,
+          severity: "info",
+          stableRef: object.id,
+          provenance: lossSceneId || "canon"
+        })
+      );
+    }
+  });
+  return warnings;
+}
+
+// ---- Appearance checks (Sections 13.4, 13.5) --------------------------
+
+// Descriptive words of an appearance value: tokens minus colour
+// words, minus the feature word (and its plural), minus stop
+// words. "clean black cloak" -> {clean}; "black cloak, burned at
+// the hem, soot-stained" -> {burned, hem, soot, stained}.
+function novaAppearanceDescriptiveWords(value, feature) {
+  const tokens = novaContinuityTokens(value || "");
+  const colors = new Set(NOVA_CONTINUITY_COLORS);
+  const words = new Set();
+  tokens.forEach(token => {
+    if (colors.has(token)) return;
+    if (NOVA_STATE_WORD_STOP.has(token)) return;
+    if (feature && (token === feature || token === feature + "s")) return;
+    if (feature && feature.endsWith("s") && token === feature.slice(0, -1)) return;
+    words.add(token);
+  });
+  return words;
+}
+
+// The prompt's description of a feature: descriptive words within
+// 4 tokens of the feature word (the 3.4E matcher's window),
+// plus the colours attached to it (via the matcher). Returns
+// { words: Set, colors: Set, mentioned: boolean }.
+// The prompt's description of a feature: the non-colour,
+// non-feature words within 4 tokens of the feature word, plus
+// the colours the 3.4E matcher attaches to it. `excludeWords`
+// (optional, a Set of lowercase words) holds proper names —
+// character, object and location names — which are never
+// wardrobe descriptors (decision D27); common verbs are
+// excluded via NOVA_APPEARANCE_VERB_STOP.
+function novaAppearancePromptDescription(promptText, feature, extraFeatures, excludeWords) {
+  const tokens = novaContinuityTokens(promptText || "");
+  const colors = new Set(NOVA_CONTINUITY_COLORS);
+  const words = new Set();
+  let mentioned = false;
+  const featureForms = new Set();
+  if (feature) {
+    featureForms.add(feature);
+    featureForms.add(feature + "s");
+    if (feature.endsWith("s")) featureForms.add(feature.slice(0, -1));
+  }
+  tokens.forEach((token, i) => {
+    if (!featureForms.has(token)) return;
+    mentioned = true;
+    for (let j = Math.max(0, i - 4); j <= Math.min(tokens.length - 1, i + 4); j++) {
+      if (j === i) continue;
+      const near = tokens[j];
+      if (colors.has(near)) continue;
+      if (NOVA_STATE_WORD_STOP.has(near)) continue;
+      if (NOVA_APPEARANCE_VERB_STOP.has(near)) continue;
+      if (excludeWords && excludeWords.has(near)) continue;
+      if (featureForms.has(near)) continue;
+      words.add(near);
+    }
+  });
+  // Colours attached to the feature, via the 3.4E matcher.
+  const found = novaContinuityFeatureColors(
+    promptText || "",
+    extraFeatures || []
+  );
+  const promptColors = new Set();
+  found.forEach((colorSet, foundFeature) => {
+    if (novaAppearanceCanonicalFeature(foundFeature) ===
+        novaAppearanceCanonicalFeature(feature || "")) {
+      colorSet.forEach(color => promptColors.add(color));
+    }
+  });
+  return { words, colors: promptColors, mentioned };
+}
+
+// Effective-state wardrobe/hair/armour checks with the own-scene
+// check set (Sections 13.4, 13.5). `carriedIn` is the appearance
+// state carried INTO the scene; `after` is the state after the
+// scene's own declarations (both from the chain entry). For each
+// field, the check set is { incoming value } ∪ { declared new
+// value }; a prompt matching either is consistent; only a
+// description matching NEITHER warns. No injury-contradiction
+// warnings (Section 13.4). `ctx` carries { characters (the
+// resolved presence), sceneNumber, numberById,
+// appearanceProvenance }. Returns warnings (each fingerprinted).
+function novaCheckAppearanceContinuity(carriedIn, after, scene, sceneId, ctx) {
+  const warnings = [];
+  const context = ctx || {};
+  const characters = Array.isArray(context.characters) ? context.characters : [];
+  const sceneNumber = context.sceneNumber || null;
+  const numberById = context.numberById || {};
+  const provenanceMap = context.appearanceProvenance || {};
+  const nameWords = context.nameWords || null;
+  const text = novaCheckSceneText(scene);
+  if (!text || !characters.length) return warnings;
+
+  const fields = ["wardrobe", "hair", "armour"];
+  characters.forEach(character => {
+    const incoming = (carriedIn && carriedIn[character.id]) || {};
+    const outgoing = (after && after[character.id]) || {};
+    const provenance = provenanceMap[character.id] || {};
+    fields.forEach(field => {
+      const incomingValue = incoming[field] || "";
+      const outgoingValue = outgoing[field] || "";
+      // The check set: incoming ∪ declared (deduped, non-empty).
+      const checkSet = [];
+      [incomingValue, outgoingValue].forEach(value => {
+        if (value && checkSet.indexOf(value) < 0) checkSet.push(value);
+      });
+      if (!checkSet.length) return;
+
+      // The feature word for this field, derived from the saved
+      // values (the 3.5A derivation: last token, canonicalised).
+      let feature = null;
+      for (const value of checkSet) {
+        const derived = novaAppearancePartFeature(value);
+        if (derived) {
+          feature = derived;
+          break;
+        }
+      }
+      if (field === "hair") feature = "hair";
+      if (!feature) return;
+
+      const derivedFeatures = new Set();
+      checkSet.forEach(value => {
+        const derived = novaAppearancePartFeature(value);
+        if (derived) derivedFeatures.add(derived);
+      });
+      const described = novaAppearancePromptDescription(
+        text,
+        feature,
+        Array.from(derivedFeatures),
+        nameWords
+      );
+      if (!described.mentioned) return;
+
+      const producingSceneId = provenance[field] || null;
+      const producingLabel = producingSceneId
+        ? novaSceneNumberLabel({ sceneNumberById: numberById }, producingSceneId)
+        : "canon";
+
+      // --- Colour contradictions (the 3.4E matcher, upgraded to
+      // the check set): the prompt's colour for the feature must
+      // appear in at least one check-set value's colours.
+      const savedColors = new Set();
+      checkSet.forEach(value => {
+        const found = novaContinuityFeatureColors(
+          value,
+          Array.from(derivedFeatures)
+        );
+        found.forEach((colorSet, foundFeature) => {
+          if (
+            novaAppearanceCanonicalFeature(foundFeature) ===
+            novaAppearanceCanonicalFeature(feature)
+          ) {
+            colorSet.forEach(color => savedColors.add(color));
+          }
+        });
+      });
+      described.colors.forEach(promptColor => {
+        if (savedColors.has(promptColor)) return;
+        // The key names the incoming value's colour (the state
+        // the scene starts from); fall back to the declared one.
+        let savedColor = null;
+        for (const value of checkSet) {
+          const found = novaContinuityFeatureColors(
+            value,
+            Array.from(derivedFeatures)
+          );
+          let hit = null;
+          found.forEach((colorSet, foundFeature) => {
+            if (
+              novaAppearanceCanonicalFeature(foundFeature) ===
+                novaAppearanceCanonicalFeature(feature) &&
+              colorSet.size
+            ) {
+              hit = Array.from(colorSet)[0];
+            }
+          });
+          if (hit) {
+            savedColor = hit;
+            break;
+          }
+        }
+        if (!savedColor) return;
+        warnings.push(
+          novaWarningWithFingerprint({
+            key:
+              "color:" +
+              novaAppearanceCanonicalFeature(feature) +
+              ":" +
+              savedColor +
+              ":" +
+              promptColor,
+            kind: "appearance",
+            message:
+              "Prompt describes the " +
+              novaAppearanceCanonicalFeature(feature) +
+              " as " +
+              promptColor +
+              ", but the current state (" +
+              producingLabel +
+              ") says " +
+              savedColor +
+              ".",
+            sceneId,
+            sceneNumber,
+            severity: "warning",
+            stableRef: character.id,
+            provenance: producingSceneId || "canon"
+          })
+        );
+      });
+
+      // --- State-word contradictions (decision D3, Rev 5
+      // lexicon): every LEXICON word the prompt uses for the
+      // feature must appear in at least one check-set value's
+      // descriptive words. The lexicon is the DECIDING filter
+      // (Section 13.4) — a prompt word not in
+      // NOVA_APPEARANCE_STATE_LEXICON is ignored, never a
+      // warning, however close to the feature it sits (so
+      // "Fire catches Theron's cloak." warns nothing: fire,
+      // catches and the possessive "s" are not lexicon words).
+      // A prompt with no lexicon words for the feature matches
+      // trivially (no contradiction). Matching is literal:
+      // "burning" is not "burned".
+      const promptStateWords = Array.from(described.words).filter(word =>
+        NOVA_APPEARANCE_STATE_LEXICON.has(word)
+      );
+      if (promptStateWords.length) {
+        const checkWords = new Set();
+        checkSet.forEach(value => {
+          novaAppearanceDescriptiveWords(value, feature).forEach(word => {
+            if (NOVA_APPEARANCE_STATE_LEXICON.has(word)) checkWords.add(word);
+          });
+        });
+        const offending = promptStateWords.filter(
+          word => !checkWords.has(word)
+        );
+        if (offending.length) {
+          const savedWords = Array.from(
+            novaAppearanceDescriptiveWords(incomingValue, feature)
+          ).filter(word => NOVA_APPEARANCE_STATE_LEXICON.has(word));
+          const savedWord =
+            savedWords[0] ||
+            Array.from(
+              novaAppearanceDescriptiveWords(outgoingValue, feature)
+            ).filter(word => NOVA_APPEARANCE_STATE_LEXICON.has(word))[0] ||
+            "unchanged";
+          warnings.push(
+            novaWarningWithFingerprint({
+              key:
+                "appearance:" +
+                field +
+                ":" +
+                savedWord +
+                ":" +
+                offending[0],
+              kind: "appearance",
+              message:
+                "Prompt describes " +
+                character.name +
+                "'s " +
+                field +
+                " as " +
+                offending[0] +
+                ", but the current state (" +
+                producingLabel +
+                ") says " +
+                (incomingValue || outgoingValue) +
+                ".",
+              sceneId,
+              sceneNumber,
+              severity: "warning",
+              stableRef: character.id,
+              provenance: producingSceneId || "canon"
+            })
+          );
+        }
+      }
+
+      // --- Hair length (the 3.5A lexicon, upgraded to the check
+      // set): the prompt's hair length must match at least one
+      // check-set value's length.
+      if (field === "hair") {
+        const promptLength = novaHairLengthNearHair(text);
+        if (promptLength) {
+          const savedLengths = checkSet
+            .map(value => novaHairLengthNearHair(value))
+            .filter(Boolean);
+          if (
+            savedLengths.length &&
+            savedLengths.indexOf(promptLength) < 0
+          ) {
+            warnings.push(
+              novaWarningWithFingerprint({
+                key:
+                  "length:hair:" +
+                  (novaHairLengthNearHair(incomingValue) ||
+                    savedLengths[0]) +
+                  ":" +
+                  promptLength,
+                kind: "appearance",
+                message:
+                  "Prompt describes the hair as " +
+                  promptLength +
+                  ", but the current state (" +
+                  producingLabel +
+                  ") says " +
+                  (novaHairLengthNearHair(incomingValue) || savedLengths[0]) +
+                  ".",
+                sceneId,
+                sceneNumber,
+                severity: "warning",
+                stableRef: character.id,
+                provenance: producingSceneId || "canon"
+              })
+            );
+          }
+        }
+      }
+    });
+  });
+  return warnings;
+}
+
+// ---- Location checks (Section 14) -------------------------------------
+
+// Location-transition info notes. `prevLocation` is the previous
+// scene's location (string or null). `ctx` carries { sceneNumber,
+// numberById, prevSceneId, prevSceneNumber }. A scene that changes
+// location without a transition marker produces an INFO-level note
+// naming both scenes, not a warning. Returns warnings (each
+// fingerprinted) — zero or one.
+function novaCheckLocationContinuity(prevLocation, scene, sceneId, ctx) {
+  const context = ctx || {};
+  const sceneNumber = context.sceneNumber || null;
+  const prevSceneNumber = context.prevSceneNumber || null;
+  const prevSceneId = context.prevSceneId || null;
+  const sceneLocation =
+    scene && typeof scene.location === "string" ? scene.location.trim() : "";
+  if (!sceneLocation || !prevLocation) return [];
+  if (
+    novaNormalize35b(sceneLocation) === novaNormalize35b(prevLocation)
+  ) {
+    return [];
+  }
+  const text = novaCheckSceneText(scene);
+  if (novaLocationMarkersPresent(text)) return [];
+  return [
+    novaWarningWithFingerprint({
+      key: "location:transition",
+      kind: "location",
+      message:
+        "Scene " +
+        (sceneNumber !== null ? sceneNumber : "?") +
+        " moves from " +
+        prevLocation +
+        " to " +
+        sceneLocation +
+        " without a transition marker (Scene " +
+        (prevSceneNumber !== null ? prevSceneNumber : "?") +
+        " was in " +
+        prevLocation +
+        ").",
+      sceneId,
+      sceneNumber,
+      severity: "info",
+      stableRef: null,
+      provenance: prevSceneId || "canon"
+    })
+  ];
+}
+
+// ---- The warning collector (Section 15.1) ----------------------------
+
+// Collects every warning for a plan, in one place, in a fixed
+// order: the 3.4E-family checks first (colour, eye count, era),
+// then the 3.5B effective-state checks (objects, appearance,
+// locations), then the style checks once for the whole plan.
+// Warnings are deduplicated by (sceneId, key) — first occurrence
+// wins — so the same fact, reported against canon AND against
+// effective state, is shown once (Section 15.3).
+// Returns { warnings, suppressed, skipped, error }. `warnings`
+// are the visible ones (no matching live decision or dismissal);
+// `suppressed` are the ones a live decision or dismissal hides
+// (each carries `suppressedBy: "decision"` or "dismissal").
+// `skipped` names the scenes the style check skipped (custom
+// override). On a chain or presence error the collector returns
+// { error } (the build is blocked; no warnings are shown).
+// The collector is PURE with respect to the plan: it never writes
+// decisions, never bumps a version, never touches storage.
+function novaCollectPlanWarnings(project, plan) {
+  const failure = error => ({
+    warnings: [],
+    suppressed: [],
+    skipped: [],
+    error,
+    chain: null
+  });
+  if (!project || !plan || !Array.isArray(plan.scenes)) {
+    return failure("No project or plan was supplied for the checks.");
+  }
+
+  // The chain is the single source of effective state. A chain
+  // error blocks the build (Section 14) — no warnings are
+  // collected against a broken chain.
+  const chain = novaBuildProductionState(project, plan);
+  if (chain.error) return failure(chain.error);
+
+  const decisions = Array.isArray(plan.continuityDecisions)
+    ? plan.continuityDecisions
+    : [];
+  const dismissed = novaDismissedWarningFingerprints;
+
+  const collected = [];
+  const seen = new Set();
+
+  // Proper names, once per collection (decision D27): every
+  // word of every project character, object and location name,
+  // lowercased. The appearance check excludes them from the
+  // prompt's descriptive words — a name next to a garment word
+  // ("Jonah wear red cloaks") is not a wardrobe descriptor.
+  const nameWords = new Set();
+  (Array.isArray(project.characterIds) ? project.characterIds : []).forEach(id => {
+    const character = novaGetCharacter(id);
+    if (character && character.name) {
+      novaNormalize35b(character.name).split(" ").forEach(word => {
+        if (word) nameWords.add(word);
+      });
+    }
+  });
+  novaGetProjectObjects(project).forEach(object => {
+    if (object && object.name) {
+      novaNormalize35b(object.name).split(" ").forEach(word => {
+        if (word) nameWords.add(word);
+      });
+    }
+  });
+  novaGetProjectLocations(project).forEach(location => {
+    if (location && location.name) {
+      novaNormalize35b(location.name).split(" ").forEach(word => {
+        if (word) nameWords.add(word);
+      });
+    }
+  });
+  const push = warning => {
+    // Dedupe by scene + key + stableRef: two characters with
+    // the same colour key in the same scene are two distinct
+    // warnings (B15 — the fingerprint carries the characterId
+    // via stableRef), while the 3.5B effective-state warning
+    // and the 3.4E canon warning for the SAME character still
+    // collapse to one (same stableRef, first wins).
+    const dedupeKey =
+      warning.sceneId + "|" + warning.key + "|" + (warning.stableRef || "");
+    if (seen.has(dedupeKey)) return;
+    seen.add(dedupeKey);
+    collected.push(warning);
+  };
+
+  // The style checks run once for the whole plan (3.5A behaviour,
+  // unchanged) — but their warnings are collected AFTER the
+  // per-scene checks, so the per-scene order below is preserved.
+  // (They are computed first only so the `skipped` list is known
+  // before the loop; their warnings join the collection at the
+  // end.)
+  const styleResult = novaCollectStyleWarnings(plan, project);
+  const styleWarnings = Array.isArray(styleResult)
+    ? styleResult
+    : styleResult.warnings || [];
+  // `skipped` holds SCENE NUMBERS (the 3.5A collector's shape),
+  // not sceneIds.
+  const styleSkipped = Array.isArray(styleResult)
+    ? []
+    : styleResult.skipped || [];
+
+  for (let index = 0; index < plan.scenes.length; index++) {
+    const scene = plan.scenes[index];
+    const entry = chain.scenes[index];
+    const sceneNumber = index + 1;
+
+    // Presence (3.5A): who is in this scene? A presence error
+    // (an unknown character id in the scene's characters list)
+    // blocks the build. novaSceneCharacters returns
+    // { characters, error } — it does not throw.
+    const presence = novaSceneCharacters(project, plan, scene);
+    if (presence.error) {
+      return failure(
+        "Scene " + sceneNumber + ": " + presence.error
+      );
+    }
+    const characters = presence.characters;
+
+    // --- Object checks (against the carried-in state, with the
+    // recovery exemption: an object recovered in this scene
+    // counts as present for this scene's checks, Section 12.3).
+    const checkObjects = novaDeepCopy35b(entry.carriedIn.objects);
+    (scene.stateChanges || []).forEach(change => {
+      if (change && change.transition === "recover" && change.objectId) {
+        if (checkObjects[change.objectId]) {
+          checkObjects[change.objectId].status = "present";
+        }
+      }
+    });
+    novaCheckObjectContinuity(
+      { objects: checkObjects },
+      scene,
+      scene.id,
+      { project, sceneNumber, numberById: chain.sceneNumberById }
+    ).forEach(push);
+
+    // --- Appearance checks (own-scene check set, Section 13.5).
+    novaCheckAppearanceContinuity(
+      entry.carriedIn.appearance,
+      entry.appearance,
+      scene,
+      scene.id,
+      {
+        characters,
+        sceneNumber,
+        numberById: chain.sceneNumberById,
+        appearanceProvenance: entry.carriedIn.appearanceProvenance,
+        nameWords
+      }
+    ).forEach(push);
+
+    // --- Location check (against the previous scene's location).
+    const prevEntry = index > 0 ? chain.scenes[index - 1] : null;
+    novaCheckLocationContinuity(
+      prevEntry ? prevEntry.location : null,
+      scene,
+      scene.id,
+      {
+        sceneNumber,
+        numberById: chain.sceneNumberById,
+        prevSceneId: prevEntry ? prevEntry.sceneId : null,
+        prevSceneNumber: index > 0 ? index : null
+      }
+    ).forEach(push);
+
+    // --- 3.4E-family checks per present character (canon, via
+    // the frozen 3.4E functions). The check text is the scene's
+    // title + direction (decision D22), so a warning about the
+    // scene's own description is never raised against the
+    // system's injected identity lines.
+    characters.forEach(character => {
+      const built = novaBuildContinuityContext(project.id, character.id);
+      if (built.error) return; // The chain already validated the cast.
+      const conflicts = novaCheckContinuityConflicts(
+        built.context,
+        novaCheckSceneText(scene)
+      );
+      conflicts.forEach(conflict => {
+        push(
+          novaWarningWithFingerprint({
+            key: conflict.key,
+            kind: conflict.kind || "continuity",
+            message: conflict.message,
+            sceneId: scene.id,
+            sceneNumber,
+            severity: conflict.severity || "warning",
+            stableRef: character.id,
+            provenance: "canon"
+          })
+        );
+      });
+    });
+  }
+
+  // --- Style warnings (3.5A, once for the plan). The 3.5A
+  // warnings carry only { key, message, sceneNumber } — the
+  // sceneId is attached here from the scene number, and the
+  // 3.5B fields (kind, severity, stableRef, provenance) are
+  // defaulted (style warnings are canon-provenance).
+  styleWarnings.forEach(warning => {
+    const number =
+      typeof warning.sceneNumber === "number" ? warning.sceneNumber : null;
+    const scene =
+      number !== null && plan.scenes[number - 1]
+        ? plan.scenes[number - 1]
+        : null;
+    if (!scene) return;
+    push(
+      novaWarningWithFingerprint({
+        key: warning.key,
+        kind: "style",
+        message: warning.message,
+        sceneId: scene.id,
+        sceneNumber: number,
+        severity: "warning",
+        stableRef: null,
+        provenance: "canon"
+      })
+    );
+  });
+
+  // --- Suppression, by LIVE matching only: a decision or a
+  // dismissal hides a warning only while its key + sceneId +
+  // fingerprint all match a current warning. The watermark is
+  // never consulted here (decision D2's corollary).
+  const visible = [];
+  const suppressed = [];
+  collected.forEach(warning => {
+    const decision = decisions.find(
+      d =>
+        d &&
+        d.key === warning.key &&
+        d.sceneId === warning.sceneId &&
+        d.fingerprint === warning.fingerprint
+    );
+    if (decision) {
+      suppressed.push({ ...warning, suppressedBy: "decision", decision });
+      return;
+    }
+    if (dismissed.has(warning.fingerprint)) {
+      suppressed.push({ ...warning, suppressedBy: "dismissal" });
+      return;
+    }
+    visible.push(warning);
+  });
+
+  return {
+    warnings: visible,
+    suppressed,
+    skipped: styleSkipped,
+    error: null,
+    // The chain is returned so the caller (job creation) can
+    // reuse it for the snapshot instead of building it twice.
+    chain
+  };
+}
+
+// The warnings for one scene (visible ones only).
+function novaPlanWarningsByScene(project, plan) {
+  const result = novaCollectPlanWarnings(project, plan);
+  const byScene = {};
+  if (result.error) return byScene;
+  result.warnings.forEach(warning => {
+    if (!byScene[warning.sceneId]) byScene[warning.sceneId] = [];
+    byScene[warning.sceneId].push(warning);
+  });
+  return byScene;
+}
+
+// ---- Dismissals (Section 16.1) ----------------------------------------
+
+// A dismissal hides a warning for this browser session only
+// (module state — it never reaches storage or the snapshot).
+// Dismissals are keyed by fingerprint: if the underlying fact
+// changes, the fingerprint changes and the warning re-appears.
+function novaDismissWarning(warning) {
+  if (!warning || !warning.fingerprint) return;
+  novaDismissedWarningFingerprints.add(warning.fingerprint);
+}
+
+function novaIsWarningDismissed(warning) {
+  if (!warning || !warning.fingerprint) return false;
+  return novaDismissedWarningFingerprints.has(warning.fingerprint);
+}
+
+// ---- Decisions (Section 16.2) -----------------------------------------
+
+// Records a decision ("this warning is intentional") on a plan.
+// The decision IS the save (Section 16.2): marking bumps
+// plan.version by 1 (decision D2), records the decision under
+// the NEW version + the current canon version, and updates
+// decisionsCheckedAt to the new versions (the decision was just
+// validated against the current warnings; the bump changes no
+// warning-relevant fact). The decision records the warning's
+// message for display only — the message is NEVER the source of
+// truth (key + sceneId + fingerprint are). Re-marking an already
+// decided warning replaces the decision (same version bump).
+// `warning` is the CURRENT warning object (it carries the
+// fingerprint); `project` supplies the canon version.
+function novaMarkWarningIntended(plan, warning, reason, project) {
+  if (!plan || typeof plan !== "object") {
+    return { error: "No plan was supplied for the decision." };
+  }
+  if (!warning || !warning.key || !warning.sceneId || !warning.fingerprint) {
+    return { error: "No warning was supplied for the decision." };
+  }
+  if (!project || typeof project !== "object") {
+    return { error: "No project was supplied for the decision." };
+  }
+  const currentVersion =
+    typeof plan.version === "number" && plan.version >= 1 ? plan.version : 1;
+  const canonVersion = novaGetProjectCanonVersion(project);
+  const newVersion = currentVersion + 1;
+  plan.version = newVersion;
+  if (!Array.isArray(plan.continuityDecisions)) plan.continuityDecisions = [];
+  const decision = {
+    key: warning.key,
+    fingerprint: warning.fingerprint,
+    sceneId: warning.sceneId,
+    reason: typeof reason === "string" ? reason : "",
+    planVersion: newVersion,
+    canonVersion,
+    warningMessage: warning.message || "",
+    decidedAt: new Date().toISOString()
+  };
+  const at = plan.continuityDecisions.findIndex(
+    d => d && d.key === warning.key && d.sceneId === warning.sceneId
+  );
+  if (at >= 0) {
+    plan.continuityDecisions[at] = decision;
+  } else {
+    plan.continuityDecisions.push(decision);
+  }
+  plan.decisionsCheckedAt = {
+    planVersion: newVersion,
+    canonVersion
+  };
+  return { error: null, decision };
+}
+
+// Removes the decisions for one scene (used by scene deletion).
+function novaRemoveSceneDecisions(plan, sceneId) {
+  if (!plan || !Array.isArray(plan.continuityDecisions)) return 0;
+  const before = plan.continuityDecisions.length;
+  plan.continuityDecisions = plan.continuityDecisions.filter(
+    d => !d || d.sceneId !== sceneId
+  );
+  return before - plan.continuityDecisions.length;
+}
+
+// ---- Revalidation (Section 16.2) --------------------------------------
+
+// Revalidates a plan's decisions against the CURRENT warnings.
+// A decision stands only while key + sceneId + fingerprint all
+// match a current warning. Same key + sceneId but a different
+// fingerprint = the underlying fact changed (invalidated). No
+// warning with that key + sceneId = the warning vanished. Both
+// kinds are REMOVED (a decision is only meaningful while its
+// warning exists). The watermark is updated to the current
+// versions. Returns { kept, removed, report } where `removed`
+// carries both messages ("the decision said X; the warning now
+// says Y") for the review panel. `warningsByScene` is the
+// collector's visible warnings keyed by sceneId (the collector
+// must have run BEFORE this call — the caller supplies it).
+//
+// Optional fourth argument `options` (Rev 5, trigger 4 —
+// accepted scene-text edit):
+//   { sceneId } — revalidate ONLY that scene's decisions;
+//     every other decision is kept untouched, unevaluated.
+//   { updateWatermark: false } — leave decisionsCheckedAt
+//     alone. The watermark tracks VERSIONS only; a scene-text
+//     edit changes no version, and updating the watermark here
+//     would wrongly imply all decisions were revalidated when
+//     only one scene was. Defaults: whole plan, watermark
+//     updated (triggers 1-3).
+function novaRevalidateDecisions(plan, project, warningsByScene, options) {
+  const empty = { kept: [], removed: [], report: null };
+  if (!plan || !project) return empty;
+  const onlySceneId =
+    options && typeof options.sceneId === "string" && options.sceneId
+      ? options.sceneId
+      : null;
+  const updateWatermark = !options || options.updateWatermark !== false;
+  if (!Array.isArray(plan.continuityDecisions)) {
+    plan.continuityDecisions = [];
+  }
+  const canonVersion = novaGetProjectCanonVersion(project);
+  const planVersion =
+    typeof plan.version === "number" && plan.version >= 1 ? plan.version : 1;
+
+  // Index the current warnings by (sceneId, key) -> warning.
+  const current = new Map();
+  Object.keys(warningsByScene || {}).forEach(sceneId => {
+    (warningsByScene[sceneId] || []).forEach(warning => {
+      current.set(sceneId + "|" + warning.key, warning);
+    });
+  });
+  // Also index the SUPPRESSED warnings: a decision's own warning
+  // is in the suppressed list (it is suppressed BY the decision).
+  // The caller passes the visible map; the revalidation must
+  // also see the suppressed ones or it would remove every live
+  // decision. The collector's full result is the honest source —
+  // so the caller passes the MERGED map (visible + suppressed).
+  // (novaLazyRevalidatePlan and novaRevalidatePlanForCreation
+  // both merge before calling.)
+
+  const kept = [];
+  const removed = [];
+  plan.continuityDecisions.forEach(decision => {
+    if (!decision || typeof decision !== "object") return;
+    // Trigger 4: a scene-text edit cannot change another
+    // scene's warnings, so decisions for other scenes are kept
+    // without evaluation.
+    if (onlySceneId && decision.sceneId !== onlySceneId) {
+      kept.push(decision);
+      return;
+    }
+    const warning = current.get(decision.sceneId + "|" + decision.key);
+    if (!warning) {
+      removed.push({
+        decision,
+        reason: "vanished",
+        message:
+          "The warning for " +
+          decision.key +
+          " no longer exists, so the decision was removed."
+      });
+      return;
+    }
+    if (warning.fingerprint !== decision.fingerprint) {
+      removed.push({
+        decision,
+        reason: "changed",
+        message:
+          "The underlying fact changed — the decision said \"" +
+          (decision.warningMessage || "") +
+          "\", the warning now says \"" +
+          (warning.message || "") +
+          "\" — so the decision was removed."
+      });
+      return;
+    }
+    kept.push(decision);
+  });
+
+  plan.continuityDecisions = kept;
+  if (updateWatermark) {
+    plan.decisionsCheckedAt = { planVersion, canonVersion };
+  }
+
+  const report =
+    removed.length > 0
+      ? {
+          removed: removed.length,
+          message:
+            removed.length +
+            " continuity decision" +
+            (removed.length === 1 ? "" : "s") +
+            " " +
+            (removed.length === 1 ? "was" : "were") +
+            " removed because the underlying facts changed."
+        }
+      : null;
+  return { kept, removed, report };
+}
+
+// Merges the collector's visible + suppressed warnings into one
+// map keyed by sceneId (the revalidation input).
+function novaMergeWarningsByScene(result) {
+  const byScene = {};
+  if (!result || result.error) return byScene;
+  [...(result.warnings || []), ...(result.suppressed || [])].forEach(
+    warning => {
+      if (!byScene[warning.sceneId]) byScene[warning.sceneId] = [];
+      byScene[warning.sceneId].push(warning);
+    }
+  );
+  return byScene;
+}
+
+// Lazy revalidation (trigger 1): compares the plan's
+// decisionsCheckedAt watermark with the current versions and
+// revalidates ONLY if either moved. Returns { revalidated,
+// revalidation } where `revalidation` is the novaRevalidateDecisions
+// result (null when nothing was revalidated). The collector runs
+// only when a revalidation is owed.
+function novaLazyRevalidatePlan(project, plan) {
+  if (!project || !plan) {
+    return { revalidated: false, revalidation: null };
+  }
+  const watermark = plan.decisionsCheckedAt || null;
+  const canonVersion = novaGetProjectCanonVersion(project);
+  const planVersion =
+    typeof plan.version === "number" && plan.version >= 1 ? plan.version : 1;
+  const stale =
+    !watermark ||
+    watermark.planVersion !== planVersion ||
+    watermark.canonVersion !== canonVersion;
+  if (!stale) return { revalidated: false, revalidation: null };
+
+  const result = novaCollectPlanWarnings(project, plan);
+  if (result.error) {
+    // A broken chain blocks the build; the watermark is left
+    // stale (the revalidation is owed again once the plan is
+    // repaired) and the error is reported, not hidden.
+    return {
+      revalidated: false,
+      revalidation: null,
+      error: result.error
+    };
+  }
+  const revalidation = novaRevalidateDecisions(
+    plan,
+    project,
+    novaMergeWarningsByScene(result)
+  );
+  return { revalidated: true, revalidation };
+}
+
+// Explicit refresh (trigger 2): re-runs all checks + revalidates
+// all decisions REGARDLESS of the watermark. Returns
+// { result, revalidation }.
+function novaRefreshContinuity(project, plan) {
+  if (!project || !plan) {
+    return {
+      result: { warnings: [], suppressed: [], skipped: [], error: "No plan." },
+      revalidation: null
+    };
+  }
+  const result = novaCollectPlanWarnings(project, plan);
+  if (result.error) {
+    return { result, revalidation: null };
+  }
+  const revalidation = novaRevalidateDecisions(
+    plan,
+    project,
+    novaMergeWarningsByScene(result)
+  );
+  return { result, revalidation };
+}
+
+// Pre-creation revalidation (trigger 3): revalidates BEFORE the
+// snapshot is taken, so the snapshot always carries
+// POST-revalidation decisions (Section 16.2: "A stale decision
+// can never suppress a warning in a created job."). Returns
+// { result, revalidation, error }.
+function novaRevalidatePlanForCreation(project, plan) {
+  if (!project || !plan) {
+    return {
+      result: null,
+      revalidation: null,
+      error: "No project or plan was supplied."
+    };
+  }
+  const result = novaCollectPlanWarnings(project, plan);
+  if (result.error) {
+    return { result, revalidation: null, error: result.error };
+  }
+  const revalidation = novaRevalidateDecisions(
+    plan,
+    project,
+    novaMergeWarningsByScene(result)
+  );
+  return { result, revalidation, error: null };
+}
+
+// Accepted scene-text edit revalidation (trigger 4, Rev 5):
+// when a scene-text edit is ACCEPTED (committed — the field
+// saved or applied: blur, Enter, Apply, or editor save), the
+// edited scene's checks are re-run and that scene's decisions
+// revalidated immediately, synchronously, under the same
+// fingerprint rules as the other triggers (warning gone ->
+// decision REMOVED; fingerprint changed -> INVALIDATED;
+// unchanged -> stands). ONLY the edited scene is revalidated:
+// a scene-text edit cannot change another scene's warnings, so
+// other scenes' decisions are kept untouched. NO plan.version
+// increment (scene-text edits are not versioned changes) and
+// NO watermark update (the watermark tracks versions only,
+// which the edit does not change).
+//
+// Transient typing triggers nothing: this function runs only
+// when the caller invokes it at the commit point. The caller
+// is novaSaveSceneText — the Save button of the per-scene
+// scene-text editor in the state controls
+// (novaSceneStateControlHtml). Scenes are built from beats by
+// buildMotionPlan, but their title and direction are editable
+// there; saving is the accepted-edit event this function
+// serves.
+//
+// The collector has no per-scene entry point — and a scene's
+// checks depend on the chain state carried in from earlier
+// scenes — so the plan collector runs and the revalidation is
+// scoped to the edited scene's decisions. Returns
+// { revalidated, revalidation, error } (the trigger-1 shape).
+function novaRevalidateSceneAfterAcceptedEdit(project, plan, sceneId) {
+  if (!project || !plan) {
+    return {
+      revalidated: false,
+      revalidation: null,
+      error: "No project or plan was supplied."
+    };
+  }
+  if (
+    typeof sceneId !== "string" ||
+    !sceneId ||
+    !Array.isArray(plan.scenes) ||
+    !plan.scenes.some(s => s && s.id === sceneId)
+  ) {
+    return {
+      revalidated: false,
+      revalidation: null,
+      error: "No scene with that id in this plan."
+    };
+  }
+  const result = novaCollectPlanWarnings(project, plan);
+  if (result.error) {
+    // A broken chain blocks the build; the decisions are left
+    // exactly as they were and the error is reported, not
+    // hidden.
+    return {
+      revalidated: false,
+      revalidation: null,
+      error: result.error
+    };
+  }
+  const revalidation = novaRevalidateDecisions(
+    plan,
+    project,
+    novaMergeWarningsByScene(result),
+    { sceneId, updateWatermark: false }
+  );
+  return { revalidated: true, revalidation };
+}
+
+// Pre-creation check, for the UI: runs the trigger-3
+// revalidation and returns the plain-language removals message
+// (or null when nothing was removed). The caller shows the
+// message and asks the user to confirm before creating.
+function novaPreCreateContinuityCheck(project, plan) {
+  const checked = novaRevalidatePlanForCreation(project, plan);
+  if (checked.error) {
+    return { error: checked.error, message: null, removed: 0 };
+  }
+  const removed = checked.revalidation
+    ? checked.revalidation.removed.length
+    : 0;
+  if (!removed) return { error: null, message: null, removed: 0 };
+  return {
+    error: null,
+    message:
+      removed +
+      " continuity decision" +
+      (removed === 1 ? "" : "s") +
+      (removed === 1 ? " was" : " were") +
+      " removed because the underlying facts changed — review the warnings before creating.",
+    removed
+  };
+}
+
+// ---- The immutable production snapshot (Section 17) -------------------
+
+// Builds job.productionContinuity: the full production state at
+// the moment of creation, frozen alongside the existing
+// continuitySnapshot (3.4B) and continuityContext (3.4E). The
+// snapshot is built from the POST-revalidation plan (the caller
+// revalidates first — novaCreateProjectJob does). It is a plain
+// data object: every nested value is a deep copy, so later edits
+// to the project or plan cannot mutate it. `chain` is the
+// novaBuildProductionState result for the plan (built by the
+// caller so the chain is built once, not twice).
+function novaBuildProductionContinuitySnapshot(project, plan, chain) {
+  const snapshot = {
+    planVersion:
+      typeof plan.version === "number" && plan.version >= 1 ? plan.version : 1,
+    canonVersion: novaGetProjectCanonVersion(project),
+    characterRecords: [],
+    appearanceState: {},
+    referenceImageIds: {},
+    projectVisualStyle: plan.styleBasis || null,
+    projectStyleAtCreation: novaDeepCopy35b(
+      novaGetProjectVisualStyle(project)
+    ),
+    sceneStyleOverrides: [],
+    objects: novaDeepCopy35b(novaGetProjectObjects(project)),
+    locations: novaDeepCopy35b(novaGetProjectLocations(project)),
+    stateTransitions: [],
+    productionState: [],
+    continuityDecisions: novaDeepCopy35b(plan.continuityDecisions || []),
+    effectiveSceneContexts: []
+  };
+
+  const cast = Array.isArray(plan.cast) ? plan.cast : [];
+  cast.forEach(characterId => {
+    const character = novaGetCharacter(characterId);
+    if (!character) return;
+    const appearance = character.appearance || {};
+    snapshot.characterRecords.push({
+      id: character.id,
+      name: character.name || "",
+      version:
+        typeof character.version === "number" ? character.version : 1,
+      species: typeof appearance.species === "string" ? appearance.species : "",
+      colors: novaDeepCopy35b(appearance.colors || {}),
+      distinctiveFeatures: novaDeepCopy35b(appearance.distinctiveFeatures || []),
+      permanentDetails:
+        typeof appearance.permanentDetails === "string"
+          ? appearance.permanentDetails
+          : "",
+      wardrobe: typeof appearance.wardrobe === "string" ? appearance.wardrobe : "",
+      hair: typeof appearance.hair === "string" ? appearance.hair : "",
+      accessories: novaDeepCopy35b(appearance.accessories || []),
+      imageAssetId: character.imageAssetId || null
+    });
+    snapshot.referenceImageIds[characterId] = character.imageAssetId || null;
+  });
+
+  // The FINAL appearance state (after the last scene).
+  const finalEntry =
+    chain && Array.isArray(chain.scenes) && chain.scenes.length
+      ? chain.scenes[chain.scenes.length - 1]
+      : null;
+  snapshot.appearanceState = finalEntry
+    ? novaDeepCopy35b(finalEntry.appearance)
+    : {};
+
+  plan.scenes.forEach((scene, index) => {
+    const entry =
+      chain && Array.isArray(chain.scenes) ? chain.scenes[index] : null;
+    const override = plan.sceneStyleOverrides
+      ? plan.sceneStyleOverrides[scene.id]
+      : null;
+    if (override) {
+      snapshot.sceneStyleOverrides.push({
+        sceneId: scene.id,
+        preset: override.preset || null,
+        // The custom direction is stored VERBATIM (Section 17) —
+        // it is the exact text injected into the scene prompt.
+        customDirection:
+          typeof override.customDirection === "string"
+            ? override.customDirection
+            : "",
+        reason: typeof override.reason === "string" ? override.reason : ""
+      });
+    }
+    snapshot.stateTransitions.push({
+      sceneId: scene.id,
+      objectChanges: novaDeepCopy35b(scene.stateChanges || []),
+      characterChanges: novaDeepCopy35b(scene.characterStateChanges || [])
+    });
+    if (entry) {
+      // The snapshot stores only the Section 14 shape
+      // { location, objects, appearance } — the chain's internal
+      // fields (carriedIn, provenance, transitions) are NOT
+      // snapshot data.
+      snapshot.productionState.push({
+        sceneId: scene.id,
+        state: {
+          location: entry.location,
+          objects: novaDeepCopy35b(entry.objects),
+          appearance: novaDeepCopy35b(entry.appearance)
+        }
+      });
+    }
+
+    // The EXACT text injected per scene, built with the same
+    // functions the plan uses (Section 17) — so the snapshot and
+    // the prompts agree by construction (B10). Presence was
+    // already validated by the collector (the caller revalidates
+    // before snapshotting); a defensive empty fallback covers a
+    // direct call with a broken plan.
+    const presence = novaSceneCharacters(project, plan, scene);
+    const characters = presence.error ? [] : presence.characters;
+    const castLines = characters.length
+      ? novaBuildCastLines(project, characters, index + 1)
+      : { lines: [], error: null };
+    const identityLines = castLines.error ? [] : castLines.lines;
+    const stateLine = entry
+      ? novaContinuityStateLine(chain, scene, index)
+      : "";
+    const style = novaEffectiveSceneStyle(plan, project, scene);
+    snapshot.effectiveSceneContexts.push({
+      sceneId: scene.id,
+      charactersPresent: characters.map(character => character.id),
+      identityLines: identityLines.join("\n"),
+      stateLine,
+      styleFragment: novaVisualStyleFragment(style.preset, style.customDirection)
+    });
+  });
+
+  return snapshot;
+}
+
+// ---- The production continuity review panel (Section 16.3) ------------
+
+// The full production continuity section for the review panel:
+// warnings grouped by scene, each with its mark-as-intended form
+// (reason + Mark intentional), the dismissed-decisions report at
+// the top when a revalidation removed decisions, and the
+// "Refresh continuity" button. When `warnings` is not passed in,
+// the review runs the lazy revalidation (trigger 1) first — the
+// review render IS the plan-open in this UI (decision D21) — and
+// renders any revalidation report at the top. When warnings are
+// passed in (tests), no revalidation runs (the caller owns it).
+// Returns an HTML string (all user text escaped).
+function novaProductionContinuityReviewHtml(project, plan, warnings) {
+  if (!project || !plan) return "";
+  let collected = null;
+  let revalidationReport = null;
+  if (Array.isArray(warnings)) {
+    collected = { warnings, suppressed: [], skipped: [], error: null };
+  } else {
+    const lazy = novaLazyRevalidatePlan(project, plan);
+    if (lazy.error) {
+      return (
+        '<div class="nova-prod-continuity">' +
+        '<h3>Production continuity</h3>' +
+        '<p class="nova-continuity-error">' +
+        novaEscape(lazy.error) +
+        "</p></div>"
+      );
+    }
+    if (lazy.revalidation && lazy.revalidation.report) {
+      revalidationReport = lazy.revalidation.report;
+    }
+    collected = novaCollectPlanWarnings(project, plan);
+    if (collected.error) {
+      return (
+        '<div class="nova-prod-continuity">' +
+        '<h3>Production continuity</h3>' +
+        '<p class="nova-continuity-error">' +
+        novaEscape(collected.error) +
+        "</p></div>"
+      );
+    }
+  }
+
+  const byScene = {};
+  collected.warnings.forEach(warning => {
+    if (!byScene[warning.sceneId]) byScene[warning.sceneId] = [];
+    byScene[warning.sceneId].push(warning);
+  });
+
+  let html = '<div class="nova-prod-continuity">';
+  html += "<h3>Production continuity</h3>";
+  if (revalidationReport) {
+    html +=
+      '<p class="nova-continuity-notice">' +
+      novaEscape(revalidationReport.message) +
+      "</p>";
+  }
+  if (!collected.warnings.length) {
+    html +=
+      "<p>No continuity warnings — the plan is consistent with the project canon.</p>";
+  } else {
+    plan.scenes.forEach((scene, index) => {
+      const sceneWarnings = byScene[scene.id] || [];
+      if (!sceneWarnings.length) return;
+      html +=
+        '<div class="nova-prod-scene-group"><h4>' +
+        novaEscape("Scene " + (index + 1) + ": " + (scene.title || "")) +
+        "</h4>";
+      sceneWarnings.forEach(warning => {
+        html += novaProductionWarningHtml(project, plan, warning);
+      });
+      html += "</div>";
+    });
+  }
+  if (collected.skipped && collected.skipped.length) {
+    // `skipped` holds scene NUMBERS (the 3.5A collector's shape).
+    html +=
+      '<p class="nova-continuity-note">Style checks skipped for scenes with a custom override: ' +
+      collected.skipped
+        .map(n => "Scene " + n)
+        .map(novaEscape)
+        .join(", ") +
+      ".</p>";
+  }
+  html +=
+    '<button type="button" class="ws-btn" onclick="novaRefreshContinuityUi()">Refresh continuity</button>';
+  html += "</div>";
+  return html;
+}
+
+// One warning row: the message, its severity, and the
+// mark-as-intended form (reason + button). The form carries the
+// warning's key + sceneId; the handler re-resolves the CURRENT
+// warning (by key + sceneId) so the decision records the current
+// fingerprint, never a stale one.
+function novaProductionWarningHtml(project, plan, warning) {
+  const severity =
+    warning.severity === "info" ? "info" : "warning";
+  const formId =
+    "nova-mark-" + warning.sceneId + "-" + novaNormalize35b(warning.key);
+  let html =
+    '<div class="nova-prod-warning nova-prod-warning-' +
+    severity +
+    '"><p class="nova-prod-warning-message">' +
+    novaEscape(warning.message) +
+    "</p>";
+  html +=
+    '<form class="nova-mark-intended-form" data-scene-id="' +
+    novaEscape(warning.sceneId) +
+    '" data-warning-key="' +
+    novaEscape(warning.key) +
+    '" onsubmit="return novaMarkIntendedSubmit(event)">' +
+    '<label for="' +
+    novaEscape(formId) +
+    '">Why is this intentional?</label> ' +
+    '<input id="' +
+    novaEscape(formId) +
+    '" name="reason" type="text" placeholder="e.g. the cloak is burned in the next scene" required> ' +
+    '<button type="submit" class="ws-btn">Mark intentional</button>' +
+    "</form></div>";
+  return html;
+}
+
+// The mark-as-intended form handler: re-resolves the CURRENT
+// warning by key + sceneId (the decision records the CURRENT
+// fingerprint), marks it, and re-renders the review.
+function novaMarkIntendedSubmit(event) {
+  event.preventDefault();
+  const form = event.target;
+  const sceneId = form.getAttribute("data-scene-id");
+  const key = form.getAttribute("data-warning-key");
+  const reason = form.reason ? form.reason.value : "";
+  const plan = novaMotionPlan;
+  const project = novaSelectedProjectId
+    ? novaGetProject(novaSelectedProjectId)
+    : null;
+  if (!plan || !project) return false;
+  const collected = novaCollectPlanWarnings(project, plan);
+  if (collected.error) {
+    alert(collected.error);
+    return false;
+  }
+  const warning = [...collected.warnings, ...collected.suppressed].find(
+    w => w.sceneId === sceneId && w.key === key
+  );
+  if (!warning) {
+    alert("That warning no longer exists — the plan has changed.");
+    novaRenderProductionIdentity();
+    return false;
+  }
+  const marked = novaMarkWarningIntended(plan, warning, reason, project);
+  if (marked.error) {
+    alert(marked.error);
+    return false;
+  }
+  novaRenderProductionIdentity();
+  return false;
+}
+
+// The "Refresh continuity" button handler (trigger 2): re-runs
+// all checks + revalidates all decisions regardless of the
+// watermark, then re-renders the review.
+function novaRefreshContinuityUi() {
+  const plan = novaMotionPlan;
+  const project = novaSelectedProjectId
+    ? novaGetProject(novaSelectedProjectId)
+    : null;
+  if (!plan || !project) return;
+  const refreshed = novaRefreshContinuity(project, plan);
+  if (refreshed.result && refreshed.result.error) {
+    alert(refreshed.result.error);
+    return;
+  }
+  if (refreshed.revalidation && refreshed.revalidation.report) {
+    novaLastRevalidationReport = refreshed.revalidation.report;
+  }
+  novaRenderProductionIdentity();
+}
+
+// ---- Workspace: Objects & Locations (Section 12.1) --------------------
+
+// The Objects & Locations section for the project detail view.
+// Objects are id-keyed (names may duplicate); locations are
+// name-keyed (duplicate names are refused). Both lists live on
+// project.continuity.{objects, locations} and are saved through
+// novaUpdateProject (which bumps the canon version — objects and
+// locations are in the bump set, decision D6).
+function novaWorkspaceObjectsSectionHtml(project) {
+  if (!project) return "";
+  const objects = novaGetProjectObjects(project);
+  const locations = novaGetProjectLocations(project);
+  const characters = novaLoadCharacters().filter(
+    character => character.projectId === project.id
+  );
+  const editingObject = novaWorkspaceEditingObjectId
+    ? objects.find(o => o.id === novaWorkspaceEditingObjectId) || null
+    : null;
+  const editingLocation = novaWorkspaceEditingLocationName
+    ? locations.find(l => l.name === novaWorkspaceEditingLocationName) || null
+    : null;
+
+  let html = `<h2>📦 Objects &amp; Locations</h2>`;
+  html += `<p class="motion-note">Objects and places the story tracks across scenes. Objects carry a state (present, lost, damaged, destroyed) that scenes change; locations are the places scenes can be set.</p>`;
+
+  // --- Objects ---
+  html += `<h3>Objects</h3>`;
+  if (!objects.length) {
+    html += `<p class="motion-note">No objects yet. Add the first object this project tracks.</p>`;
+  } else {
+    html += `<div class="ws-grid">`;
+    objects.forEach(object => {
+      const owner = object.ownerCharacterId
+        ? novaGetCharacter(object.ownerCharacterId)
+        : null;
+      const confirming =
+        novaWorkspaceObjectDeleteTarget &&
+        novaWorkspaceObjectDeleteTarget.type === "object" &&
+        novaWorkspaceObjectDeleteTarget.id === object.id;
+      html += `<div class="ws-card">
+        <h3>${novaEscape(object.name)}</h3>
+        ${object.description ? `<p class="ws-text">${novaEscape(object.description)}</p>` : ""}
+        <p class="motion-note">Home: ${novaEscape(object.homeLocation || "—")}${owner ? " · Owner: " + novaEscape(owner.name) : ""}</p>
+        <div class="ws-row">
+          <button type="button" class="ws-btn" onclick="novaWorkspaceEditObject('${novaEscape(object.id)}')">Edit</button>
+          <button type="button" class="ws-btn ws-btn-danger" onclick="novaWorkspaceAskDeleteObject('${novaEscape(object.id)}')">Delete</button>
+        </div>
+        ${confirming ? novaWorkspaceObjectDeleteConfirmHtml(object) : ""}
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Object add/edit form.
+  html += `<h3>${editingObject ? "Edit Object" : "Add Object"}</h3>`;
+  html += `<label class="motion-label" for="wsObjectName">Object name</label>
+    <input class="motion-input" id="wsObjectName" type="text" value="${editingObject ? novaEscape(editingObject.name) : ""}" placeholder="Example: The Dawn Key">
+    <label class="motion-label" for="wsObjectDescription">Description</label>
+    <textarea class="motion-input" id="wsObjectDescription" rows="2" placeholder="What is this object?">${editingObject ? novaEscape(editingObject.description || "") : ""}</textarea>
+    <label class="motion-label" for="wsObjectHome">Home location</label>
+    <input class="motion-input" id="wsObjectHome" type="text" value="${editingObject ? novaEscape(editingObject.homeLocation || "") : ""}" placeholder="Where does it start? Example: The Great Hall">
+    <label class="motion-label" for="wsObjectOwner">Owner (optional)</label>
+    <select class="motion-select" id="wsObjectOwner">
+      <option value="">No owner</option>
+      ${characters.map(character => `<option value="${novaEscape(character.id)}"${editingObject && editingObject.ownerCharacterId === character.id ? " selected" : ""}>${novaEscape(character.name)}</option>`).join("")}
+    </select>
+    <div class="ws-row">
+      <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceSaveObject()">${editingObject ? "Save Object" : "Add Object"}</button>
+      ${editingObject ? `<button type="button" class="ws-btn" onclick="novaWorkspaceCancelEditObject()">Cancel</button>` : ""}
+    </div>`;
+
+  // --- Locations ---
+  html += `<h3>Locations</h3>`;
+  if (!locations.length) {
+    html += `<p class="motion-note">No locations yet. Add the first place scenes can be set.</p>`;
+  } else {
+    html += `<div class="ws-grid">`;
+    locations.forEach(location => {
+      const confirming =
+        novaWorkspaceObjectDeleteTarget &&
+        novaWorkspaceObjectDeleteTarget.type === "location" &&
+        novaWorkspaceObjectDeleteTarget.id === location.name;
+      html += `<div class="ws-card">
+        <h3>${novaEscape(location.name)}</h3>
+        ${location.description ? `<p class="ws-text">${novaEscape(location.description)}</p>` : ""}
+        <div class="ws-row">
+          <button type="button" class="ws-btn" onclick="novaWorkspaceEditLocation('${novaEscape(location.name)}')">Edit</button>
+          <button type="button" class="ws-btn ws-btn-danger" onclick="novaWorkspaceAskDeleteLocation('${novaEscape(location.name)}')">Delete</button>
+        </div>
+        ${confirming ? novaWorkspaceLocationDeleteConfirmHtml(location) : ""}
+      </div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Location add/edit form. Locations are name-keyed: renaming
+  // does NOT rewrite scene.location texts (they are free text —
+  // decision D25); the user updates scenes via the state editor.
+  html += `<h3>${editingLocation ? "Edit Location" : "Add Location"}</h3>`;
+  html += `<label class="motion-label" for="wsLocationName">Location name</label>
+    <input class="motion-input" id="wsLocationName" type="text" value="${editingLocation ? novaEscape(editingLocation.name) : ""}" placeholder="Example: The Great Hall">
+    <label class="motion-label" for="wsLocationDescription">Description</label>
+    <textarea class="motion-input" id="wsLocationDescription" rows="2" placeholder="What is this place?">${editingLocation ? novaEscape(editingLocation.description || "") : ""}</textarea>
+    <div class="ws-row">
+      <button type="button" class="ws-btn ws-btn-primary" onclick="novaWorkspaceSaveLocation()">${editingLocation ? "Save Location" : "Add Location"}</button>
+      ${editingLocation ? `<button type="button" class="ws-btn" onclick="novaWorkspaceCancelEditLocation()">Cancel</button>` : ""}
+    </div>`;
+
+  return html;
+}
+
+// The two-step delete confirm for an object. When the object is
+// used in the current plan's stateChanges, the confirm warns
+// that deleting it will block the plan until those changes are
+// removed (Section 12.2: an unknown objectId fails the chain).
+function novaWorkspaceObjectDeleteConfirmHtml(object) {
+  let warning = "Delete this object? This cannot be undone.";
+  const plan = novaMotionPlan;
+  if (
+    plan &&
+    plan.projectId === novaWorkspaceProjectId &&
+    Array.isArray(plan.scenes)
+  ) {
+    const used = plan.scenes.some(scene =>
+      (scene.stateChanges || []).some(
+        change => change && change.objectId === object.id
+      )
+    );
+    if (used) {
+      warning =
+        "Delete this object? The current plan changes it in a scene — deleting it will block the plan until those changes are removed.";
+    }
+  }
+  return `<div class="ws-confirm">
+    <p>${novaEscape(warning)}</p>
+    <div class="ws-row">
+      <button type="button" class="ws-btn ws-btn-danger" onclick="novaWorkspaceConfirmDeleteObject('${novaEscape(object.id)}')">Delete</button>
+      <button type="button" class="ws-btn" onclick="novaWorkspaceCancelObjectDelete()">Cancel</button>
+    </div>
+  </div>`;
+}
+
+function novaWorkspaceLocationDeleteConfirmHtml(location) {
+  return `<div class="ws-confirm">
+    <p>Delete this location? This cannot be undone. Scenes set in this location keep their location text.</p>
+    <div class="ws-row">
+      <button type="button" class="ws-btn ws-btn-danger" onclick="novaWorkspaceConfirmDeleteLocation('${novaEscape(location.name)}')">Delete</button>
+      <button type="button" class="ws-btn" onclick="novaWorkspaceCancelObjectDelete()">Cancel</button>
+    </div>
+  </div>`;
+}
+
+// Saves the object form (add or edit). The name is required; the
+// home location and owner are optional. The save goes through
+// novaUpdateProject with the FULL continuity object (the other
+// fields are carried forward, never dropped).
+function novaWorkspaceSaveObject() {
+  const project = novaGetProject(novaWorkspaceProjectId);
+  if (!project) {
+    novaWorkspaceSetStatus("That project no longer exists.");
+    return;
+  }
+  const name = document.getElementById("wsObjectName").value.trim();
+  if (!name) {
+    novaWorkspaceSetStatus("An object needs a name.");
+    return;
+  }
+  const description = document
+    .getElementById("wsObjectDescription")
+    .value.trim();
+  const homeLocation = document.getElementById("wsObjectHome").value.trim();
+  const ownerCharacterId =
+    document.getElementById("wsObjectOwner").value || null;
+  const objects = novaGetProjectObjects(project);
+  const editingId = novaWorkspaceEditingObjectId;
+  let next;
+  if (editingId && objects.some(o => o.id === editingId)) {
+    next = objects.map(object =>
+      object.id === editingId
+        ? { ...object, name, description, homeLocation, ownerCharacterId }
+        : object
+    );
+  } else {
+    next = [
+      ...objects,
+      {
+        id: novaNewObjectId(),
+        name,
+        description,
+        homeLocation,
+        ownerCharacterId
+      }
+    ];
+  }
+  const saved = novaUpdateProject(project.id, {
+    continuity: {
+      ...(project.continuity || {}),
+      objects: next
+    }
+  });
+  if (!saved) {
+    novaWorkspaceSetStatus("The object could not be saved.");
+    return;
+  }
+  novaWorkspaceEditingObjectId = null;
+  novaWorkspaceSetStatus(editingId ? "Object saved." : "Object added.");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceEditObject(objectId) {
+  novaWorkspaceEditingObjectId = objectId;
+  novaWorkspaceObjectDeleteTarget = null;
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceCancelEditObject() {
+  novaWorkspaceEditingObjectId = null;
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceAskDeleteObject(objectId) {
+  novaWorkspaceObjectDeleteTarget = { type: "object", id: objectId };
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceConfirmDeleteObject(objectId) {
+  const project = novaGetProject(novaWorkspaceProjectId);
+  if (!project) {
+    novaWorkspaceObjectDeleteTarget = null;
+    novaWorkspaceSetStatus("That project no longer exists.");
+    novaRenderWorkspace();
+    return;
+  }
+  const next = novaGetProjectObjects(project).filter(
+    object => object.id !== objectId
+  );
+  const saved = novaUpdateProject(project.id, {
+    continuity: {
+      ...(project.continuity || {}),
+      objects: next
+    }
+  });
+  novaWorkspaceObjectDeleteTarget = null;
+  if (!saved) {
+    novaWorkspaceSetStatus("The object could not be deleted.");
+    novaRenderWorkspace();
+    return;
+  }
+  if (novaWorkspaceEditingObjectId === objectId) {
+    novaWorkspaceEditingObjectId = null;
+  }
+  novaWorkspaceSetStatus("Object deleted.");
+  novaRenderWorkspace();
+}
+
+// Saves the location form (add or edit). Locations are
+// name-keyed: a duplicate name is refused.
+function novaWorkspaceSaveLocation() {
+  const project = novaGetProject(novaWorkspaceProjectId);
+  if (!project) {
+    novaWorkspaceSetStatus("That project no longer exists.");
+    return;
+  }
+  const name = document.getElementById("wsLocationName").value.trim();
+  if (!name) {
+    novaWorkspaceSetStatus("A location needs a name.");
+    return;
+  }
+  const description = document
+    .getElementById("wsLocationDescription")
+    .value.trim();
+  const locations = novaGetProjectLocations(project);
+  const editingName = novaWorkspaceEditingLocationName;
+  const duplicate = locations.some(
+    location =>
+      novaNormalize35b(location.name) === novaNormalize35b(name) &&
+      location.name !== editingName
+  );
+  if (duplicate) {
+    novaWorkspaceSetStatus("A location with this name already exists.");
+    return;
+  }
+  let next;
+  if (editingName && locations.some(l => l.name === editingName)) {
+    next = locations.map(location =>
+      location.name === editingName
+        ? { name, description }
+        : location
+    );
+  } else {
+    next = [...locations, { name, description }];
+  }
+  const saved = novaUpdateProject(project.id, {
+    continuity: {
+      ...(project.continuity || {}),
+      locations: next
+    }
+  });
+  if (!saved) {
+    novaWorkspaceSetStatus("The location could not be saved.");
+    return;
+  }
+  novaWorkspaceEditingLocationName = null;
+  novaWorkspaceSetStatus(editingName ? "Location saved." : "Location added.");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceEditLocation(name) {
+  novaWorkspaceEditingLocationName = name;
+  novaWorkspaceObjectDeleteTarget = null;
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceCancelEditLocation() {
+  novaWorkspaceEditingLocationName = null;
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceAskDeleteLocation(name) {
+  novaWorkspaceObjectDeleteTarget = { type: "location", id: name };
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceConfirmDeleteLocation(name) {
+  const project = novaGetProject(novaWorkspaceProjectId);
+  if (!project) {
+    novaWorkspaceObjectDeleteTarget = null;
+    novaWorkspaceSetStatus("That project no longer exists.");
+    novaRenderWorkspace();
+    return;
+  }
+  const next = novaGetProjectLocations(project).filter(
+    location => location.name !== name
+  );
+  const saved = novaUpdateProject(project.id, {
+    continuity: {
+      ...(project.continuity || {}),
+      locations: next
+    }
+  });
+  novaWorkspaceObjectDeleteTarget = null;
+  if (!saved) {
+    novaWorkspaceSetStatus("The location could not be deleted.");
+    novaRenderWorkspace();
+    return;
+  }
+  if (novaWorkspaceEditingLocationName === name) {
+    novaWorkspaceEditingLocationName = null;
+  }
+  novaWorkspaceSetStatus("Location deleted.");
+  novaRenderWorkspace();
+}
+
+function novaWorkspaceCancelObjectDelete() {
+  novaWorkspaceObjectDeleteTarget = null;
+  novaWorkspaceSetStatus("");
+  novaRenderWorkspace();
+}
+
+// ---- Scene state controls (Sections 12, 13) ---------------------------
+
+// Per-scene location + object-change + appearance-change controls,
+// rendered into #motionSceneState after a plan is built. Project
+// plans only (like the 3.5A continuity controls). The chain is
+// built once for the render; on a chain error the controls still
+// render (the user must be able to REMOVE the offending change),
+// with the error shown at the top and no state lines.
+function novaRenderSceneStateControls() {
+  const container = document.getElementById("motionSceneState");
+  if (!container) return;
+  const plan = novaMotionPlan;
+  if (!plan || !plan.projectId || !Array.isArray(plan.scenes)) {
+    container.innerHTML = "";
+    return;
+  }
+  const project = novaGetProject(plan.projectId);
+  if (!project) {
+    container.innerHTML = "";
+    return;
+  }
+  const cast = Array.isArray(plan.cast) ? plan.cast : [];
+  const castCharacters = cast
+    .map(id => novaGetCharacter(id))
+    .filter(Boolean);
+  const chain = novaBuildProductionState(project, plan);
+  let html = `<div class="ws-continuity"><h3>Scene State</h3>`;
+  html += `<p class="motion-note">Record what changes in each scene: where it is set, what happens to the project's objects, and how the characters' appearance changes. The state line each scene carries into its prompt is shown under its controls.</p>`;
+  if (chain.error) {
+    html += `<p class="ws-warn">${novaEscape(chain.error)}</p>`;
+  }
+  plan.scenes.forEach((scene, index) => {
+    html += novaSceneStateControlHtml(
+      scene,
+      index,
+      project,
+      castCharacters,
+      chain.error ? null : chain
+    );
+  });
+  html += `</div>`;
+  container.innerHTML = html;
+}
+
+// One scene's state controls: location, object changes,
+// appearance changes, and the delete-scene button.
+function novaSceneStateControlHtml(scene, index, project, castCharacters, chain) {
+  const sceneNumber = index + 1;
+  const objects = novaGetProjectObjects(project);
+  const locations = novaGetProjectLocations(project);
+  const stateLine = chain
+    ? novaContinuityStateLine(chain, scene, index)
+    : "";
+  let html =
+    `<div class="ws-scene-control"><h4>Scene ${sceneNumber}: ${novaEscape(scene.title || "")}</h4>`;
+
+  // Scene text (title + direction) — the trigger-4 editor
+  // (Section 16.2). The Save button is the ONLY commit point:
+  // typing in these fields triggers nothing (no input, keydown
+  // or blur handler is attached to either field). Saving
+  // writes the text and revalidates this scene's decisions
+  // synchronously (novaSaveSceneText). The text is escaped on
+  // render, as everywhere else in this panel.
+  html +=
+    `<div class="motion-field"><label class="motion-label" for="wsStateTitle_${index}">Scene title</label>` +
+    `<input class="motion-input" id="wsStateTitle_${index}" type="text" value="${novaEscape(scene.title || "")}" placeholder="Scene title"></div>` +
+    `<div class="motion-field"><label class="motion-label" for="wsStateDirection_${index}">Scene direction</label>` +
+    `<textarea class="motion-textarea" id="wsStateDirection_${index}" rows="3" placeholder="What happens in this scene?">${novaEscape(scene.direction || "")}</textarea></div>` +
+    `<p><button class="motion-btn motion-btn-primary" onclick="novaSaveSceneText(${index})">Save scene text</button> <span class="motion-note">Saving revalidates this scene's continuity decisions.</span></p>`;
+
+  // Location (free text, with the registry as suggestions).
+  html +=
+    `<div class="motion-field"><label class="motion-label" for="wsStateLocation_${index}">Location</label>` +
+    `<input class="motion-input" id="wsStateLocation_${index}" type="text" list="wsStateLocationList" value="${novaEscape(scene.location || "")}" placeholder="Where is this scene set?" onchange="novaSetSceneLocation(${index}, this.value)">` +
+    `<datalist id="wsStateLocationList">` +
+    locations.map(l => `<option value="${novaEscape(l.name)}">`).join("") +
+    `</datalist></div>`;
+
+  // The state line this scene carries (read-only).
+  if (stateLine) {
+    html += `<p class="motion-note">${novaEscape(stateLine)}</p>`;
+  }
+
+  // Object changes already declared.
+  const stateChanges = Array.isArray(scene.stateChanges)
+    ? scene.stateChanges
+    : [];
+  if (stateChanges.length) {
+    html += `<p><strong>Object changes:</strong></p><ul class="ws-state-list">`;
+    stateChanges.forEach(change => {
+      const name = novaObjectNameById(project, change.objectId);
+      let text = name + ": " + change.transition;
+      if (change.transition === "move" && change.newLocation) {
+        text += " to " + change.newLocation;
+      }
+      if (change.note) text += " — " + change.note;
+      html += `<li>${novaEscape(text)} <button class="motion-btn motion-btn-ghost" onclick="novaRemoveSceneObjectChange(${index}, '${novaEscape(change.changeId || "")}')">Remove</button></li>`;
+    });
+    html += `</ul>`;
+  }
+
+  // Object change add form.
+  if (objects.length) {
+    html +=
+      `<div class="motion-field"><label class="motion-label" for="wsStateObject_${index}">Object</label>` +
+      `<select class="motion-select" id="wsStateObject_${index}">` +
+      objects.map(o => `<option value="${novaEscape(o.id)}">${novaEscape(o.name)}</option>`).join("") +
+      `</select></div>` +
+      `<div class="motion-field"><label class="motion-label" for="wsStateTransition_${index}">Change</label>` +
+      `<select class="motion-select" id="wsStateTransition_${index}">` +
+      `<option value="lose">Lose it</option><option value="recover">Recover it</option><option value="damage">Damage it</option><option value="destroy">Destroy it</option><option value="move">Move it</option><option value="repair">Repair it</option>` +
+      `</select></div>` +
+      `<div class="motion-field"><label class="motion-label" for="wsStateNewLocation_${index}">New location (for a move)</label>` +
+      `<input class="motion-input" id="wsStateNewLocation_${index}" type="text" placeholder="Where does it go?"></div>` +
+      `<div class="motion-field"><label class="motion-label" for="wsStateNote_${index}">Note (optional)</label>` +
+      `<input class="motion-input" id="wsStateNote_${index}" type="text" placeholder="Anything to record about this change?"></div>` +
+      `<p><button class="motion-btn motion-btn-primary" onclick="novaSaveSceneObjectChange(${index})">Add object change</button></p>`;
+  } else {
+    html += `<p class="motion-note">No objects in this project yet — add them in the project workspace.</p>`;
+  }
+
+  // Appearance changes already declared.
+  const appearanceChanges = Array.isArray(scene.characterStateChanges)
+    ? scene.characterStateChanges
+    : [];
+  if (appearanceChanges.length) {
+    html += `<p><strong>Appearance changes:</strong></p><ul class="ws-state-list">`;
+    appearanceChanges.forEach(change => {
+      const character = novaGetCharacter(change.characterId);
+      const name = character ? character.name : change.characterId;
+      let text;
+      if (change.reversesChangeId) {
+        text = name + ": " + change.field + " restored";
+      } else {
+        text = name + ": " + change.field + " becomes " + change.change;
+        if (change.temporary) text += " (temporary)";
+      }
+      html += `<li>${novaEscape(text)} <button class="motion-btn motion-btn-ghost" onclick="novaRemoveSceneAppearanceChange(${index}, '${novaEscape(change.changeId || "")}')">Remove</button></li>`;
+    });
+    html += `</ul>`;
+  }
+
+  // Appearance change add form.
+  if (castCharacters.length) {
+    // The reversal dropdown filters by the selects' initial
+    // values: the first cast character and the wardrobe field
+    // (Section 13.3, Rev 4/5).
+    const reversible = novaReversibleChanges(
+      novaMotionPlan,
+      castCharacters.length ? castCharacters[0].id : null,
+      index,
+      "wardrobe"
+    );
+    html +=
+      `<div class="motion-field"><label class="motion-label" for="wsStateCharacter_${index}">Character</label>` +
+      `<select class="motion-select" id="wsStateCharacter_${index}" onchange="novaStateCharacterChanged(${index})">` +
+      castCharacters.map(c => `<option value="${novaEscape(c.id)}">${novaEscape(c.name)}</option>`).join("") +
+      `</select></div>` +
+      `<div class="motion-field"><label class="motion-label" for="wsStateField_${index}">Field</label>` +
+      `<select class="motion-select" id="wsStateField_${index}" onchange="novaRebuildReversalOptions(${index})">` +
+      `<option value="wardrobe">Wardrobe</option><option value="hair">Hair</option><option value="injury">Injury</option><option value="armour">Armour</option><option value="general">General note</option>` +
+      `</select></div>` +
+      `<div class="motion-field"><label class="motion-label" for="wsStateChange_${index}">New description</label>` +
+      `<input class="motion-input" id="wsStateChange_${index}" type="text" placeholder="The new effective description, e.g. burned black cloak"></div>` +
+      `<div class="motion-field"><label class="motion-label"><input type="checkbox" id="wsStateTemporary_${index}"> Temporary (until reversed)</label></div>` +
+      `<div class="motion-field"><label class="motion-label" for="wsStateReverses_${index}">Or reverse an earlier change</label>` +
+      `<select class="motion-select" id="wsStateReverses_${index}">` +
+      `<option value="">No reversal — this is a new change</option>` +
+      reversible.map(r => `<option value="${novaEscape(r.changeId)}">Scene ${r.sceneNumber}: ${novaEscape(r.characterName)} — ${novaEscape(r.field)}: ${novaEscape(r.text)}</option>`).join("") +
+      `</select></div>` +
+      `<p><button class="motion-btn motion-btn-primary" onclick="novaSaveSceneAppearanceChange(${index})">Add appearance change</button></p>`;
+  }
+
+  html +=
+    `<p><button class="motion-btn motion-btn-ghost" onclick="novaDeleteScene(${index})">Delete this scene</button></p>`;
+  html += `</div>`;
+  return html;
+}
+
+// The forward appearance changes a reversal may target: every
+// non-reversal change from scenes 0..sceneIndex, not yet
+// reversed, in scene order. `characterId` narrows to one
+// character (null = all characters) and `field` narrows to one
+// appearance field (null/omitted = all fields) — the editor
+// filters by the selected character AND the selected field
+// (Section 13.3, Rev 4/5). The chain builder enforces the same
+// rule independently; this dropdown is a convenience, not the
+// authority.
+function novaReversibleChanges(plan, characterId, sceneIndex, field) {
+  const out = [];
+  if (!plan || !Array.isArray(plan.scenes)) return out;
+  const reversed = new Set();
+  const limit = Math.min(sceneIndex, plan.scenes.length - 1);
+  for (let i = 0; i <= limit; i++) {
+    const scene = plan.scenes[i];
+    (scene.characterStateChanges || []).forEach(change => {
+      if (!change || typeof change !== "object") return;
+      if (change.reversesChangeId) {
+        reversed.add(change.reversesChangeId);
+        return;
+      }
+      if (characterId && change.characterId !== characterId) return;
+      if (field && change.field !== field) return;
+      if (!change.changeId) return;
+      const character = novaGetCharacter(change.characterId);
+      out.push({
+        changeId: change.changeId,
+        characterId: change.characterId,
+        characterName: character ? character.name : change.characterId,
+        field: change.field,
+        text: change.change || "",
+        sceneNumber: i + 1
+      });
+    });
+  }
+  return out.filter(entry => !reversed.has(entry.changeId));
+}
+
+// Rebuilds the reversal select for the chosen character AND
+// field (Section 13.3, Rev 4/5). Called when either select
+// changes.
+function novaRebuildReversalOptions(index) {
+  const character = document.getElementById("wsStateCharacter_" + index);
+  const field = document.getElementById("wsStateField_" + index);
+  const reverses = document.getElementById("wsStateReverses_" + index);
+  if (!character || !field || !reverses || !novaMotionPlan) return;
+  const options = novaReversibleChanges(
+    novaMotionPlan,
+    character.value,
+    index,
+    field.value
+  );
+  reverses.innerHTML =
+    `<option value="">No reversal — this is a new change</option>` +
+    options
+      .map(
+        r =>
+          `<option value="${novaEscape(r.changeId)}">Scene ${r.sceneNumber}: ${novaEscape(r.characterName)} — ${novaEscape(r.field)}: ${novaEscape(r.text)}</option>`
+      )
+      .join("");
+}
+
+// Rebuilds the reversal select for the chosen character (the
+// field filter applies too — see novaRebuildReversalOptions).
+function novaStateCharacterChanged(index) {
+  novaRebuildReversalOptions(index);
+}
+
+// Sets a scene's location (free text). A location change affects
+// the chain and the warnings but not the prompts (the state line
+// carries objects + appearance, not the location), so no prompt
+// rebuild is needed — the review + controls refresh.
+function novaSetSceneLocation(index, value) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const scene = novaMotionPlan.scenes[index];
+  if (!scene) return;
+  const location = typeof value === "string" ? value.trim() : "";
+  if ((scene.location || "") === location) return;
+  if (location) {
+    scene.location = location;
+  } else {
+    delete scene.location;
+  }
+  novaMotionPlan.version = (novaMotionPlan.version || 1) + 1;
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+  novaRenderSceneStateControls();
+}
+
+// Saves a scene's edited text (title + direction) — the
+// trigger-4 commit point (Section 16.2). The Save button in
+// the per-scene state editor is the commit action: typing in
+// the fields triggers nothing (no input, keydown or blur
+// handler calls this function). On commit the text is
+// written, the edited scene's decisions are revalidated
+// synchronously, the prompts are rebuilt and the displays
+// refresh. A scene-text edit NEVER bumps plan.version and
+// never updates the watermark (Section 16.2) — this handler
+// touches neither. A no-change save is a no-op: the edit was
+// not accepted as a change, so nothing is revalidated.
+function novaSaveSceneText(index) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const plan = novaMotionPlan;
+  const scene = plan.scenes[index];
+  if (!scene || !plan.projectId) return;
+  const project = novaGetProject(plan.projectId);
+  if (!project) return;
+  const titleInput = document.getElementById("wsStateTitle_" + index);
+  const directionInput = document.getElementById("wsStateDirection_" + index);
+  if (!titleInput || !directionInput) return;
+  const title = typeof titleInput.value === "string" ? titleInput.value.trim() : "";
+  const direction = typeof directionInput.value === "string" ? directionInput.value.trim() : "";
+  if ((scene.title || "") === title && (scene.direction || "") === direction) {
+    return;
+  }
+  scene.title = title;
+  scene.direction = direction;
+  // Trigger 4: revalidate this scene's decisions NOW, before
+  // anything else happens. On a broken chain the function
+  // reports the error and leaves the decisions exactly as
+  // they were; the text stays saved (a text edit cannot break
+  // the chain — the chain depends on declared changes, not on
+  // title or direction) and the prompt rebuild is skipped,
+  // because it would fail on the same chain error. The prompt
+  // refreshes on the next successful rebuild, once the plan
+  // is repaired.
+  const checked = novaRevalidateSceneAfterAcceptedEdit(project, plan, scene.id);
+  if (checked.error) {
+    alert(checked.error);
+  } else {
+    novaRebuildAllScenePrompts();
+  }
+  novaRenderPlanBrief();
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+  novaRenderSceneStateControls();
+}
+
+// Saves a scene's new object change. The change is validated
+// against the scene's AFTER-state (the state after the scene's
+// existing changes — the new change appends after them). When the
+// chain is already broken the save is refused: the plan must be
+// repaired (by removing the offending change) before new changes
+// are added.
+function novaSaveSceneObjectChange(index) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const plan = novaMotionPlan;
+  const scene = plan.scenes[index];
+  if (!scene || !plan.projectId) return;
+  const project = novaGetProject(plan.projectId);
+  if (!project) return;
+  const objectSelect = document.getElementById("wsStateObject_" + index);
+  const transitionSelect = document.getElementById("wsStateTransition_" + index);
+  const newLocationInput = document.getElementById("wsStateNewLocation_" + index);
+  const noteInput = document.getElementById("wsStateNote_" + index);
+  if (!objectSelect || !transitionSelect) return;
+  const objectId = objectSelect.value;
+  const transition = transitionSelect.value;
+  const newLocation = newLocationInput ? newLocationInput.value.trim() : "";
+  const note = noteInput ? noteInput.value.trim() : "";
+
+  const chain = novaBuildProductionState(project, plan);
+  if (chain.error) {
+    alert(chain.error);
+    return;
+  }
+  const entry = chain.scenes[index];
+  const current = entry && entry.objects ? entry.objects[objectId] : null;
+  const error = novaValidateObjectChange(current, transition, newLocation);
+  if (error) {
+    alert("Scene " + (index + 1) + ": " + error);
+    return;
+  }
+  if (!Array.isArray(scene.stateChanges)) scene.stateChanges = [];
+  const change = {
+    changeId: novaNewChangeId(),
+    objectId,
+    transition,
+    newLocation: transition === "move" ? newLocation : "",
+    note
+  };
+  scene.stateChanges.push(change);
+  plan.version = (plan.version || 1) + 1;
+  if (!novaRebuildAllScenePrompts()) return;
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+  novaRenderSceneStateControls();
+}
+
+function novaRemoveSceneObjectChange(index, changeId) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const scene = novaMotionPlan.scenes[index];
+  if (!scene || !Array.isArray(scene.stateChanges)) return;
+  const before = scene.stateChanges.length;
+  scene.stateChanges = scene.stateChanges.filter(
+    change => change.changeId !== changeId
+  );
+  if (scene.stateChanges.length === before) return;
+  novaMotionPlan.version = (novaMotionPlan.version || 1) + 1;
+  if (!novaRebuildAllScenePrompts()) return;
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+  novaRenderSceneStateControls();
+}
+
+// Saves a scene's new appearance change. A reversal needs no
+// description (the restored value comes from the chain history —
+// decision D4); a forward change needs the new effective
+// description. The chain rebuild validates the reversal target.
+function novaSaveSceneAppearanceChange(index) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const plan = novaMotionPlan;
+  const scene = plan.scenes[index];
+  if (!scene || !plan.projectId) return;
+  const characterSelect = document.getElementById("wsStateCharacter_" + index);
+  const fieldSelect = document.getElementById("wsStateField_" + index);
+  const changeInput = document.getElementById("wsStateChange_" + index);
+  const temporaryInput = document.getElementById("wsStateTemporary_" + index);
+  const reversesSelect = document.getElementById("wsStateReverses_" + index);
+  if (!characterSelect || !fieldSelect) return;
+  const characterId = characterSelect.value;
+  const field = fieldSelect.value;
+  const change = changeInput ? changeInput.value.trim() : "";
+  const temporary = temporaryInput ? temporaryInput.checked : false;
+  const reversesChangeId = reversesSelect ? reversesSelect.value : "";
+  if (!reversesChangeId && !change) {
+    alert("Enter the new description, or choose a change to reverse.");
+    return;
+  }
+  if (!Array.isArray(scene.characterStateChanges)) {
+    scene.characterStateChanges = [];
+  }
+  scene.characterStateChanges.push({
+    changeId: novaNewChangeId(),
+    characterId,
+    field,
+    change: reversesChangeId ? "" : change,
+    temporary: reversesChangeId ? false : temporary,
+    reversesChangeId: reversesChangeId || null
+  });
+  plan.version = (plan.version || 1) + 1;
+  if (!novaRebuildAllScenePrompts()) {
+    // The chain refused the change (e.g. the reversal target is
+    // gone) — roll the declaration back out so the plan stays
+    // valid.
+    scene.characterStateChanges.pop();
+    plan.version = plan.version - 1;
+    return;
+  }
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+  novaRenderSceneStateControls();
+}
+
+// Removes an appearance change. A forward change that a later
+// change reverses is REFUSED (removing it would dangle the
+// reversal and break the chain) — the reversal goes first.
+function novaRemoveSceneAppearanceChange(index, changeId) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const plan = novaMotionPlan;
+  const scene = plan.scenes[index];
+  if (!scene || !Array.isArray(scene.characterStateChanges)) return;
+  const reversing = [];
+  plan.scenes.forEach((other, otherIndex) => {
+    (other.characterStateChanges || []).forEach(change => {
+      if (change && change.reversesChangeId === changeId) {
+        reversing.push(otherIndex + 1);
+      }
+    });
+  });
+  if (reversing.length) {
+    alert(
+      "Scene " +
+        reversing[0] +
+        " reverses this change — remove the reversal first."
+    );
+    return;
+  }
+  const before = scene.characterStateChanges.length;
+  scene.characterStateChanges = scene.characterStateChanges.filter(
+    change => change.changeId !== changeId
+  );
+  if (scene.characterStateChanges.length === before) return;
+  plan.version = (plan.version || 1) + 1;
+  if (!novaRebuildAllScenePrompts()) return;
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+  novaRenderSceneStateControls();
+}
+
+// ---- Scene deletion (Section 16.2) ------------------------------------
+
+// Deletes a scene. The deletion is allowed even if it breaks the
+// chain (the Section 12.2 reorder analogy — the edit is allowed,
+// the BUILD is blocked): the scene + its decisions go, the
+// version bumps, and the prompt rebuild validates all-or-nothing
+// (on error it alerts and touches no prompt). The brief is
+// re-rendered (the scene block is gone and the numbering shifts).
+function novaDeleteScene(index) {
+  if (!novaMotionPlan || !Array.isArray(novaMotionPlan.scenes)) return;
+  const plan = novaMotionPlan;
+  const scene = plan.scenes[index];
+  if (!scene) return;
+  const decisions = Array.isArray(plan.continuityDecisions)
+    ? plan.continuityDecisions.filter(d => d && d.sceneId === scene.id)
+    : [];
+  const notice =
+    decisions.length > 0
+      ? "This scene had " +
+        decisions.length +
+        " continuity decision" +
+        (decisions.length === 1 ? "" : "s") +
+        ", which will be removed.\n\n"
+      : "";
+  if (!confirm(notice + "Delete Scene " + (index + 1) + "?")) return;
+  plan.scenes.splice(index, 1);
+  novaRemoveSceneDecisions(plan, scene.id);
+  plan.version = (plan.version || 1) + 1;
+  novaRebuildAllScenePrompts();
+  novaRenderPlanBrief();
+  novaRenderProductionIdentity();
+  novaRenderSceneContinuityControls();
+  novaRenderSceneStateControls();
+}
+
+// Re-renders the production brief (motionOutput) from the current
+// plan, mirroring buildMotionPlan's rendering exactly (same
+// template, same fields — the data source is the plan, not the
+// build-time locals). Used after a scene deletion, where the
+// in-place prompt patch cannot remove a scene block or renumber
+// the scenes that follow it.
+function novaRenderPlanBrief() {
+  const plan = novaMotionPlan;
+  const output = document.getElementById("motionOutput");
+  const empty = document.getElementById("motionEmpty");
+  if (!plan || !output) return;
+  if (!Array.isArray(plan.scenes) || !plan.scenes.length) {
+    output.innerHTML = "";
+    output.style.display = "none";
+    if (empty) empty.style.display = "block";
+    return;
+  }
+  const subject = novaExtractSubject(plan.prompt || "");
+  const actions = novaDetectActions(plan.prompt || "");
+  const elapsed = plan.scenes.reduce(
+    (total, scene) => total + (scene.duration || 0),
+    0
+  );
+  const sceneHTML = plan.scenes
+    .map(
+      (scene, index) => `
+    <div class="motion-scene">
+      <h3>SCENE ${index + 1}: ${novaEscape(scene.title)}</h3>
+      <p><strong>Timeline:</strong> ${scene.start}s – ${scene.end}s</p>
+      <p><strong>Duration:</strong> ${scene.duration} seconds</p>
+      <p><strong>Visual direction:</strong> ${novaEscape(scene.direction)}</p>
+      <p><strong>Camera:</strong> ${novaEscape(scene.camera)}</p>
+      <p><strong>Subject movement:</strong> ${novaEscape(scene.motion)}</p>
+      <p><strong>Generation prompt:</strong></p>
+      <p>${novaEscape(scene.prompt)}</p>
+    </div>
+  `
+    )
+    .join("");
+  const actionText = actions.length
+    ? actions.join(", ")
+    : "General subject action";
+  output.innerHTML = `
+    <h3>NOVA INTELLIGENCE PRODUCTION BRIEF</h3>
+
+    <p><strong>Detected subject:</strong> ${novaEscape(subject)}</p>
+    <p><strong>Detected actions:</strong> ${novaEscape(actionText)}</p>
+    <p><strong>Generation mode:</strong> ${plan.mode === "text" ? "Text to Video" : "Image to Video"}</p>
+    <p><strong>Visual style:</strong> ${novaEscape(plan.style || "")}</p>
+    <p><strong>Preferred camera:</strong> ${novaEscape(plan.camera || "")}</p>
+    <p><strong>Aspect ratio:</strong> ${novaEscape(plan.ratio || "")}</p>
+    <p><strong>Total duration:</strong> ${plan.duration} seconds</p>
+    <p><strong>Number of scenes:</strong> ${plan.scenes.length}</p>
+    <p><strong>Character identity:</strong> ${novaEscape(plan.character || "Continuity instructions enabled")}</p>
+
+    <h3 style="margin-top:20px;">CINEMATIC SCENE BREAKDOWN</h3>
+    ${sceneHTML}
+
+    <div class="motion-scene">
+      <strong>GLOBAL CONTINUITY RULES</strong>
+      <p>Maintain consistent subject identity, anatomy, colours, proportions, environment and lighting across all scenes.</p>
+      <p>Preserve the intended action and spatial relationships. Avoid unexplained changes in character appearance or location.</p>
+      <p>Final timeline: ${elapsed} seconds.</p>
+    </div>
+
+    <p class="motion-note">
+      NOVA Prompt Brain 2.0 · Rule-based cinematic planning.
+      AI model interpretation and actual video rendering are not yet connected.
+    </p>
+  `;
+  if (empty) empty.style.display = "none";
+  output.style.display = "block";
+}
+
+// ---- Prompt rebuilds (Sections 12, 14) --------------------------------
+
+// Rebuilds every scene prompt of a plan through the shared
+// builder (which includes the state line), using a pre-built
+// chain. Returns { error } — on a per-scene error the rebuild
+// stops and reports it (earlier scenes keep their new prompts;
+// the caller re-validates the chain before calling, so a
+// per-scene error here is defensive only).
+function novaRebuildPlanPrompts(plan, chain) {
+  if (!plan || !Array.isArray(plan.scenes)) {
+    return { error: "No plan was supplied for the prompt rebuild." };
+  }
+  for (let index = 0; index < plan.scenes.length; index++) {
+    const scene = plan.scenes[index];
+    const rebuilt = novaBuildScenePrompt(plan, scene, chain);
+    if (rebuilt.error) {
+      return { error: "Scene " + (index + 1) + ": " + rebuilt.error };
+    }
+    scene.prompt = rebuilt.prompt;
+  }
+  return { error: null };
+}
+
+// Rebuilds ALL scene prompts of the current plan, all-or-nothing:
+// the chain is validated FIRST; on error it alerts and touches
+// no prompt. On success every prompt is rebuilt (state lines
+// refresh across the whole plan — a change in scene N alters
+// the lines of scenes N+1...) and the brief is patched in place
+// per scene (the 3.5A pattern). Returns true on success.
+function novaRebuildAllScenePrompts() {
+  const plan = novaMotionPlan;
+  if (!plan || !Array.isArray(plan.scenes)) return false;
+  if (!plan.projectId) {
+    // Standalone plans have no state chain; their prompts carry
+    // no state line, so there is nothing to rebuild.
+    return true;
+  }
+  const project = novaGetProject(plan.projectId);
+  if (!project) {
+    alert("The project for this plan no longer exists.");
+    return false;
+  }
+  const chain = novaBuildProductionState(project, plan);
+  if (chain.error) {
+    alert(chain.error);
+    return false;
+  }
+  const output = document.getElementById("motionOutput");
+  for (let index = 0; index < plan.scenes.length; index++) {
+    const scene = plan.scenes[index];
+    const oldPrompt = scene.prompt;
+    const rebuilt = novaBuildScenePrompt(plan, scene, chain);
+    if (rebuilt.error) {
+      alert("Scene " + (index + 1) + ": " + rebuilt.error);
+      return false;
+    }
+    scene.prompt = rebuilt.prompt;
+    if (output && oldPrompt && oldPrompt !== rebuilt.prompt) {
+      output.innerHTML = output.innerHTML.replace(
+        novaEscape(oldPrompt),
+        novaEscape(rebuilt.prompt)
+      );
+    }
+  }
+  return true;
+}
+
+// ---- Pre-creation confirmation (Section 16.2) --------------------------
+
+// Renders the creation-confirm panel (the design's exact
+// message + Create anyway / Cancel) into #motionCreationConfirm.
+function novaShowCreationConfirm(message) {
+  const container = document.getElementById("motionCreationConfirm");
+  if (!container) return;
+  container.innerHTML =
+    `<div class="ws-confirm"><p>${novaEscape(message)}</p>` +
+    `<div class="ws-row">` +
+    `<button type="button" class="ws-btn ws-btn-primary" onclick="novaConfirmCreation()">Create anyway</button> ` +
+    `<button type="button" class="ws-btn" onclick="novaCancelCreation()">Cancel</button>` +
+    `</div></div>`;
+  novaCurrentPlanWarnings = null;
+}
+
+// The confirm button: one-shot confirmation, then re-invoke the
+// creation (the internal revalidation is then a no-op — the
+// watermark is current after the pre-check).
+function novaConfirmCreation() {
+  const container = document.getElementById("motionCreationConfirm");
+  if (container) container.innerHTML = "";
+  novaMotionCreationConfirmed = true;
+  generateMotionVideo();
+}
+
+// The cancel button: clears the panel; nothing is created.
+function novaCancelCreation() {
+  const container = document.getElementById("motionCreationConfirm");
+  if (container) container.innerHTML = "";
+  novaMotionCreationConfirmed = false;
+}
+
+/* ---- End of Stage 3.5B: Production State Manager ---------------------- */
 
 /* ---------- Provider Interface (contract only, Stage 3.1) ----------
    Correction 5: interface definitions + a safe unavailable adapter —
