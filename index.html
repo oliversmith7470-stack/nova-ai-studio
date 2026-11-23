@@ -533,6 +533,262 @@
     width: 100%;
   }
 }  
+
+/* NOVA MOTION 4.0 WORKSPACE */
+.motion-studio {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  overflow-y: auto;
+  background: #080b18;
+  color: #fff;
+  padding: 22px;
+}
+
+.motion-container {
+  max-width: 1100px;
+  margin: auto;
+}
+
+.motion-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 25px;
+}
+
+.motion-logo {
+  font-size: 21px;
+  font-weight: 800;
+}
+
+.motion-logo span {
+  color: #9875ff;
+}
+
+.motion-close {
+  background: #211b3e;
+  border: 1px solid #483577;
+  color: white;
+  padding: 10px 15px;
+  border-radius: 8px;
+}
+
+.motion-hero {
+  padding: 28px;
+  border: 1px solid #373057;
+  border-radius: 16px;
+  background: radial-gradient(circle at 90% 10%, #50319b55, transparent 45%), #11162a;
+  margin-bottom: 22px;
+}
+
+.motion-hero h1 {
+  font-size: clamp(25px, 4vw, 36px);
+  margin-bottom: 10px;
+}
+
+.motion-hero h1 span {
+  color: #ae91ff;
+}
+
+.motion-hero p {
+  color: #aab2c8;
+  line-height: 1.7;
+  font-size: 13px;
+}
+
+.motion-status {
+  display: inline-block;
+  margin-top: 15px;
+  color: #c3afff;
+  background: #211b3e;
+  border: 1px solid #483577;
+  border-radius: 20px;
+  padding: 7px 12px;
+  font-size: 11px;
+}
+
+.motion-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(260px, 0.8fr);
+  gap: 18px;
+}
+
+.motion-panel {
+  min-width: 0;
+  background: #11162a;
+  border: 1px solid #252c46;
+  border-radius: 13px;
+  padding: 21px;
+  margin-bottom: 18px;
+}
+
+.motion-panel h2 {
+  font-size: 17px;
+  margin-bottom: 17px;
+}
+
+.motion-label {
+  display: block;
+  color: #b8c0d5;
+  font-size: 12px;
+  margin: 16px 0 8px;
+}
+
+.motion-input,
+.motion-select {
+  display: block;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #343d5c;
+  border-radius: 8px;
+  background: #0b1021;
+  color: white;
+  font: inherit;
+  font-size: 13px;
+}
+
+.motion-input:focus,
+.motion-select:focus {
+  outline: 1px solid #9875ff;
+}
+
+#motionPrompt {
+  min-height: 145px;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+.motion-mode {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.motion-mode button {
+  padding: 13px 8px;
+  background: #171d34;
+  border: 1px solid #343d5c;
+  color: #c5cce0;
+  border-radius: 8px;
+}
+
+.motion-mode button.active {
+  background: #29204b;
+  border-color: #9875ff;
+  color: white;
+}
+
+.motion-two {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.motion-upload {
+  display: block;
+  width: 100%;
+  padding: 14px;
+  background: #0b1021;
+  border: 1px dashed #62518c;
+  border-radius: 8px;
+  color: #c3afff;
+  font-size: 12px;
+}
+
+.motion-primary {
+  width: 100%;
+  margin-top: 20px;
+  padding: 14px;
+  background: linear-gradient(100deg, #7047d8, #9875ff);
+  color: white;
+  border: none;
+  border-radius: 9px;
+  font-weight: bold;
+}
+
+.motion-primary:disabled {
+  opacity: .6;
+  cursor: not-allowed;
+}
+
+.motion-preview {
+  min-height: 210px;
+  background: radial-gradient(circle, #29204b, #090d1d 70%);
+  border: 1px solid #34304f;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 20px;
+  color: #aab2c8;
+  line-height: 1.7;
+  font-size: 13px;
+}
+
+.motion-preview strong {
+  display: block;
+  color: white;
+  font-size: 28px;
+  margin-bottom: 10px;
+}
+
+.motion-output {
+  display: none;
+  margin-top: 18px;
+  padding: 16px;
+  background: #0b1021;
+  border: 1px solid #483577;
+  border-radius: 9px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.motion-scene {
+  padding: 12px;
+  margin-top: 10px;
+  background: #171d34;
+  border: 1px solid #343d5c;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.motion-note {
+  color: #929bb5;
+  font-size: 11px;
+  line-height: 1.6;
+  margin-top: 13px;
+}
+
+@media (max-width: 750px) {
+  .motion-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .motion-studio {
+    padding: 12px;
+  }
+
+  .motion-hero,
+  .motion-panel {
+    padding: 17px;
+  }
+
+  .motion-header {
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 380px) {
+  .motion-two {
+    grid-template-columns: 1fr;
+  }
+}
+
 </style>
 </head>
 
@@ -554,7 +810,7 @@
 
     <p class="nav-label">AI CREATION TOOLS</p>
 
-    <button class="nav-item" onclick="openTool('AI Video Generator')">
+    <button class="nav-item" onclick="openMotionStudio()">
       <span class="nav-icon">▶</span> AI Video
     </button>
 
@@ -651,7 +907,7 @@
           <div class="tool-icon">🎬</div>
           <h3>AI Video Generator</h3>
           <p>Transform text prompts and images into cinematic video experiences.</p>
-          <button class="tool-button" onclick="openTool('AI Video Generator')">
+          <button class="tool-button" onclick="openMotionStudio()">
             Explore Tool →
           </button>
         </article>
@@ -741,6 +997,134 @@
 
 </div>
 
+
+<!-- NOVA MOTION 4.0 -->
+<section id="motionStudio" class="motion-studio">
+  <div class="motion-container">
+
+    <header class="motion-header">
+      <div class="motion-logo">NOVA <span>MOTION 4.0</span></div>
+      <button class="motion-close" onclick="closeMotionStudio()">✕ Close</button>
+    </header>
+
+    <section class="motion-hero">
+      <h1>Bring Your <span>Imagination</span> to Motion.</h1>
+      <p>Direct your scenes, develop cinematic concepts and prepare your video projects with NOVA Motion.</p>
+      <span class="motion-status">● Studio Preview · Video engine not connected</span>
+    </section>
+
+    <div class="motion-grid">
+
+      <div>
+        <section class="motion-panel">
+          <h2>🎬 Create Your Video</h2>
+
+          <label class="motion-label">Generation Mode</label>
+          <div class="motion-mode">
+            <button type="button" id="textMode" class="active" onclick="setMotionMode('text')">Text to Video</button>
+            <button type="button" id="imageMode" onclick="setMotionMode('image')">Image to Video</button>
+          </div>
+
+          <div id="motionUploadArea" style="display:none;">
+            <label class="motion-label">Upload Reference Image</label>
+            <input class="motion-upload" id="motionImage" type="file" accept="image/*">
+          </div>
+
+          <label class="motion-label" for="motionPrompt">Describe your video</label>
+          <textarea class="motion-input" id="motionPrompt" placeholder="Example: A powerful black dragon emerges from a burning medieval castle as the camera slowly moves towards its glowing eyes..."></textarea>
+
+          <div class="motion-two">
+            <div>
+              <label class="motion-label" for="motionRatio">Aspect Ratio</label>
+              <select class="motion-select" id="motionRatio">
+                <option value="16:9">16:9 Landscape</option>
+                <option value="9:16">9:16 Vertical</option>
+                <option value="1:1">1:1 Square</option>
+                <option value="4:5">4:5 Portrait</option>
+              </select>
+            </div>
+
+            <div>
+              <label class="motion-label" for="motionDuration">Duration</label>
+              <select class="motion-select" id="motionDuration">
+                <option value="5">5 seconds</option>
+                <option value="8" selected>8 seconds</option>
+                <option value="10">10 seconds</option>
+                <option value="15">15 seconds</option>
+                <option value="30">30 seconds</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="motion-two">
+            <div>
+              <label class="motion-label" for="motionStyle">Visual Style</label>
+              <select class="motion-select" id="motionStyle">
+                <option>Cinematic Photorealism</option>
+                <option>Fantasy Epic</option>
+                <option>3D Animation</option>
+                <option>Documentary Realism</option>
+                <option>Anime</option>
+                <option>Stylized Film</option>
+              </select>
+            </div>
+
+            <div>
+              <label class="motion-label" for="motionCamera">Camera Movement</label>
+              <select class="motion-select" id="motionCamera">
+                <option>Slow Cinematic Push-In</option>
+                <option>Tracking Shot</option>
+                <option>Wide Establishing Shot</option>
+                <option>Orbit Camera</option>
+                <option>Crane Movement</option>
+                <option>Handheld Camera</option>
+                <option>Static Camera</option>
+              </select>
+            </div>
+          </div>
+
+          <label class="motion-label" for="motionCharacter">Character Description (Optional)</label>
+          <textarea class="motion-input" id="motionCharacter" rows="3" placeholder="Describe the character's appearance, clothing, age range and distinguishing features..."></textarea>
+
+          <button class="motion-primary" id="motionPlanButton" onclick="buildMotionPlan()">
+            Build Cinematic Scene Plan →
+          </button>
+
+          <p class="motion-note">Scene planning is available in this preview. Actual video rendering will be enabled when a compatible generation engine is connected.</p>
+        </section>
+
+        <section class="motion-panel">
+          <h2>📋 Your Scene Plan</h2>
+          <div id="motionOutput" class="motion-output"></div>
+          <p id="motionEmpty" class="motion-note">Your scene breakdown will appear here after you build a plan.</p>
+        </section>
+      </div>
+
+      <div>
+        <section class="motion-panel">
+          <h2>Video Preview</h2>
+          <div class="motion-preview">
+            <div>
+              <strong>▶</strong>
+              Your cinematic preview will appear here when video generation is connected.
+            </div>
+          </div>
+        </section>
+
+        <section class="motion-panel">
+          <h2>Project Information</h2>
+          <p class="motion-note">Workspace: NOVA MOTION 4.0</p>
+          <p class="motion-note">Project type: AI Video</p>
+          <p class="motion-note">Planning engine: Local browser prototype</p>
+          <p class="motion-note">Video rendering: Not connected</p>
+        </section>
+      </div>
+
+    </div>
+  </div>
+</section>
+<!-- END NOVA MOTION 4.0 -->
+
 <!-- NOVA AI WRITING STUDIO -->
 <section id="writingStudio" class="writing-studio">
   <div class="writing-panel">
@@ -799,6 +1183,103 @@
 <!-- END NOVA AI WRITING STUDIO -->  
   
 <script>
+
+// NOVA MOTION 4.0 FUNCTIONS
+
+let novaMotionMode = "text";
+
+function openMotionStudio() {
+  document.getElementById("motionStudio").style.display = "block";
+  document.body.style.overflow = "hidden";
+  document.getElementById("sidebar").classList.remove("open");
+}
+
+function closeMotionStudio() {
+  document.getElementById("motionStudio").style.display = "none";
+  document.body.style.overflow = "";
+}
+
+function setMotionMode(mode) {
+  novaMotionMode = mode;
+
+  document.getElementById("textMode").classList.toggle("active", mode === "text");
+  document.getElementById("imageMode").classList.toggle("active", mode === "image");
+
+  document.getElementById("motionUploadArea").style.display =
+    mode === "image" ? "block" : "none";
+}
+
+function buildMotionPlan() {
+  const prompt = document.getElementById("motionPrompt").value.trim();
+  const character = document.getElementById("motionCharacter").value.trim();
+  const ratio = document.getElementById("motionRatio").value;
+  const duration = Number(document.getElementById("motionDuration").value);
+  const style = document.getElementById("motionStyle").value;
+  const camera = document.getElementById("motionCamera").value;
+  const image = document.getElementById("motionImage").files[0];
+
+  const output = document.getElementById("motionOutput");
+  const empty = document.getElementById("motionEmpty");
+
+  if (!prompt) {
+    alert("Please describe the video you want to create.");
+    return;
+  }
+
+  if (novaMotionMode === "image" && !image) {
+    alert("Please upload a reference image for Image to Video mode.");
+    return;
+  }
+
+  const sceneCount = Math.max(1, Math.ceil(duration / 5));
+  const scenes = [];
+
+  for (let i = 0; i < sceneCount; i++) {
+    const sceneDuration = Math.min(5, duration - i * 5);
+
+    let direction = [
+      "Establish the environment and introduce the main subject.",
+      "Develop the action with expressive subject movement.",
+      "Build visual intensity and deepen the cinematic atmosphere.",
+      "Deliver the main visual moment and emotional payoff.",
+      "Finish with a memorable cinematic closing shot."
+    ][Math.min(i, 4)];
+
+    scenes.push(
+      `<div class="motion-scene">
+        <strong>SCENE ${i + 1}</strong><br>
+        Duration: ${sceneDuration} seconds<br>
+        Direction: ${direction}
+      </div>`
+    );
+  }
+
+  const safe = value => String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[char]);
+
+  output.innerHTML = `
+    <h3>Cinematic Production Brief</h3>
+    <p><strong>Concept:</strong> ${safe(prompt)}</p>
+    <p><strong>Mode:</strong> ${novaMotionMode === "text" ? "Text to Video" : "Image to Video"}</p>
+    <p><strong>Visual style:</strong> ${safe(style)}</p>
+    <p><strong>Camera:</strong> ${safe(camera)}</p>
+    <p><strong>Aspect ratio:</strong> ${safe(ratio)}</p>
+    <p><strong>Duration:</strong> ${duration} seconds</p>
+    <p><strong>Character:</strong> ${safe(character || "No character description supplied")}</p>
+    <h3 style="margin-top:18px;">Scene Breakdown</h3>
+    ${scenes.join("")}
+    <p class="motion-note">This is an initial structured scene plan, not a generated video or an AI-interpreted screenplay.</p>
+  `;
+
+  empty.style.display = "none";
+  output.style.display = "block";
+}
+
 
   function toggleMenu() {
     document.getElementById("sidebar")
