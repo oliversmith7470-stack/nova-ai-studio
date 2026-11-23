@@ -1213,6 +1213,11 @@ let novaMotionJob = null;
 let novaMotionPendingJobId = null;
 let novaMotionImageFile = null;
 
+// Stage 3.4C: project-aware selection. Both null means standalone.
+// The project workspace UI (Stage 3.4D) sets these.
+let novaSelectedProjectId = null;
+let novaSelectedCharacterId = null;
+
 function openMotionStudio() {
   document.getElementById("motionStudio").style.display = "block";
   document.body.style.overflow = "hidden";
@@ -1646,8 +1651,18 @@ async function generateMotionVideo() {
     }
 
     // Otherwise create a fresh job and persist its token first.
+    // Stage 3.4C: a selected project + character takes the
+    // project-aware path; otherwise the standalone path is used.
     if (!job) {
-      job = await novaCreateJob(novaMotionPlan);
+      const selection = novaGetProjectSelection();
+
+      job = selection
+        ? await novaCreateProjectJob(
+            novaMotionPlan,
+            selection.projectId,
+            selection.characterId
+          )
+        : await novaCreateJob(novaMotionPlan);
     }
 
     if (
@@ -1687,7 +1702,35 @@ async function generateMotionVideo() {
   try {
     let imageDataUrl = null;
 
-    if (novaMotionImageFile) {
+    // Stage 3.4C: a project job records its exact reference image in
+    // its character snapshot, so the submission resolves that asset
+    // from IndexedDB. A standalone job keeps the existing upload path.
+    // A project job NEVER falls through to the file input: no
+    // recorded image means no image, including on retry.
+    if (job.projectId && Array.isArray(job.characterSnapshots)) {
+      const snapshot = job.characterSnapshots[0];
+
+      if (snapshot && snapshot.imageAssetId) {
+        const blob = await novaGetImage(snapshot.imageAssetId);
+
+        if (!blob) {
+          throw new Error(
+            "The reference image recorded for this job is no longer available in this browser."
+          );
+        }
+
+        if (blob.size > 5 * 1024 * 1024) {
+          throw new Error(
+            "Reference images must be 5 MB or smaller for this prototype."
+          );
+        }
+
+        imageDataUrl = await novaBlobToDataUrl(blob);
+      }
+
+      // No recorded image means no image.
+      // Never fall through to the current file input.
+    } else if (novaMotionImageFile) {
       if (novaMotionImageFile.size > 5 * 1024 * 1024) {
         throw new Error(
           "Reference images must be 5 MB or smaller for this prototype."
@@ -2982,6 +3025,216 @@ async function novaCreateJob(plan) {
     !persistedJob ||
     persistedJob.accessToken !== accessToken ||
     !persistedJob.productionPlan
+  ) {
+    throw new Error(
+      "NOVA could not securely save the job credentials. Please check browser storage."
+    );
+  }
+
+  return persistedJob;
+}
+
+/* ---------- Project-Aware Job Creation (Stage 3.4C) ----------
+   Standalone creation (novaCreateJob) is unchanged. A project job is
+   created inside a selected project using a selected character, with
+   immutable snapshots of the character and the project's continuity
+   at the moment of creation. Editing the character or the project
+   later never rewrites an existing job's history.
+   Image rules: the character's saved image is the default identity
+   reference; a newly uploaded image overrides it for that single
+   production and is stored as a separate asset — it never overwrites
+   the character's permanent reference image. */
+
+function novaGetProjectSelection() {
+  const projectId = novaSelectedProjectId || null;
+  const characterId = novaSelectedCharacterId || null;
+
+  if (!projectId && !characterId) return null;
+
+  if (!projectId) {
+    throw new Error(
+      "A character is selected but no project is selected. Select a project first."
+    );
+  }
+
+  if (!characterId) {
+    throw new Error(
+      "A project is selected but no character is selected. Select a character first."
+    );
+  }
+
+  return { projectId, characterId };
+}
+
+function novaBlobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(
+      new Error("Could not read the reference image.")
+    );
+
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function novaCreateProjectJob(plan, projectId, characterId) {
+  const project = novaGetProject(projectId);
+
+  if (!project) {
+    throw new Error("The selected project does not exist.");
+  }
+
+  const character = novaGetCharacter(characterId);
+
+  if (!character) {
+    throw new Error("The selected character does not exist.");
+  }
+
+  // Belonging is decided by the character's own projectId, which
+  // novaCreateCharacter sets and novaUpdateCharacter protects.
+  // project.characterIds is a maintained mirror, never repaired here.
+  if (character.projectId !== project.id) {
+    throw new Error(
+      "The selected character does not belong to the selected project."
+    );
+  }
+
+  // Resolve the reference image: a new upload overrides the saved
+  // character image for this production only; otherwise the saved
+  // image is the default; otherwise the job has no image reference.
+  // The character record is never written here, so an upload can
+  // never overwrite the character's permanent reference image.
+  let imageAsset = null;
+  let imageSource = "none";
+
+  if (novaMotionImageFile) {
+    const uploaded = await novaStoreImage(novaMotionImageFile);
+
+    if (!uploaded || !uploaded.id) {
+      throw new Error(
+        "NOVA could not save the uploaded reference image. Please check browser storage."
+      );
+    }
+
+    imageAsset = {
+      id: uploaded.id,
+      name: uploaded.name,
+      type: uploaded.type,
+      size: uploaded.size
+    };
+    imageSource = "upload";
+  } else if (character.imageAssetId) {
+    const saved = await novaGetImage(character.imageAssetId);
+
+    if (!saved) {
+      throw new Error(
+        "The character's saved reference image is no longer available in this browser."
+      );
+    }
+
+    imageAsset = {
+      id: character.imageAssetId,
+      name: saved.name || null,
+      type: saved.type || null,
+      size: typeof saved.size === "number" ? saved.size : null
+    };
+    imageSource = "saved";
+  }
+
+  const accessToken = novaCreateAccessToken();
+
+  const productionPlan = JSON.parse(JSON.stringify(plan));
+
+  // The job's character reference names the SELECTED character, so
+  // scene characterRefIds point at the real character, not a
+  // throwaway per-job id.
+  const characterRef = {
+    id: character.id,
+    description: character.description,
+    imageAssetId: imageAsset ? imageAsset.id : null,
+    createdAt: character.createdAt
+  };
+
+  const job = {
+    id: novaNewId("nova-job"),
+    createdAt: new Date().toISOString(),
+    updatedAt: null,
+    status: "queued",
+
+    // The complete plan is retained for authenticated submission.
+    productionPlan,
+
+    // Existing local plan structure is preserved.
+    plan: {
+      prompt: plan.prompt,
+      character: plan.character,
+      mode: plan.mode,
+      ratio: plan.ratio,
+      duration: plan.duration,
+      style: plan.style,
+      camera: plan.camera,
+      image: imageAsset
+        ? {
+            name: imageAsset.name,
+            type: imageAsset.type,
+            size: imageAsset.size,
+            assetId: imageAsset.id
+          }
+        : plan.image || null
+    },
+
+    scenes: novaPrepareScenes(plan, characterRef),
+    provider: null,
+    characterRef,
+    accessToken,
+    result: null,
+    error: null,
+
+    projectId: project.id,
+    characterIds: [character.id],
+
+    // Immutable snapshots: deep copies of the character and the
+    // project's continuity at the moment of creation.
+    characterSnapshots: [
+      {
+        characterId: character.id,
+        version: character.version || 1,
+        name: character.name,
+        description: character.description,
+        appearance: JSON.parse(JSON.stringify(character.appearance || {})),
+        imageAssetId: imageAsset ? imageAsset.id : null,
+        imageSource,
+        continuityNotes: JSON.parse(
+          JSON.stringify(character.continuityNotes || [])
+        )
+      }
+    ],
+
+    continuitySnapshot: JSON.parse(
+      JSON.stringify(
+        project.continuity || {
+          worldDescription: "",
+          visualStyle: "",
+          rules: [],
+          notes: []
+        }
+      )
+    )
+  };
+
+  novaSaveJob(job);
+
+  // Never submit until the token and job are confirmed in localStorage.
+  const persistedJob = novaGetJob(job.id);
+
+  if (
+    !persistedJob ||
+    persistedJob.accessToken !== accessToken ||
+    !persistedJob.productionPlan ||
+    !persistedJob.characterSnapshots ||
+    !persistedJob.continuitySnapshot
   ) {
     throw new Error(
       "NOVA could not securely save the job credentials. Please check browser storage."
