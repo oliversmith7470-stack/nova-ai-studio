@@ -1202,7 +1202,7 @@
   </div>
 </section>
 <!-- END NOVA AI WRITING STUDIO -->  
-  
+
 <script>
 
 // NOVA MOTION 4.0 FUNCTIONS
@@ -1210,6 +1210,7 @@
 let novaMotionMode = "text";
 let novaMotionPlan = null;
 let novaMotionJob = null;
+let novaMotionPendingJobId = null;
 let novaMotionImageFile = null;
 
 function openMotionStudio() {
@@ -1517,7 +1518,7 @@ function buildMotionPlan() {
   });
 
 
-// Save the accepted production plan for the generation engine.
+ // Save the accepted production plan for the generation engine.
 const imageInput = document.getElementById("motionImage");
 
 novaMotionImageFile =
@@ -1598,10 +1599,10 @@ if (generateButton) {
   empty.style.display = "none";
   output.style.display = "block";
 }
+  
+  
 
-
-
-/* =========================================
+ /* =========================================
    NOVA MOTION PRODUCTION ENGINE
    Stage 3 — Integration Foundation
 ========================================= */
@@ -1636,17 +1637,39 @@ async function generateMotionVideo() {
     button.textContent = "Creating job...";
   }
 
-  // 1. NOVA creates and saves its own job BEFORE any provider contact.
-  //    The job stays accessible even when no provider exists.
   let job = null;
+
   try {
-    job = await novaCreateJob(novaMotionPlan);
+    // Reuse an existing pending job after an uncertain request.
+    if (novaMotionPendingJobId) {
+      job = novaGetJob(novaMotionPendingJobId);
+    }
+
+    // Otherwise create a fresh job and persist its token first.
+    if (!job) {
+      job = await novaCreateJob(novaMotionPlan);
+    }
+
+    if (
+      !job.accessToken ||
+      !job.productionPlan
+    ) {
+      throw new Error(
+        "The saved job is missing its access credentials or production plan."
+      );
+    }
+
   } catch (error) {
-    updateMotionStatus("Could not create the production job.", "failed");
+    updateMotionStatus(
+      error.message || "Could not create the production job.",
+      "failed"
+    );
+
     if (button) {
       button.disabled = false;
       button.textContent = "Retry Generation →";
     }
+
     return;
   }
 
@@ -1659,14 +1682,11 @@ async function generateMotionVideo() {
     button.textContent = "Submitting...";
   }
 
-  // 2. Check provider availability through the backend.
-  //    Only the backend's verified response advances the job's status —
-  //    the browser never marks a job completed on its own word.
   let httpStatus = 0;
+
   try {
     let imageDataUrl = null;
 
-    // Convert an uploaded reference image when one exists.
     if (novaMotionImageFile) {
       if (novaMotionImageFile.size > 5 * 1024 * 1024) {
         throw new Error(
@@ -1691,30 +1711,44 @@ async function generateMotionVideo() {
       {
         method: "POST",
         headers: {
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          "X-NOVA-JOB-TOKEN": job.accessToken
         },
         body: JSON.stringify({
           jobId: job.id,
-          plan: novaMotionPlan,
+          plan: job.productionPlan,
           imageDataUrl: imageDataUrl
         })
       }
     );
 
     httpStatus = response.status;
+
     const result = await response.json();
 
     novaMotionJob = result;
 
-    if (!response.ok) {
+    // The backend intentionally returns 503 when the job is saved
+    // but the video provider is unavailable.
+    const savedUnavailable =
+      response.status === 503 &&
+      result.jobId === job.id &&
+      result.status === "unavailable";
+
+    if (!response.ok && !savedUnavailable) {
       throw new Error(
-        result.message || "The video provider is not available."
+        result.message || "The production request was not accepted."
       );
     }
 
+    novaMotionPendingJobId = null;
+
     novaUpdateJob(job.id, {
       status: result.status || "queued",
-      provider: result.provider || null
+      provider: result.provider || null,
+      error: result.status === "unavailable"
+        ? result.message || null
+        : null
     });
 
     updateMotionStatus(
@@ -1726,15 +1760,26 @@ async function generateMotionVideo() {
       displayMotionVideo(result.videoUrl);
     }
 
-    if (result.status === "completed" && button) {
-      button.textContent = "Generate Again";
+    // Verify the persistent server record after the visibility window.
+    novaScheduleJobRefresh(job.id);
+
+    if (button) {
+      button.textContent =
+        result.status === "completed"
+          ? "Generate Again"
+          : "Retry Generation →";
     }
 
   } catch (error) {
-    // The job stays saved with its true status: unavailable when the
-    // backend reports no provider (503), failed for any other error.
+    // A network error or server error may occur after the job was saved.
+    // Preserve the ID and token so a retry uses the same credentials.
+    if (httpStatus === 0 || httpStatus >= 500) {
+      novaMotionPendingJobId = job.id;
+    } else {
+      novaMotionPendingJobId = null;
+    }
+
     novaUpdateJob(job.id, {
-      status: httpStatus === 503 ? "unavailable" : "failed",
       error: error.message || "Production request failed."
     });
 
@@ -1742,6 +1787,10 @@ async function generateMotionVideo() {
       error.message || "Production request failed.",
       "failed"
     );
+
+    if (httpStatus === 0 || httpStatus >= 500) {
+      novaScheduleJobRefresh(job.id);
+    }
 
     if (button) {
       button.textContent = "Retry Generation →";
@@ -1838,6 +1887,146 @@ function novaUpdateJob(id, patch) {
   Object.assign(job, patch);
   job.updatedAt = new Date().toISOString();
   return novaSaveJob(job);
+}
+
+function novaWait(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function novaSyncJobFromServer(jobId) {
+  const localJob = novaGetJob(jobId);
+
+  if (
+    !localJob ||
+    !localJob.accessToken
+  ) {
+    return false;
+  }
+
+  // The first check waits for the observed Blobs visibility delay.
+  const retryDelays = [0, 2000, 4000, 8000, 12000, 16000];
+
+  for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+    if (retryDelays[attempt] > 0) {
+      await novaWait(retryDelays[attempt]);
+    }
+
+    try {
+      const response = await fetch(
+        "/.netlify/functions/motion-status?jobId=" +
+          encodeURIComponent(jobId),
+        {
+          method: "GET",
+          headers: {
+            "X-NOVA-JOB-TOKEN": localJob.accessToken
+          }
+        }
+      );
+
+      const data = await response.json();
+
+      // A 404 can be temporary because Blobs is eventually consistent.
+      if (response.status === 404) {
+        continue;
+      }
+
+      if (response.status === 401) {
+        novaUpdateJob(jobId, {
+          error: "NOVA could not authenticate this saved job."
+        });
+        return false;
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          data.message || "Could not retrieve the saved job."
+        );
+      }
+
+      if (data.jobId !== jobId) {
+        throw new Error("The server returned an unexpected job.");
+      }
+
+      const currentJob = novaGetJob(jobId);
+
+      if (!currentJob) {
+        return false;
+      }
+
+      // Preserve local scene metadata while applying server statuses.
+      const serverScenes = Array.isArray(data.scenes)
+        ? data.scenes
+        : [];
+
+      const mergedScenes = currentJob.scenes.map(localScene => {
+        const serverScene = serverScenes.find(
+          scene => scene.index === localScene.index
+        );
+
+        if (!serverScene) {
+          return localScene;
+        }
+
+        return Object.assign({}, localScene, {
+          status: serverScene.status,
+          providerJobId: serverScene.providerJobId || null,
+          videoUrl: serverScene.videoUrl || null,
+          error: serverScene.error || null
+        });
+      });
+
+      novaUpdateJob(jobId, {
+        status: data.status,
+        provider: data.provider,
+        updatedAt: data.updatedAt,
+        productionPlan: data.plan || currentJob.productionPlan,
+        scenes: mergedScenes,
+        error: data.error || null
+      });
+
+      return true;
+
+    } catch (error) {
+      console.error(
+        "[NOVA MOTION] Status retrieval error:",
+        error
+      );
+
+      novaUpdateJob(jobId, {
+        error: error.message || "Status retrieval failed."
+      });
+
+      return false;
+    }
+  }
+
+  // Do not mark a job failed just because the store has not exposed it yet.
+  novaUpdateJob(jobId, {
+    error:
+      "The saved job is not visible yet. NOVA will check again later."
+  });
+
+  return false;
+}
+
+function novaScheduleJobRefresh(jobId) {
+  setTimeout(() => {
+    novaSyncJobFromServer(jobId);
+  }, 12000);
+}
+
+function novaRestoreJobs() {
+  const jobs = novaLoadJobs();
+
+  jobs.forEach(job => {
+    if (
+      job &&
+      job.id &&
+      job.accessToken
+    ) {
+      novaScheduleJobRefresh(job.id);
+    }
+  });
 }
 
 /* ---------- Image assets (IndexedDB — never localStorage) ----------
@@ -1937,25 +2126,43 @@ function novaPrepareScenes(plan, characterRef) {
    provider exists, the job becomes "unavailable" — and stays saved
    and accessible. */
 
+function novaCreateAccessToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+
+  return Array.from(bytes)
+    .map(byte => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 async function novaCreateJob(plan) {
   const imageAsset = novaMotionImageFile
     ? await novaStoreImage(novaMotionImageFile)
     : null;
 
-  // Correction 3: in Stage 3.1 the character reference belongs to the
-  // JOB. It becomes a reusable project-level identity in Stage 3.3.
   const characterRef = {
     id: novaNewId("nova-char"),
     description: plan.character || null,
-    imageAssetId: imageAsset && imageAsset.id ? imageAsset.id : null,
+    imageAssetId: imageAsset && imageAsset.id
+      ? imageAsset.id
+      : null,
     createdAt: new Date().toISOString()
   };
+
+  const accessToken = novaCreateAccessToken();
+
+  const productionPlan = JSON.parse(JSON.stringify(plan));
 
   const job = {
     id: novaNewId("nova-job"),
     createdAt: new Date().toISOString(),
     updatedAt: null,
     status: "queued",
+
+    // The complete plan is retained for authenticated submission.
+    productionPlan,
+
+    // Existing local plan structure is preserved.
     plan: {
       prompt: plan.prompt,
       character: plan.character,
@@ -1973,14 +2180,31 @@ async function novaCreateJob(plan) {
           }
         : plan.image || null
     },
+
     scenes: novaPrepareScenes(plan, characterRef),
     provider: null,
     characterRef,
+    accessToken,
     result: null,
     error: null
   };
 
-  return novaSaveJob(job);
+  novaSaveJob(job);
+
+  // Never submit until the token and job are confirmed in localStorage.
+  const persistedJob = novaGetJob(job.id);
+
+  if (
+    !persistedJob ||
+    persistedJob.accessToken !== accessToken ||
+    !persistedJob.productionPlan
+  ) {
+    throw new Error(
+      "NOVA could not securely save the job credentials. Please check browser storage."
+    );
+  }
+
+  return persistedJob;
 }
 
 /* ---------- Provider Interface (contract only, Stage 3.1) ----------
@@ -2202,6 +2426,10 @@ function novaRenderJobs() {
     document.getElementById("writingResult").style.display = "none";
     document.getElementById("writingStatus").textContent = "";
   }    
+
+// NOVA MOTION — Stage 3.3 startup restoration
+novaRenderJobs();
+novaRestoreJobs();
 </script>
 
 </body>
