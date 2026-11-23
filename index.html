@@ -2370,7 +2370,7 @@ async function generateMotionVideo() {
     }
 
     const response = await fetch(
-      "/.netlify/functions/motion-generate",
+      "/api/motion-generate",
       {
         method: "POST",
         headers: {
@@ -2819,7 +2819,7 @@ async function novaSyncJobFromServer(jobId) {
 
     try {
       const response = await fetch(
-        "/.netlify/functions/motion-status?jobId=" +
+        "/api/motion-status?jobId=" +
           encodeURIComponent(jobId),
         {
           method: "GET",
@@ -11236,7 +11236,7 @@ function novaRenderJobs() {
     result.value = "";
 
     try {
-      const response = await fetch("/.netlify/functions/gemini", {
+      const response = await fetch("/api/gemini", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
