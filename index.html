@@ -2240,6 +2240,579 @@ function novaRestoreJobs() {
   });
 }
 
+/* ---------- Legacy Character Migration (Stage 3.4B) ---------- */
+
+// Produces a stable identity key from the actual character description
+// and image asset reference. The old characterRef ID is deliberately ignored.
+function novaLegacyCharacterMigrationKey(characterRef) {
+  if (!characterRef || typeof characterRef.description !== "string") {
+    return null;
+  }
+
+  const description = characterRef.description
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+
+  if (!description) return null;
+
+  const imageAssetId =
+    typeof characterRef.imageAssetId === "string" &&
+    characterRef.imageAssetId.trim()
+      ? characterRef.imageAssetId
+      : null;
+
+  return JSON.stringify([description, imageAssetId]);
+}
+
+// Detects a relationship conflict for one recovered character identity.
+// Returns null when the existing records agree, or a conflict object
+// naming the competing projects when they do not. A conflict exists when:
+// - two or more projects carry the group's migration key (even with no
+//   character record: migration would otherwise select the first and
+//   leave another project claiming the same identity);
+// - the character's linked project already carries a different
+//   non-empty migration key (it belongs to another identity);
+// - the character's recorded project and the project identified
+//   independently by the migration key disagree (two live projects
+//   claim the identity, or the character's link names a missing project
+//   while the key names a live one).
+// Migration must never silently choose between them.
+function novaLegacyCharacterRelationshipConflict(group, characters, projects) {
+  const character = characters.find(
+    item => item && item.legacyMigrationKey === group.key
+  );
+
+  const keyProjects = projects.filter(
+    item => item && item.legacyMigrationKey === group.key
+  );
+
+  const linkedProject = character
+    ? projects.find(item => item && item.id === character.projectId)
+    : null;
+
+  const linkedProjectKey =
+    linkedProject &&
+    typeof linkedProject.legacyMigrationKey === "string" &&
+    linkedProject.legacyMigrationKey.trim()
+      ? linkedProject.legacyMigrationKey
+      : null;
+
+  // Duplicate key-bearing projects are a conflict even when no
+  // character record exists.
+  if (keyProjects.length > 1) {
+    return {
+      description: group.description,
+      imageAssetId: group.imageAssetId,
+      jobIds: group.jobIds,
+      characterId: character ? character.id : null,
+      linkedProjectId: linkedProject ? linkedProject.id : null,
+      keyProjectIds: keyProjects.map(project => project.id),
+      linkedProjectKey
+    };
+  }
+
+  if (!character) return null;
+
+  // The linked project already belongs to another recovered identity:
+  // it must not be silently reused for this one.
+  if (linkedProjectKey && linkedProjectKey !== group.key) {
+    return {
+      description: group.description,
+      imageAssetId: group.imageAssetId,
+      jobIds: group.jobIds,
+      characterId: character.id,
+      linkedProjectId: linkedProject.id,
+      keyProjectIds: keyProjects.map(project => project.id),
+      linkedProjectKey
+    };
+  }
+
+  if (keyProjects.length === 0) return null;
+
+  // Consistent only when exactly one project carries the key and it is
+  // the character's own linked project.
+  if (
+    linkedProject &&
+    keyProjects.length === 1 &&
+    keyProjects[0].id === linkedProject.id
+  ) {
+    return null;
+  }
+
+  return {
+    description: group.description,
+    imageAssetId: group.imageAssetId,
+    jobIds: group.jobIds,
+    characterId: character.id,
+    linkedProjectId: linkedProject ? linkedProject.id : null,
+    keyProjectIds: keyProjects.map(project => project.id),
+    linkedProjectKey
+  };
+}
+
+// Creates a read-only migration report.
+// This function does not write to localStorage or IndexedDB.
+function novaPreviewLegacyCharacterMigration() {
+  try {
+    const jobs = novaLoadJobs();
+    const projects = novaLoadProjects();
+    const characters = novaLoadCharacters();
+
+    const groups = new Map();
+
+    const skipped = {
+      alreadyLinked: 0,
+      missingCharacterRef: 0,
+      missingDescription: 0
+    };
+
+    jobs.forEach(job => {
+      if (!job || !job.id) return;
+
+      if (job.projectId) {
+        skipped.alreadyLinked++;
+        return;
+      }
+
+      if (!job.characterRef) {
+        skipped.missingCharacterRef++;
+        return;
+      }
+
+      const key = novaLegacyCharacterMigrationKey(job.characterRef);
+
+      if (!key) {
+        skipped.missingDescription++;
+        return;
+      }
+
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          description: job.characterRef.description.trim(),
+          imageAssetId: job.characterRef.imageAssetId || null,
+          jobIds: []
+        });
+      }
+
+      groups.get(key).jobIds.push(job.id);
+    });
+
+    const reportGroups = Array.from(groups.values()).map(group => {
+      const existingCharacter = characters.find(
+        character =>
+          character &&
+          character.legacyMigrationKey === group.key
+      );
+
+      const linkedProject = existingCharacter
+        ? projects.find(
+            project => project && project.id === existingCharacter.projectId
+          )
+        : null;
+
+      // A project is found independently by migration key, so an
+      // interrupted run that saved the project but not the character
+      // is still detected and reused.
+      const keyProject = projects.find(
+        project =>
+          project &&
+          project.legacyMigrationKey === group.key
+      );
+
+      // Prefer the character's own project link when it resolves.
+      const existingProject = linkedProject || keyProject || null;
+
+      // A conflicted group is reported explicitly, never presented as
+      // an ordinary reusable record.
+      const conflict = novaLegacyCharacterRelationshipConflict(
+        group,
+        characters,
+        projects
+      );
+
+      return {
+        description: group.description,
+        imageAssetId: group.imageAssetId,
+        jobIds: group.jobIds,
+        jobCount: group.jobIds.length,
+        existingCharacterId: existingCharacter
+          ? existingCharacter.id
+          : null,
+        existingProjectId: conflict
+          ? (linkedProject ? linkedProject.id : null)
+          : (existingProject ? existingProject.id : null),
+        projectRequired: !existingProject,
+        characterRequired: !existingCharacter,
+        conflict
+      };
+    });
+
+    return {
+      ok: true,
+      dryRun: true,
+      totalJobs: jobs.length,
+      eligibleJobs: reportGroups.reduce(
+        (total, group) => total + group.jobCount,
+        0
+      ),
+      distinctCharacterGroups: reportGroups.length,
+      newProjectsRequired: reportGroups.filter(
+        group => group.projectRequired
+      ).length,
+      newCharactersRequired: reportGroups.filter(
+        group => group.characterRequired
+      ).length,
+      skipped,
+      conflicts: reportGroups
+        .filter(group => group.conflict)
+        .map(group => group.conflict),
+      groups: reportGroups
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      dryRun: true,
+      error: error.message || "Migration preview failed."
+    };
+  }
+}
+
+// Executes migration only when explicitly called.
+// Existing jobs, access tokens, plans, scenes and characterRef objects
+// are preserved. No IndexedDB image data is modified.
+function novaMigrateLegacyCharacters() {
+  const preview = novaPreviewLegacyCharacterMigration();
+
+  if (!preview.ok) return preview;
+
+  // A relationship conflict means the stored records disagree about
+  // which project a character belongs to. Abort before writing
+  // anything — NOVA must not silently choose between them.
+  if (preview.conflicts && preview.conflicts.length > 0) {
+    return {
+      ok: false,
+      migrated: false,
+      error: "Migration aborted: " + preview.conflicts.length +
+        " character project relationship conflict(s) must be resolved before migration can run.",
+      conflicts: preview.conflicts,
+      preview
+    };
+  }
+
+  if (preview.eligibleJobs === 0) {
+    return {
+      ok: true,
+      migrated: false,
+      message: "No eligible legacy character jobs were found.",
+      preview
+    };
+  }
+
+  const originalProjectRaw = localStorage.getItem(NOVA_PROJECTS_KEY);
+  const originalCharacterRaw = localStorage.getItem(NOVA_CHARACTERS_KEY);
+  const originalJobsRaw = localStorage.getItem(NOVA_JOBS_KEY);
+
+  try {
+    const projects = novaLoadProjects();
+    const characters = novaLoadCharacters();
+    const jobs = novaLoadJobs();
+
+    let migratedJobs = 0;
+    let createdProjects = 0;
+    let createdCharacters = 0;
+    let reusedProjects = 0;
+    let reusedCharacters = 0;
+
+    const groups = new Map();
+
+    jobs.forEach(job => {
+      if (!job || !job.id || job.projectId || !job.characterRef) {
+        return;
+      }
+
+      const key = novaLegacyCharacterMigrationKey(job.characterRef);
+
+      if (!key) return;
+
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          description: job.characterRef.description.trim(),
+          imageAssetId: job.characterRef.imageAssetId || null,
+          jobIds: []
+        });
+      }
+
+      groups.get(key).jobIds.push(job.id);
+    });
+
+    for (const group of groups.values()) {
+      let character = characters.find(
+        item => item && item.legacyMigrationKey === group.key
+      );
+
+      // A project is found independently by migration key, so an
+      // interrupted run that saved the project but not the character
+      // is still detected and reused instead of duplicated.
+      let project = projects.find(
+        item => item && item.legacyMigrationKey === group.key
+      );
+
+      // Prefer the character's own project link when it resolves.
+      if (character) {
+        const linkedProject = projects.find(
+          item => item && item.id === character.projectId
+        );
+        if (linkedProject) project = linkedProject;
+      }
+
+      const now = new Date().toISOString();
+
+      // Create only the project when it is missing. When a character
+      // already exists, the recovered project keeps the character's
+      // original project ID and creation time.
+      if (!project) {
+        project = {
+          id: character ? character.projectId : novaNewId("nova-project"),
+          name: "Recovered: " + group.description.slice(0, 70),
+          description: "Automatically recovered from existing NOVA production jobs.",
+          createdAt: character && character.createdAt ? character.createdAt : now,
+          updatedAt: null,
+          characterIds: [],
+          continuity: {
+            worldDescription: "",
+            visualStyle: "",
+            rules: [],
+            notes: []
+          },
+          legacyMigrationKey: group.key
+        };
+
+        projects.unshift(project);
+        createdProjects++;
+      } else {
+        reusedProjects++;
+      }
+
+      // A reused linked project may predate migration keys. Assign the
+      // group's key so post-persistence verification can find it and a
+      // later run recognises the project as recovered. Its ID, creation
+      // date and existing character relationships are preserved. The
+      // write-back is unconditional: the linking block below only writes
+      // the project back when the character is newly added, so without
+      // this the key would be lost whenever the character was already
+      // listed in characterIds.
+      // A whitespace-only key counts as missing, matching the detector's
+      // trimmed-string treatment: otherwise verification would fail on
+      // the malformed key and roll the migration back.
+      const hasMigrationKey =
+        typeof project.legacyMigrationKey === "string" &&
+        project.legacyMigrationKey.trim();
+
+      if (!hasMigrationKey) {
+        project = { ...project, legacyMigrationKey: group.key };
+
+        const projectIndex = projects.findIndex(
+          item => item.id === project.id
+        );
+
+        if (projectIndex >= 0) {
+          projects[projectIndex] = project;
+        } else {
+          projects.unshift(project);
+        }
+      }
+
+      // Create only the character when it is missing, linked to the
+      // (possibly reused) project recovered above.
+      if (!character) {
+        character = {
+          id: novaNewId("nova-char"),
+          projectId: project.id,
+          name: "Recovered Character",
+          description: group.description,
+          appearance: {
+            species: "",
+            colors: "",
+            distinctiveFeatures: "",
+            permanentDetails: []
+          },
+          imageAssetId: group.imageAssetId,
+          continuityNotes: [],
+          version: 1,
+          createdAt: now,
+          updatedAt: null,
+          legacyMigrationKey: group.key
+        };
+
+        characters.unshift(character);
+        createdCharacters++;
+      } else {
+        // The character's recorded project relationship is preserved
+        // as found. A disagreement with the migration key is a
+        // conflict, and the migration aborts before reaching this
+        // point — it is never silently rewritten here.
+        reusedCharacters++;
+      }
+
+      const characterIds = Array.isArray(project.characterIds)
+        ? project.characterIds
+        : [];
+
+      if (!characterIds.includes(character.id)) {
+        project = {
+          ...project,
+          characterIds: [...characterIds, character.id]
+        };
+
+        const projectIndex = projects.findIndex(
+          item => item.id === project.id
+        );
+
+        if (projectIndex >= 0) {
+          projects[projectIndex] = project;
+        } else {
+          projects.unshift(project);
+        }
+      }
+
+      const continuitySnapshot = JSON.parse(
+        JSON.stringify(project.continuity || {
+          worldDescription: "",
+          visualStyle: "",
+          rules: [],
+          notes: []
+        })
+      );
+
+      const characterSnapshot = JSON.parse(
+        JSON.stringify(character)
+      );
+
+      group.jobIds.forEach(jobId => {
+        const jobIndex = jobs.findIndex(item => item && item.id === jobId);
+
+        if (jobIndex < 0) return;
+
+        const job = jobs[jobIndex];
+
+        // Never overwrite an existing project relationship.
+        if (job.projectId) return;
+
+        jobs[jobIndex] = {
+          ...job,
+          projectId: project.id,
+          characterIds: [character.id],
+          characterSnapshots: [characterSnapshot],
+          continuitySnapshot
+        };
+
+        migratedJobs++;
+      });
+    }
+
+    // Persist all three collections. If any write fails, restore
+    // their original raw values rather than leaving a partial migration.
+    localStorage.setItem(NOVA_PROJECTS_KEY, JSON.stringify(projects));
+    localStorage.setItem(NOVA_CHARACTERS_KEY, JSON.stringify(characters));
+    localStorage.setItem(NOVA_JOBS_KEY, JSON.stringify(jobs));
+
+    // Verify the persisted collections before reporting success.
+    const savedProjects = JSON.parse(
+      localStorage.getItem(NOVA_PROJECTS_KEY) || "[]"
+    );
+    const savedCharacters = JSON.parse(
+      localStorage.getItem(NOVA_CHARACTERS_KEY) || "[]"
+    );
+    const savedJobs = JSON.parse(
+      localStorage.getItem(NOVA_JOBS_KEY) || "[]"
+    );
+
+    if (
+      !Array.isArray(savedProjects) ||
+      !Array.isArray(savedCharacters) ||
+      !Array.isArray(savedJobs) ||
+      savedJobs.length !== jobs.length ||
+      savedProjects.length !== projects.length ||
+      savedCharacters.length !== characters.length
+    ) {
+      throw new Error("Migration persistence verification failed.");
+    }
+
+    // Verify every migrated project-character relationship survived
+    // persistence: the character must exist, its project must exist,
+    // the character must point at that project, and the project must
+    // list the character.
+    for (const group of groups.values()) {
+      const savedCharacter = savedCharacters.find(
+        item => item && item.legacyMigrationKey === group.key
+      );
+      const savedProject = savedProjects.find(
+        item => item && item.legacyMigrationKey === group.key
+      );
+
+      if (
+        !savedCharacter ||
+        !savedProject ||
+        savedCharacter.projectId !== savedProject.id ||
+        !Array.isArray(savedProject.characterIds) ||
+        !savedProject.characterIds.includes(savedCharacter.id)
+      ) {
+        throw new Error("Migration relationship verification failed.");
+      }
+    }
+
+    novaRenderJobs();
+
+    return {
+      ok: true,
+      migrated: true,
+      migratedJobs,
+      createdProjects,
+      createdCharacters,
+      reusedProjects,
+      reusedCharacters,
+      skipped: preview.skipped
+    };
+  } catch (error) {
+    // Restore the exact original values, including absent keys.
+    try {
+      if (originalProjectRaw === null) {
+        localStorage.removeItem(NOVA_PROJECTS_KEY);
+      } else {
+        localStorage.setItem(NOVA_PROJECTS_KEY, originalProjectRaw);
+      }
+
+      if (originalCharacterRaw === null) {
+        localStorage.removeItem(NOVA_CHARACTERS_KEY);
+      } else {
+        localStorage.setItem(NOVA_CHARACTERS_KEY, originalCharacterRaw);
+      }
+
+      if (originalJobsRaw === null) {
+        localStorage.removeItem(NOVA_JOBS_KEY);
+      } else {
+        localStorage.setItem(NOVA_JOBS_KEY, originalJobsRaw);
+      }
+    } catch (rollbackError) {
+      return {
+        ok: false,
+        migrated: false,
+        error: "Migration failed and automatic rollback also encountered a storage error. Do not retry until storage has been inspected.",
+        rollbackError: rollbackError.message || "Unknown rollback error."
+      };
+    }
+
+    return {
+      ok: false,
+      migrated: false,
+      error: error.message || "Migration failed. Original records were restored."
+    };
+  }
+}
+
 /* ---------- Image assets (IndexedDB — never localStorage) ----------
    Job records hold image metadata + an asset id only. The actual image
    bytes live in IndexedDB, so a large reference image cannot blow the
