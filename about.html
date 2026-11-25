@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#080b18">
+  <meta name="description" content="About NOVA AI Studio — Omoyeni Shina John, Founder of NOVA AI Studio.">
+  <title>About — NOVA AI Studio</title>
+
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    :root {
+      --bg: #080b18;
+      --panel: #11162a;
+      --border: #2a2f45;
+      --gold: #c9a227;
+      --gold-soft: #e3c766;
+      --text: #f4f1e6;
+      --muted: #a9b0c4;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: Georgia, "Times New Roman", serif;
+      min-height: 100vh;
+      line-height: 1.8;
+    }
+
+    a {
+      color: var(--gold-soft);
+    }
+
+    .about-nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 28px 24px 0;
+      font-family: Arial, sans-serif;
+    }
+
+    .about-brand {
+      font-size: 19px;
+      font-weight: 800;
+      letter-spacing: 1px;
+      color: var(--text);
+      text-decoration: none;
+    }
+
+    .about-brand span {
+      color: var(--gold);
+    }
+
+    .about-nav-links {
+      display: flex;
+      gap: 22px;
+      font-size: 14px;
+    }
+
+    .about-nav-links a {
+      color: var(--muted);
+      text-decoration: none;
+    }
+
+    .about-nav-links a:hover,
+    .about-nav-links a[aria-current="page"] {
+      color: var(--gold-soft);
+    }
+
+    .about-main {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 56px 24px 80px;
+    }
+
+    .about-portrait {
+      margin: 0 auto 48px;
+      max-width: 340px;
+      border: 1px solid var(--gold);
+      border-radius: 4px;
+      padding: 10px;
+      background: var(--panel);
+    }
+
+    .about-portrait img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: 2px;
+    }
+
+    .about-portrait figcaption {
+      padding-top: 12px;
+      font-family: Arial, sans-serif;
+      font-size: 13px;
+      letter-spacing: 1px;
+      text-align: center;
+      color: var(--muted);
+    }
+
+    h1 {
+      font-size: 42px;
+      font-weight: 400;
+      letter-spacing: 0.5px;
+      line-height: 1.25;
+      margin-bottom: 8px;
+    }
+
+    .about-identity {
+      font-size: 21px;
+      color: var(--gold-soft);
+      margin-bottom: 20px;
+    }
+
+    .about-titles {
+      font-size: 18px;
+      color: var(--muted);
+      margin-bottom: 64px;
+    }
+
+    .about-titles strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    section {
+      margin-bottom: 56px;
+    }
+
+    h2 {
+      font-size: 26px;
+      font-weight: 400;
+      color: var(--gold);
+      margin-bottom: 18px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    p {
+      font-size: 18px;
+      margin-bottom: 16px;
+    }
+
+    ol {
+      list-style: none;
+      counter-reset: about-item;
+    }
+
+    ol li {
+      counter-increment: about-item;
+      font-size: 18px;
+      padding: 14px 0 14px 56px;
+      position: relative;
+      border-bottom: 1px solid var(--border);
+    }
+
+    ol li::before {
+      content: counter(about-item, decimal-leading-zero);
+      position: absolute;
+      left: 0;
+      top: 16px;
+      font-family: Arial, sans-serif;
+      font-size: 14px;
+      color: var(--gold);
+      letter-spacing: 1px;
+    }
+
+    .about-contact-email {
+      font-family: Arial, sans-serif;
+      font-size: 18px;
+    }
+
+    .about-footer {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 0 24px 48px;
+      font-family: Arial, sans-serif;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .about-footer a {
+      color: var(--gold-soft);
+    }
+  </style>
+</head>
+
+<body>
+
+  <nav class="about-nav" aria-label="Site">
+    <a class="about-brand" href="index.html">NOVA <span>AI STUDIO</span></a>
+    <div class="about-nav-links">
+      <a href="index.html">Home</a>
+      <a href="about.html" aria-current="page">About</a>
+    </div>
+  </nav>
+
+  <main class="about-main">
+
+    <figure class="about-portrait">
+      <img src="assets/about/owner-photo.jpg" alt="Portrait of Omoyeni Shina John, Founder of NOVA AI Studio" width="741" height="1024">
+      <figcaption>OMOYENI SHINA JOHN — FOUNDER OF NOVA AI STUDIO</figcaption>
+    </figure>
+
+    <h1>About Shina</h1>
+
+    <p class="about-identity"><strong>Omoyeni Shina John — Founder of NOVA AI Studio.</strong></p>
+
+    <p class="about-titles">Founder and Developer of NOVA AI Studio. Relationship Coach. Author of <strong>BEYOND EMOTIONS — The One Thing That Enthralls a Man's Heart</strong>. Filmmaker.</p>
+
+    <section>
+      <h2>Why we built NOVA</h2>
+      <p>We built NOVA because the tools for telling a story in moving pictures were locked behind three things: prices, quotas, and waiting lines. If you had a story but no budget, the door was closed.</p>
+      <p>We want anyone with a story to be able to make a film — free. We will never put a paywall between a creator and their story.</p>
+    </section>
+
+    <section>
+      <h2>What NOVA is</h2>
+      <p>NOVA AI Studio is a free AI video-generation studio. You type what you imagine, and you get a real video back. No subscriptions. No daily limits. No queues.</p>
+    </section>
+
+    <section>
+      <h2>What we believe</h2>
+      <ol>
+        <li>A story should never need a budget to be told.</li>
+        <li>Free means free — no subscriptions, no daily limits, no queues.</li>
+        <li>The tool should do the hard work, not the creator.</li>
+        <li>Honesty about limits — free generation, subject to the computing capacity available at that moment, said plainly.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Our goals</h2>
+      <ol>
+        <li>Free video generation for everyone, always.</li>
+        <li>Real cinema quality from a text prompt.</li>
+        <li>A studio that grows with its creators — more models, longer films, more languages.</li>
+        <li>Never a paywall between a creator and their story.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Today</h2>
+      <p>NOVA's own engine has already generated its first videos. The studio itself is still being built — this page will grow as it does.</p>
+    </section>
+
+    <section>
+      <h2>Contact</h2>
+      <p>Business email: <a class="about-contact-email" href="mailto:novaaistudio.com@gmail.com">novaaistudio.com@gmail.com</a></p>
+      <p>Write to us. We read everything ourselves.</p>
+    </section>
+
+  </main>
+
+  <footer class="about-footer">
+    © 2026 NOVA AI STUDIO. <a href="index.html">Back to the studio</a>
+  </footer>
+
+</body>
+</html>

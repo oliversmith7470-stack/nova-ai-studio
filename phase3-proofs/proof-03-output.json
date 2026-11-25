@@ -1,0 +1,31 @@
+{
+  "result": [
+    {
+      "uuid": "2f007da2-f9db-4f83-ac68-782571dbbd8e",
+      "name": "nova-a2-test",
+      "created_at": "2026-11-24T14:10:11.390Z",
+      "version": "production",
+      "jurisdiction": null,
+      "num_tables": 0,
+      "file_size": 20480
+    },
+    {
+      "uuid": "138fc3d6-2b86-4ccb-baa1-70f124b69a32",
+      "name": "nova-motion-jobs",
+      "created_at": "2026-11-23T21:16:35.173Z",
+      "version": "production",
+      "jurisdiction": null,
+      "num_tables": 0,
+      "file_size": 28672
+    }
+  ],
+  "errors": [],
+  "messages": [],
+  "success": true,
+  "result_info": {
+    "count": 2,
+    "page": 1,
+    "per_page": 100,
+    "total_count": 2
+  }
+}
