@@ -190,6 +190,48 @@
     .about-footer a {
       color: var(--gold-soft);
     }
+
+    /* Licence disclosure (Phase 3 §19.2). The quoted clauses are the
+       licence's own wording, verbatim (LTXV Open Weights License 0.X). */
+    .about-disclosure {
+      border: 1px solid var(--gold);
+      border-radius: 4px;
+      background: var(--panel);
+      padding: 18px 20px;
+      margin-top: 20px;
+    }
+
+    .about-disclosure p {
+      font-size: 16px;
+    }
+
+    .about-disclosure p:last-child {
+      margin-bottom: 0;
+    }
+
+    .about-restrictions blockquote {
+      border-left: 2px solid var(--gold);
+      padding-left: 18px;
+      margin: 0 0 16px;
+      font-size: 17px;
+      color: var(--muted);
+    }
+
+    .about-restrictions blockquote p {
+      font-size: 17px;
+      margin-bottom: 0;
+    }
+
+    .about-restrictions-list {
+      list-style: none;
+      padding-left: 0;
+      margin-bottom: 16px;
+    }
+
+    .about-restrictions-list li {
+      font-size: 17px;
+      padding: 6px 0;
+    }
   </style>
 </head>
 
@@ -225,6 +267,42 @@
     <section>
       <h2>What NOVA is</h2>
       <p>NOVA AI Studio is a free AI video-generation studio. You type what you imagine, and you get a real video back. No subscriptions. No daily limits. No queues.</p>
+      <aside class="about-disclosure" aria-label="Machine-generated content disclosure">
+        <p><strong>Machine-generated content:</strong> Videos generated on NOVA AI Studio are machine generated.</p>
+        <p>LTXV Open Weights License 0.X, Attachment A(e): &ldquo;(e) To generate or disseminate information and/or content (e.g. images, code, posts, articles), and place the information and/or content in any context (e.g. bot generating tweets) without expressly and intelligibly disclaiming that the information and/or content is machine generated;&rdquo;</p>
+        <p><a href="#use-restrictions">Use restrictions that apply to generated videos</a></p>
+      </aside>
+    </section>
+
+    <section class="about-restrictions" id="use-restrictions">
+      <h2>Use restrictions</h2>
+      <p>Videos on NOVA are generated with the LTX-Video 2B model, licensed under the LTXV Open Weights License 0.X. That licence places use-based restrictions on the model and on anything it generates. The licence's own words:</p>
+      <blockquote>
+        <p>3.1. Use-based restrictions as referenced in paragraph 4 MUST be included as an enforceable provision by you in any type of legal agreement (e.g. a license) governing the use and/or distribution of the Model or Derivatives of the Model, and you shall give notice to subsequent users you distribute to, that the Model or Derivatives of the Model are subject to paragraph 4. This provision does not apply to the use of Complementary Material.</p>
+      </blockquote>
+      <blockquote>
+        <p>4. Use-based restrictions. The restrictions set forth in Attachment A are considered Use-based restrictions. Therefore, you cannot use the Model and the Derivatives of the Model in violation of the specified restricted uses. You may use the Model subject to this Agreement, including only for lawful purposes and in accordance with the Agreement. &ldquo;Use&rdquo; may include creating any content with, fine-tuning, updating, running, training, evaluating and/or re-parametrizing the Model. You shall require all of your users who use the Model or a Derivative of the Model to comply with the terms of this paragraph 4.</p>
+      </blockquote>
+      <p>Attachment A — You agree not to use the Model or its Derivatives in any of the following ways:</p>
+      <ul class="about-restrictions-list">
+        <li>(a) In any way that violates any applicable national, federal, state, local or international law or regulation;</li>
+        <li>(b) For the purpose of exploiting, Harming or attempting to exploit or Harm minors in any way;</li>
+        <li>(c) To generate or disseminate false information and/or content with the purpose of Harming others;</li>
+        <li>(d) To generate or disseminate personal identifiable information that can be used to Harm an individual;</li>
+        <li>(e) To generate or disseminate information and/or content (e.g. images, code, posts, articles), and place the information and/or content in any context (e.g. bot generating tweets) without expressly and intelligibly disclaiming that the information and/or content is machine generated;</li>
+        <li>(f) To defame, disparage or otherwise harass others;</li>
+        <li>(g) To impersonate or attempt to impersonate (e.g. deepfakes) others without their consent;</li>
+        <li>(h) For fully automated decision making that adversely impacts an individual's legal rights or otherwise creates or modifies a binding, enforceable obligation;</li>
+        <li>(i) For any use intended to or which has the effect of discriminating against or Harming individuals or groups based on online or offline social behavior or known or predicted personal or personality characteristics;</li>
+        <li>(j) To exploit any of the vulnerabilities of a specific group of persons based on their age, social, physical or mental characteristics, in order to materially distort the behavior of a person pertaining to that group in a manner that causes or is likely to cause that person or another person physical or psychological Harm;</li>
+        <li>(k) For any use intended to or which has the effect of discriminating against individuals or groups based on legally protected characteristics or categories;</li>
+        <li>(a) To provide medical advice and medical results interpretation;</li>
+        <li>(l) To generate and/or disseminate information for the purpose to be used for administration of justice, law enforcement, immigration or asylum processes, such as predicting an individual will commit fraud/crime commitment (e.g. by text profiling, drawing causal relationships between assertions made in documents, indiscriminate and arbitrarily-targeted use);</li>
+        <li>(m) To generate and/or disseminate malware (including &ndash; but not limited to &ndash; ransomware) or any other content to be used for the purpose of harming electronic systems;</li>
+        <li>(n) To engage in, promote, incite, or facilitate discrimination or other unlawful of harmful conduct in the provision of employment, employment benefits, credit, housing, or other essential goods and services;</li>
+        <li>(o) To engage in, promote, incite, or facilitate the harassment, abuse, threatening, or bullying of individuals or groups of individuals.</li>
+      </ul>
+      <p>By generating a video on NOVA, you agree to use it only within these restrictions.</p>
     </section>
 
     <section>

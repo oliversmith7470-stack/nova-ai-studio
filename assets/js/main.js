@@ -600,6 +600,15 @@ async function generateMotionVideo() {
     return;
   }
 
+  // Phase 3 §19.2: before a first generation, the user sees the
+  // licence's use restrictions in full and acknowledges them. The
+  // acknowledgement is stored in this browser only; later
+  // generations proceed without showing it again.
+  if (!novaLicenceNoticeAcknowledged()) {
+    novaShowLicenceNotice();
+    return;
+  }
+
   const button = document.getElementById("motionGenerateButton");
 
   if (button) {
@@ -9459,6 +9468,51 @@ function novaCancelCreation() {
   const container = document.getElementById("motionCreationConfirm");
   if (container) container.innerHTML = "";
   novaMotionCreationConfirmed = false;
+}
+
+// ---- Licence notice before a first generation (Section 19.2) ----------
+
+const NOVA_LICENCE_NOTICE_KEY = "nova-licence-notice-acknowledged";
+
+function novaLicenceNoticeAcknowledged() {
+  try {
+    return localStorage.getItem(NOVA_LICENCE_NOTICE_KEY) === "yes";
+  } catch (error) {
+    return false;
+  }
+}
+
+// Renders the full §3.1/§4 user restrictions + Attachment A(e) into
+// #motionCreationConfirm and waits for the user to acknowledge before
+// any generation is created. The notice text is the licence's own
+// wording, verbatim (LTXV Open Weights License 0.X).
+function novaShowLicenceNotice() {
+  const container = document.getElementById("motionCreationConfirm");
+  if (!container) return;
+  container.innerHTML =
+    `<div class="ws-confirm"><p><strong>Before your first video: use restrictions</strong></p>` +
+    `<p>Videos on NOVA are machine generated (LTX-Video 2B, LTXV Open Weights License 0.X). The licence restricts how the model and its outputs may be used. In the licence's own words:</p>` +
+    `<p>3.1. Use-based restrictions as referenced in paragraph 4 MUST be included as an enforceable provision by you in any type of legal agreement (e.g. a license) governing the use and/or distribution of the Model or Derivatives of the Model, and you shall give notice to subsequent users you distribute to, that the Model or Derivatives of the Model are subject to paragraph 4. This provision does not apply to the use of Complementary Material.</p>` +
+    `<p>4. Use-based restrictions. The restrictions set forth in Attachment A are considered Use-based restrictions. Therefore, you cannot use the Model and the Derivatives of the Model in violation of the specified restricted uses. You may use the Model subject to this Agreement, including only for lawful purposes and in accordance with the Agreement. &ldquo;Use&rdquo; may include creating any content with, fine-tuning, updating, running, training, evaluating and/or re-parametrizing the Model. You shall require all of your users who use the Model or a Derivative of the Model to comply with the terms of this paragraph 4.</p>` +
+    `<p>Attachment A(e): &ldquo;(e) To generate or disseminate information and/or content (e.g. images, code, posts, articles), and place the information and/or content in any context (e.g. bot generating tweets) without expressly and intelligibly disclaiming that the information and/or content is machine generated;&rdquo; The full list of restrictions is on the <a href="about.html#use-restrictions">About page</a>.</p>` +
+    `<div class="ws-row">` +
+    `<button type="button" class="ws-btn ws-btn-primary" data-nova-click="novaAcknowledgeLicenceNotice">I understand — continue</button> ` +
+    `<button type="button" class="ws-btn" data-nova-click="novaCancelCreation">Cancel</button>` +
+    `</div></div>`;
+}
+
+// The acknowledge button: records the acknowledgement in this
+// browser, then re-invokes the generation that was waiting.
+function novaAcknowledgeLicenceNotice() {
+  const container = document.getElementById("motionCreationConfirm");
+  if (container) container.innerHTML = "";
+  try {
+    localStorage.setItem(NOVA_LICENCE_NOTICE_KEY, "yes");
+  } catch (error) {
+    // A browser that refuses storage still proceeds: the notice
+    // was shown and acknowledged in this session.
+  }
+  generateMotionVideo();
 }
 
 /* ---- End of Stage 3.5B: Production State Manager ---------------------- */

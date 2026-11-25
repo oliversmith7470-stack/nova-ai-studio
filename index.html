@@ -803,6 +803,32 @@
   margin-top: 13px;
 }
 
+/* Licence disclosure (Phase 3 §19.2): visible copy beside the
+   generate button and on the download surface — never buried in
+   a footer. The A(e) clause is the licence's own wording, verbatim. */
+.motion-disclosure {
+  border: 1px solid #c9a227;
+  border-radius: 8px;
+  background: #171d34;
+  padding: 12px 14px;
+  margin-top: 13px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #c6cede;
+}
+
+.motion-disclosure p {
+  margin: 0 0 8px;
+}
+
+.motion-disclosure p:last-child {
+  margin-bottom: 0;
+}
+
+.motion-disclosure a {
+  color: #e3c766;
+}
+
 @media (max-width: 750px) {
   .motion-grid {
     grid-template-columns: 1fr;
@@ -1524,6 +1550,12 @@
             Generate Video →
           </button>
 
+          <aside class="motion-disclosure" aria-label="Machine-generated content disclosure">
+            <p><strong>Machine-generated content:</strong> Videos generated on NOVA AI Studio are machine generated.</p>
+            <p>LTXV Open Weights License 0.X, Attachment A(e): &ldquo;(e) To generate or disseminate information and/or content (e.g. images, code, posts, articles), and place the information and/or content in any context (e.g. bot generating tweets) without expressly and intelligibly disclaiming that the information and/or content is machine generated;&rdquo;</p>
+            <p><a href="about.html#use-restrictions">Use restrictions that apply to generated videos</a></p>
+          </aside>
+
           <div id="motionCreationConfirm"></div>
 
           <p class="motion-note">
@@ -1556,6 +1588,11 @@
               Your cinematic preview will appear here when video generation is connected.
             </div>
           </div>
+          <aside class="motion-disclosure" aria-label="Machine-generated content disclosure">
+            <p><strong>Machine-generated content:</strong> Videos generated on NOVA AI Studio are machine generated.</p>
+            <p>LTXV Open Weights License 0.X, Attachment A(e): &ldquo;(e) To generate or disseminate information and/or content (e.g. images, code, posts, articles), and place the information and/or content in any context (e.g. bot generating tweets) without expressly and intelligibly disclaiming that the information and/or content is machine generated;&rdquo;</p>
+            <p><a href="about.html#use-restrictions">Use restrictions that apply to generated videos</a></p>
+          </aside>
         </section>
 
         <section class="motion-panel">
