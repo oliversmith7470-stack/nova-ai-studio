@@ -1,0 +1,61 @@
+# NOVA AI Studio — retention reconciliation scheduler.
+#
+# Cloudflare Pages Functions have no cron triggers, so the 15-minute
+# retention reconciliation in _worker.js (handleScheduled) cannot run on
+# a schedule by itself. This workflow calls the authenticated internal
+# endpoint POST /internal/reconcile every 15 minutes instead. The
+# endpoint runs the SAME reconciliation (retention measurement + deletion
+# of >30-day terminal job/scene rows, completeness flagging, 24-hour
+# escalation) and returns a JSON summary, which this job prints and
+# fails on if the endpoint does not answer 200.
+#
+# Secret: CRON_SECRET — set it in TWO places, with the SAME value:
+#   1. GitHub repository secret: Settings → Secrets and variables →
+#      Actions → New repository secret, name CRON_SECRET.
+#   2. Cloudflare Pages production environment variable CRON_SECRET
+#      (same name, same value) on the nova-ai-studio project.
+# The endpoint compares the two in constant time and fails closed
+# (503 cron_secret_unset) when the Pages variable is not set, so the
+# workflow fails loudly instead of silently doing nothing.
+#
+# GitHub notes: scheduled runs may start a few minutes late under load,
+# and GitHub automatically disables scheduled workflows in a repository
+# with no activity for 60 days — push a commit or re-enable the workflow
+# if that happens. The endpoint is idempotent, so a late, retried, or
+# duplicate run is safe: a second run in the same window deletes
+# nothing further.
+#
+# The production hostname is the stable Pages URL. Do NOT point this at
+# a deployment-specific URL (8ab5e076.nova-ai-studio-cp5.pages.dev):
+# that address is pinned to one deployment and goes stale on the next.
+
+name: Retention reconcile
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: # manual run, for verification after deploy
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call the reconcile endpoint
+        env:
+          RECONCILE_URL: https://nova-ai-studio-cp5.pages.dev/internal/reconcile
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          # --retry 2 is safe: the endpoint is idempotent, so a retried
+          # POST cannot double-apply anything.
+          http_code=$(curl -sS --retry 2 -o /tmp/reconcile.json -w "%{http_code}" \
+            -X POST "$RECONCILE_URL" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            --max-time 60)
+          echo "HTTP $http_code"
+          cat /tmp/reconcile.json
+          if [ "$http_code" -ne 200 ]; then
+            echo "::error::reconcile endpoint returned HTTP $http_code"
+            exit 1
+          fi

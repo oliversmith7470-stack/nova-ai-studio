@@ -1555,6 +1555,141 @@ try {
     }
   }
 
+  // ------------------------------------------------ POST /internal/reconcile
+  // GitHub Actions scheduler route (25 Nov 2026): the endpoint runs the
+  // same handleScheduled() reconciliation as scheduled(), gated on the
+  // CRON_SECRET shared secret. Fail closed when the secret is unset
+  // (503); wrong or missing secret -> 401; non-POST -> 405.
+  {
+    console.log("\n-- POST /internal/reconcile (GitHub Actions scheduler) --");
+    const CRON_SECRET = "test-cron-secret-0123456789";
+    const RECONCILE_ENV = {
+      NOVA_JOB_RECORD_RETENTION_ENABLED: "true",
+      NOVA_JOB_RECORD_RETENTION_DAYS: "30"
+    };
+    const DAY = 86400000;
+    const seedTerminalJob = async (db, jobId, ageMs, nScenes = 1) => {
+      const now = Date.now();
+      await db.prepare("INSERT INTO jobs (id, data) VALUES (?, ?)").bind(
+        jobId,
+        JSON.stringify({ id: jobId, createdAtMs: now - ageMs, status: "succeeded", mode: "single" })
+      ).run();
+      for (let i = 0; i < nScenes; i++) {
+        await db.prepare(
+          "INSERT INTO scenes (job_id, scene_index, attempt, execution_id, provider_job_id, status, error, output_ref, expires_at, updated_at) VALUES (?, ?, 1, ?, NULL, 'succeeded', NULL, NULL, NULL, ?)"
+        ).bind(jobId, i, `${jobId}:scene-${i}:attempt-1`, now - ageMs).run();
+      }
+    };
+    const authHdr = (secret) => ({ Authorization: "Bearer " + secret });
+
+    // --- Auth + method + reconciliation, on a boot WITH the secret set.
+    {
+      const { mf, db } = await boot({ apiPort, extraBindings: { ...RECONCILE_ENV, CRON_SECRET } });
+      try {
+        const oldJob = newJobId();
+        const youngJob = newJobId();
+        await seedTerminalJob(db, oldJob, 40 * DAY, 1);
+        await seedTerminalJob(db, youngJob, 10 * DAY, 1);
+
+        const get = await callWorker(mf, "GET", "/internal/reconcile", {});
+        check(
+          "RCN.1 GET /internal/reconcile -> 405",
+          get.status === 405 && get.json && get.json.error === "Only POST requests are allowed.",
+          `HTTP ${get.status}`
+        );
+
+        const noAuth = await callWorker(mf, "POST", "/internal/reconcile", {});
+        check(
+          "RCN.2 POST without secret -> 401 unauthorised",
+          noAuth.status === 401 && noAuth.json && noAuth.json.error === "unauthorised",
+          `HTTP ${noAuth.status}`
+        );
+
+        const wrong = await callWorker(mf, "POST", "/internal/reconcile", { headers: authHdr("wrong-secret") });
+        check(
+          "RCN.3 POST with wrong secret -> 401 unauthorised",
+          wrong.status === 401 && wrong.json && wrong.json.error === "unauthorised",
+          `HTTP ${wrong.status}`
+        );
+
+        const ok = await callWorker(mf, "POST", "/internal/reconcile", { headers: authHdr(CRON_SECRET) });
+        check(
+          "RCN.4 POST with correct secret -> 200 with reconciliation summary",
+          ok.status === 200 && ok.json && ok.json.ok === true &&
+            ok.json.retainedRows === 4 &&
+            ok.json.retentionDeletion && ok.json.retentionDeletion.enabled === true &&
+            ok.json.retentionDeletion.days === 30,
+          `HTTP ${ok.status} ${ok.text.slice(0, 200)}`
+        );
+        check(
+          "RCN.5 summary reports the deletion (1 job, 1 scene)",
+          ok.json && ok.json.retentionDeletion.deletedJobs === 1 &&
+            ok.json.retentionDeletion.deletedScenes === 1,
+          JSON.stringify(ok.json && ok.json.retentionDeletion)
+        );
+        check(
+          "RCN.6 endpoint deleted the 40-day terminal job and kept the 10-day job",
+          (await jobRow(db, oldJob)) === null && (await jobRow(db, youngJob)) !== null,
+          ""
+        );
+        check(
+          "RCN.7 response carries no CORS headers",
+          ok.headers.get("access-control-allow-origin") === null,
+          `ACAO=${ok.headers.get("access-control-allow-origin")}`
+        );
+        const again = await callWorker(mf, "POST", "/internal/reconcile", { headers: authHdr(CRON_SECRET) });
+        check(
+          "RCN.8 second call is a no-op (idempotent: nothing left to delete)",
+          again.status === 200 && again.json &&
+            again.json.retentionDeletion.deletedJobs === 0 &&
+            again.json.retentionDeletion.deletedScenes === 0,
+          `HTTP ${again.status} ${again.text.slice(0, 200)}`
+        );
+      } finally {
+        await mf.dispose();
+      }
+    }
+
+    // --- Fail closed when CRON_SECRET is unset: a separate boot with
+    // retention enabled but NO secret configured.
+    {
+      const { mf, db } = await boot({ apiPort, extraBindings: RECONCILE_ENV });
+      try {
+        const oldJob = newJobId();
+        await seedTerminalJob(db, oldJob, 40 * DAY, 1);
+        const r = await callWorker(mf, "POST", "/internal/reconcile", { headers: authHdr("anything") });
+        check(
+          "RCN.9 CRON_SECRET unset -> 503 cron_secret_unset (fail closed)",
+          r.status === 503 && r.json && r.json.error === "cron_secret_unset",
+          `HTTP ${r.status} ${r.text.slice(0, 120)}`
+        );
+        check(
+          "RCN.10 nothing ran while the secret was unset (40-day job still present)",
+          (await jobRow(db, oldJob)) !== null,
+          ""
+        );
+      } finally {
+        await mf.dispose();
+      }
+    }
+
+    // --- No D1 binding: direct module import with an env that has the
+    // secret but no NOVA_DB.
+    {
+      const mod = await import("../_worker.js");
+      const res = await mod.default.fetch(
+        new Request(SITE + "/internal/reconcile", { method: "POST", headers: authHdr(CRON_SECRET) }),
+        { CRON_SECRET }
+      );
+      const body = await res.json().catch(() => null);
+      check(
+        "RCN.11 no D1 binding -> 500 service unavailable",
+        res.status === 500 && body && body.error === "service unavailable",
+        `HTTP ${res.status}`
+      );
+    }
+  }
+
   // ------------------------------------------------ T31-17 masking + repair CLI
   {
     console.log("\n-- T31-17 retry row must not mask a missing attempt-1 row --");

@@ -398,8 +398,10 @@ async function handleGemini(request, env) {
 // SCOPE of this block: Worker/API + D1 core only.
 // - POST /api/generate, GET /api/status, GET /api/download, GET /api/capacity,
 //   GET /api/export/jobs, POST /api/retry, POST /internal/d1-apply,
-//   GET /internal/d1-read,
-//   scheduled() (15-minute reconciliation timer + 24h escalation, D1 side).
+//   GET /internal/d1-read, POST /internal/reconcile (GitHub Actions
+//   scheduler route, 25 Nov 2026 — the live 15-minute trigger),
+//   scheduled() (same reconciliation + 24h escalation, D1 side — kept as
+//   a thin wrapper; NEVER fires on Pages, which has no cron triggers).
 // - Worker-sole-D1-access (Rev 3 §C-1.1); canonical-request-v1 (Rev 3.1
 //   §A-3.1.1 + Rev 3.2 §B-3.2.10); atomic rate limits (Rev 3 §C-1.6);
 //   creation batch 2+N with footprint rule + creationToken (Rev 3.3 §C-3.3.1,
@@ -3616,6 +3618,60 @@ async function handleD1Read(request, env) {
   return respond(400, { error: "Unknown read operation." });
 }
 
+// --------------------------------------- POST /internal/reconcile
+// GitHub Actions scheduler route (25 Nov 2026): Pages Functions have no
+// cron triggers, so the 15-minute reconciliation cannot be driven by a
+// cron trigger on this deployment. A GitHub Actions workflow
+// (.github/workflows/retention-reconcile.yml) POSTs here every 15
+// minutes instead. Auth: shared secret CRON_SECRET (a Pages production
+// env var), compared in constant time against the `Authorization:
+// Bearer <secret>` header. Fail closed: secret unset -> 503, wrong or
+// missing secret -> 401, no D1 binding -> 500. The request body is
+// ignored. No CORS headers are set — no browser ever calls this
+// endpoint; curl does not need CORS. Runs the SAME handleScheduled()
+// reconciliation as scheduled() and returns its summary as JSON, so a
+// failed run is visible in the workflow log and the operator can verify
+// each run's counts.
+
+function secretsEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const ae = new TextEncoder().encode(a);
+  const be = new TextEncoder().encode(b);
+  let diff = ae.length ^ be.length;
+  const n = Math.max(ae.length, be.length);
+  for (let i = 0; i < n; i++) {
+    diff |= (ae[i] || 0) ^ (be[i] || 0);
+  }
+  return diff === 0;
+}
+
+async function handleReconcile(request, env) {
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Content-Type-Options": "nosniff"
+  };
+  const respond = (status, data) =>
+    new Response(JSON.stringify(data), { status, headers });
+  if (request.method !== "POST") {
+    return respond(405, { error: "Only POST requests are allowed." });
+  }
+  const configured = env.CRON_SECRET;
+  if (typeof configured !== "string" || configured.length === 0) {
+    return respond(503, { error: "cron_secret_unset" });
+  }
+  const auth = request.headers.get("Authorization") || "";
+  const presented = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!secretsEqual(presented, configured)) {
+    console.error("[NOVA] /internal/reconcile rejected: bad or missing secret");
+    return respond(401, { error: "unauthorised" });
+  }
+  if (!env.NOVA_DB) {
+    return respond(500, { error: "service unavailable" });
+  }
+  const summary = await handleScheduled(null, env);
+  return respond(200, summary);
+}
+
 // ------------------------------------------------- scheduled()
 // The 15-minute reconciliation timer, D1 side (Rev 3.2 §B-3.2.7, Rev 3.5
 // §C-3.5.1.2), plus the 24-hour escalation. The Worker can only do the
@@ -3631,12 +3687,34 @@ async function handleD1Read(request, env) {
 
 async function handleScheduled(event, env) {
   const db = env.NOVA_DB;
-  if (!db) return;
+  // Summary returned to the caller (the GitHub Actions endpoint reports
+  // it as JSON; the scheduled() wrapper ignores it). Counts are
+  // best-effort: per-row failures are logged at the call site, while
+  // `errors` counts only the step-level failures that abort a whole step.
+  const summary = {
+    ok: true,
+    retainedRows: null,
+    retainedBytes: null,
+    retentionBacklogAlert: false,
+    retentionDeletion: {
+      enabled: phase3RetentionEnabled(env),
+      days: phase3RetentionDays(env),
+      deletedJobs: 0,
+      deletedScenes: 0
+    },
+    jobsChecked: 0,
+    incompleteFlagged: 0,
+    escalated: 0,
+    errors: 0
+  };
+  if (!db) return { ...summary, ok: false, error: "no_database" };
   const nowMs = Date.now();
 
   // 1. Retention measurement + alert (Rev 3.1 §A-3.1.4.2, Rev 3.2 §B-3.2.6).
   try {
     const m = await measureRetention(db);
+    summary.retainedRows = m.retainedRows;
+    summary.retainedBytes = m.retainedBytes;
     console.log(
       "[NOVA scheduled] retained rows=" + m.retainedRows +
         " bytes=" + m.retainedBytes + " (logical UTF-8 payload)"
@@ -3645,6 +3723,7 @@ async function handleScheduled(event, env) {
       m.retainedRows >= PHASE3_RETENTION_ALERT_ROWS ||
       m.retainedBytes >= PHASE3_RETENTION_ALERT_BYTES
     ) {
+      summary.retentionBacklogAlert = true;
       console.log(
         "[NOVA scheduled] retention-backlog-alert rows=" + m.retainedRows +
           " bytes=" + m.retainedBytes
@@ -3661,6 +3740,7 @@ async function handleScheduled(event, env) {
     }
   } catch (e) {
     console.error("[NOVA scheduled] retention measurement failed:", e && e.message);
+    summary.errors++;
   }
 
   // 1b. Retention deletion (owner decision 25 Nov ~18:21 WAT: Q3 APPROVED,
@@ -3762,8 +3842,11 @@ async function handleScheduled(event, env) {
         "[NOVA scheduled] retention-deletion: enabled (" + days + " days), deleted " +
           deletedJobs + " job records, " + deletedScenes + " scene rows"
       );
+      summary.retentionDeletion.deletedJobs = deletedJobs;
+      summary.retentionDeletion.deletedScenes = deletedScenes;
     } catch (e) {
       console.error("[NOVA scheduled] retention deletion failed:", e && e.message);
+      summary.errors++;
     }
   }
 
@@ -3779,9 +3862,11 @@ async function handleScheduled(event, env) {
       )
       .all();
     jobs = (res && res.results) || [];
+    summary.jobsChecked = jobs.length;
   } catch (e) {
     console.error("[NOVA scheduled] pending-jobs read failed:", e && e.message);
-    return;
+    summary.errors++;
+    return summary;
   }
   for (const row of jobs) {
     let job;
@@ -3800,6 +3885,7 @@ async function handleScheduled(event, env) {
         (sceneRows && sceneRows.results) || []
       );
       if (missing.length > 0) {
+        summary.incompleteFlagged++;
         console.log(
           "[NOVA scheduled] incomplete-scene-set jobId=" + row.id +
             " missing indexes=" + missing.join(",")
@@ -3823,6 +3909,7 @@ async function handleScheduled(event, env) {
         "[NOVA scheduled] completeness check failed for " + row.id + ":",
         e && e.message
       );
+      summary.errors++;
     }
     // 24-hour escalation (Rev 3.2 §B-3.2.7.2): intent-recorded or
     // reconciliation-needed jobs older than 24h are escalated (visibility
@@ -3836,6 +3923,7 @@ async function handleScheduled(event, env) {
           job.reconciliationNeeded === 1) &&
         job.reconciliationEscalated !== 1;
       if (needsEscalation) {
+        summary.escalated++;
         console.log(
           "[NOVA scheduled] reconciliation-escalated jobId=" + row.id +
             " dispatchState=" + job.dispatchState
@@ -3852,8 +3940,10 @@ async function handleScheduled(event, env) {
         "[NOVA scheduled] escalation check failed for " + row.id + ":",
         e && e.message
       );
+      summary.errors++;
     }
   }
+  return summary;
 }
 
 // ------------------------------------------- CSP: nonce injection (HTML)
@@ -4016,6 +4106,9 @@ export default {
     if (url.pathname === "/internal/d1-read") {
       return handleD1Read(request, env);
     }
+    if (url.pathname === "/internal/reconcile") {
+      return handleReconcile(request, env);
+    }
     if (url.pathname === "/api/csp-report") {
       return handleCspReport(request, env);
     }
@@ -4041,8 +4134,17 @@ export default {
   },
 
   // Phase 3 scheduled handler: the 15-minute reconciliation timer
-  // (D1 side) + 24h escalation. Requires a cron trigger in deployment
-  // configuration (e.g. "*/15 * * * *"); no trigger is configured here.
+  // (D1 side) + 24h escalation. NOTE (25 Nov 2026): this NEVER fires on
+  // a Pages deployment — Pages Functions have no cron triggers, and the
+  // account has no Worker service to attach one to (verified: the
+  // Workers API lists zero services; the old script name was never
+  // verified). The live trigger is the GitHub Actions workflow POSTing
+  // to /internal/reconcile, which runs the same handleScheduled(). This
+  // export is KEPT as a thin wrapper: the worker test suite exercises
+  // it directly, the reconciliation stays callable if the site ever
+  // moves to Workers, and every step of handleScheduled is idempotent
+  // (conditional deletes, set-once flags), so a duplicate run is safe.
+  // Do NOT treat it as a live path on Pages.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(handleScheduled(event, env));
   }
