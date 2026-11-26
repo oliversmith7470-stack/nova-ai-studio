@@ -508,6 +508,13 @@ if (generateButton) {
   generateButton.disabled = false;
 }
 
+// 26 Nov 2026: the plan-ready state is spelled out under the
+// button — the button going from disabled to enabled is silent.
+updateMotionGenerateStatus(
+  "Scene plan ready — tap Generate Video.",
+  "idle"
+);
+
   const sceneHTML = scenes.map((scene, index) => `
     <div class="motion-scene">
       <h3>SCENE ${index + 1}: ${novaEscape(scene.title)}</h3>
@@ -586,8 +593,26 @@ function updateMotionStatus(message, state = "idle") {
     status.dataset.state = state;
   }
 
+  // 26 Nov 2026: mirror every generation outcome into the status
+  // line directly under the Generate button — that line is the
+  // primary place the outcome is shown (visible without scrolling
+  // on a phone); #motionStatus sits at the bottom of the Scene Plan
+  // card, several screens below the button.
+  updateMotionGenerateStatus(message, state);
+
   if (preview && state !== "completed") {
     preview.textContent = message;
+  }
+}
+
+// Writes only the status line directly under the Generate button.
+// Used on its own for states that are not generation outcomes
+// (plan ready, licence notice pending, licence cancelled).
+function updateMotionGenerateStatus(message, state = "idle") {
+  const generateStatus = document.getElementById("motionGenerateStatus");
+  if (generateStatus) {
+    generateStatus.textContent = message;
+    generateStatus.dataset.state = state;
   }
 }
 
@@ -600,21 +625,37 @@ async function generateMotionVideo() {
     return;
   }
 
+  const button = document.getElementById("motionGenerateButton");
+
   // Phase 3 §19.2: before a first generation, the user sees the
   // licence's use restrictions in full and acknowledges them. The
   // acknowledgement is stored in this browser only; later
   // generations proceed without showing it again.
   if (!novaLicenceNoticeAcknowledged()) {
+    // 26 Nov 2026: the button must show the wait while the notice
+    // is pending — before this fix it stayed enabled and unchanged,
+    // so the first click looked like it did nothing.
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Waiting for confirmation…";
+    }
+    updateMotionGenerateStatus(
+      "Please read the use restrictions below and confirm to continue.",
+      "idle"
+    );
     novaShowLicenceNotice();
     return;
   }
-
-  const button = document.getElementById("motionGenerateButton");
 
   if (button) {
     button.disabled = true;
     button.textContent = "Creating job...";
   }
+
+  // 26 Nov 2026: say so under the button at once — the job creation
+  // and the provider round-trip are fast, and the label alone was
+  // never observed changing.
+  updateMotionGenerateStatus("Creating job…", "queued");
 
   let job = null;
 
@@ -9468,6 +9509,21 @@ function novaCancelCreation() {
   const container = document.getElementById("motionCreationConfirm");
   if (container) container.innerHTML = "";
   novaMotionCreationConfirmed = false;
+  // 26 Nov 2026: the licence-notice path disables the button while
+  // it waits; a cancel puts it back to the plan-ready state.
+  // (The creation-confirm path already restored the button before
+  // showing its panel, so this is a no-op there.)
+  if (novaMotionPlan && novaMotionPlan.scenes.length) {
+    const button = document.getElementById("motionGenerateButton");
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Generate Video →";
+    }
+    updateMotionGenerateStatus(
+      "Scene plan ready — tap Generate Video.",
+      "idle"
+    );
+  }
 }
 
 // ---- Licence notice before a first generation (Section 19.2) ----------

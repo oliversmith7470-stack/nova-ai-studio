@@ -803,6 +803,28 @@
   margin-top: 13px;
 }
 
+/* Generate-button status (26 Nov 2026 fix): the primary, always-visible
+   outcome line directly under the Generate button. A disabled button
+   gives no feedback on tap, so the state is always spelled out here —
+   plan needed, creating job, licence pending, capacity unavailable —
+   where it is visible without scrolling on a phone. */
+#motionGenerateStatus {
+  color: #d7deee;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+  margin-top: 10px;
+}
+#motionGenerateStatus[data-state="failed"] {
+  color: #f3b0b0;
+}
+#motionGenerateStatus[data-state="queued"] {
+  color: #a9c8f5;
+}
+#motionGenerateStatus[data-state="completed"] {
+  color: #a9e6b8;
+}
+
 /* Licence disclosure (Phase 3 §19.2): visible copy beside the
    generate button and on the download surface — never buried in
    a footer. The A(e) clause is the licence's own wording, verbatim. */
@@ -1548,6 +1570,8 @@
           >
             Generate Video →
           </button>
+
+          <p id="motionGenerateStatus" aria-live="polite">Build a cinematic scene plan first — the Generate button stays off until a plan is ready.</p>
 
           <aside class="motion-disclosure" aria-label="Machine-generated content disclosure">
             <p><strong>Machine-generated content:</strong> Videos generated on NOVA AI Studio are machine generated.</p>
