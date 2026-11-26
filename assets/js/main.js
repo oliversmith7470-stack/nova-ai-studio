@@ -2982,7 +2982,7 @@ async function novaWorkspaceSaveCharacter() {
   if (file) {
     if (file.size > 5 * 1024 * 1024) {
       novaWorkspaceSetStatus(
-        "Reference images must be 5 MB or smaller for this prototype."
+        "Reference images must be 5 MB or smaller."
       );
       return;
     }
