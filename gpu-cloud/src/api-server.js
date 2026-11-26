@@ -27,11 +27,16 @@
 // a fake executor, and a stub usage source).
 
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
 import { GpuManager } from './gpu-manager.js';
+import { PROVIDER_DEFINITIONS } from './providers.js';
+import { KaggleExecutor, KAGGLE_PROVIDER_ID } from './kaggle-executor.js';
 import { createStorage } from './storage/index.js';
 import { ApiStateStore } from './api-server/state-store.js';
 import { verifyWorkerAuth } from './api-server/auth.js';
@@ -39,7 +44,6 @@ import { HttpD1Client } from './api-server/d1-client.js';
 import { DispatchManager } from './api-server/dispatch.js';
 import { SweepRunner } from './api-server/sweep.js';
 import { ReconciliationRunner } from './api-server/reconcile.js';
-import { FakeControlledExecutor } from './api-server/fake-executor.js';
 import { validateMp4 } from './api-server/validation.js';
 import { revokeSecret as doRevokeSecret } from './api-server/revocation.js';
 import {
@@ -50,6 +54,17 @@ import {
   RETENTION_ENABLED,
   RETENTION_DAYS,
 } from './api-server/constants.js';
+
+import {
+  STARTUP_STATE_DIR,
+  verifyStartupReadiness,
+  decideStartupFailureExit,
+  resetAttemptCounter,
+  logStartupEvent,
+  normaliseError,
+  attachStartupIdentity,
+  formatRejectionValue,
+} from './api-server/startup-attempts.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_API_DATA_DIR = path.join(__dirname, '..', 'data', 'api');
@@ -72,6 +87,199 @@ export function routeInventory() {
     { method: 'GET', pattern: '/internal/download', auth: 'API-secret + HMAC', middleware: 'HMAC verify (empty body), 30 s idle timeout applies client-side' },
     { method: 'POST', pattern: '/internal/cancel', auth: 'API-secret + HMAC', middleware: 'HMAC verify, 256 KB body limit, 5 s Worker timeout applies client-side' },
   ];
+}
+
+// =============================================================================
+// Production executor registration factory (Rev 4.9 §4, Rev 4.8 §6)
+// =============================================================================
+
+// The code-owned production executor allowlist: provider id -> { create }.
+// An entry is added ONLY after the seven §6 registration-gate items have
+// been independently evidenced and accepted. The allowlist is EMPTY: no
+// provider has passed the gate. `kaggle-t4` is not a permitted public
+// executor (personal/experimental only); paid `runpod-4090` is not eligible
+// without the owner's separate cost approval and all required gate
+// evidence. The factory never treats a provider definition or a
+// credential's presence as proof of public authorisation.
+export const PRODUCTION_EXECUTOR_FACTORIES = new Map();
+
+const PROVIDER_ID_RE = /^[a-z][a-z0-9-]*$/;
+
+// Parse NOVA_PRODUCTION_EXECUTORS: a comma-separated list of trimmed,
+// non-empty, unique provider ids. An empty value is valid (no public
+// production executor registered; the API still starts, in the
+// no-capacity state). A malformed list (an id with an illegal shape) or a
+// duplicate id is a startup failure — the factory never silently skips an
+// invalid configured id.
+export function parseExecutorList(value) {
+  if (value === undefined || value === null) return [];
+  const raw = String(value);
+  if (raw.trim() === '') return [];
+  const ids = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  const seen = new Set();
+  for (const id of ids) {
+    if (!PROVIDER_ID_RE.test(id)) {
+      throw new Error(`malformed production executor list: invalid provider id ${JSON.stringify(id)}`);
+    }
+    if (seen.has(id)) {
+      throw new Error(`malformed production executor list: duplicate provider id ${JSON.stringify(id)}`);
+    }
+    seen.add(id);
+  }
+  return ids;
+}
+
+// Controlled-test mode requires an explicitly supplied controlled-test
+// executor and registers only that executor. Production mode never creates
+// or defaults to FakeControlledExecutor; the two modes are mutually
+// exclusive.
+export function assertControlledTestExecutor(executor) {
+  if (!executor || executor.id !== 'controlled-test-ltx') {
+    throw new Error('refusing to start: controlled-test mode requires the controlled-test executor only (Rev 3 §C-1.4)');
+  }
+}
+
+export function registerControlledTestProvider(manager) {
+  return manager.registerProvider({
+    id: 'controlled-test-ltx',
+    kind: 'kaggle',
+    label: 'Controlled-test LTX executor (fake, Phase 3 only)',
+    gpuType: 'NVIDIA T4 (simulated)',
+    vramGb: 16,
+    models: ['ltx-video-2b'],
+    costModel: { type: 'free', perSecondUsd: 0 },
+    availabilityWindow: { type: 'always', description: 'Controlled test only — not public capacity.' },
+    maxConcurrentJobs: 1,
+    connected: true,
+    status: 'available',
+  });
+}
+
+// Executor identity: the BaseExecutor family (Kaggle/Colab) carries
+// `providerId`; the controlled-test fake carries `id`. Both spellings are
+// accepted; a missing identity is a mismatch.
+export function executorProviderId(executor) {
+  if (!executor || typeof executor !== 'object') return null;
+  return executor.providerId ?? executor.id ?? null;
+}
+
+// The executor bound to a provider id must be that provider's executor
+// and must implement the runtime contract dispatch uses: start(job) and
+// fileReport(report). getExecutionState is OPTIONAL at registration — the
+// real Kaggle executor has no programmatic status query yet (manual
+// channel; the query is unverified, §B-3.2.18), and DispatchManager
+// treats a missing query as unknown state (reconciliation path), never as
+// a failure. reportFailure and requestCancel are likewise optional —
+// dispatch checks for them before calling. A future production executor
+// proves the full contract through gate item 7 (controlled dispatch
+// end-to-end) before it is ever added to the allowlist.
+export function assertExecutorMatchesProvider(executor, providerId) {
+  if (!executor || executorProviderId(executor) !== providerId) {
+    throw new Error(`production executor id mismatch: expected executor for provider ${providerId}`);
+  }
+  for (const method of ['start', 'fileReport']) {
+    if (typeof executor[method] !== 'function') {
+      throw new Error(`production executor for provider ${providerId} is missing ${method}()`);
+    }
+  }
+}
+
+// Kaggle credential presence on the API host (Rev 4.9 §4, personal path):
+// the Kaggle CLI reads KAGGLE_USERNAME/KAGGLE_KEY from the environment or
+// ~/.kaggle/kaggle.json. Presence is checked, never the values — no
+// credential value is read, logged, or compared here. `overrides` exists
+// for tests (config.kaggleCredentialPresent); production always probes the
+// host. The home directory defaults to the process user's home.
+export function isKaggleCredentialPresent({ env = process.env, home = os.homedir() } = {}) {
+  const username = env.KAGGLE_USERNAME;
+  const key = env.KAGGLE_KEY;
+  if (typeof username === 'string' && username.length > 0
+    && typeof key === 'string' && key.length > 0) {
+    return true;
+  }
+  try {
+    const raw = fs.readFileSync(path.join(home, '.kaggle', 'kaggle.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.username === 'string' && parsed.username.length > 0
+      && typeof parsed?.key === 'string' && parsed.key.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// Personal executor registration (owner-only, Rev 4.9 §4): the only
+// recognised personal id is `kaggle-t4`; it must resolve to an implemented
+// Kaggle executor and the required Kaggle credential must be present on the
+// API host. An unknown or unimplemented id, or a missing credential,
+// disables the personal executor but does NOT prevent the API from
+// starting (the personal path is opt-in, unlike a production id, which is
+// a startup failure). The personal executor is never added to the public
+// allowlist and never satisfies public capacity.
+//
+// The owner-token check remains authoritative at the Worker boundary, where
+// the Pages secret NOVA_OWNER_TOKEN actually resides. The API host must not
+// receive a duplicate copy of the owner bearer token, and this factory must
+// not claim it has verified the Pages secret: the signed
+// personal-audience request and activation state are verified before
+// personal dispatch by the Worker, not here.
+//
+// Returns { providerId, providerDef, executor } or null (personal path
+// unavailable). The provider def is registered with connected/available
+// set from credential presence — the registry's dispatchable() gate needs
+// those flags, and credential presence is the only authenticated signal
+// available at this layer; the five §6 status concepts (S1) remain a
+// separate design change and are NOT claimed here.
+export function createPersonalExecutor({ personalExecutorId = '', kaggleCredentialPresent = null, packageDir = null } = {}) {
+  const id = typeof personalExecutorId === 'string' ? personalExecutorId.trim() : '';
+  if (id === '') return null;
+  if (id !== KAGGLE_PROVIDER_ID) {
+    console.error(`[api-server] personal executor unavailable: unknown personal executor id ${JSON.stringify(id)} (only kaggle-t4 is recognised)`);
+    return null;
+  }
+  const credentialPresent = kaggleCredentialPresent ?? isKaggleCredentialPresent();
+  if (!credentialPresent) {
+    console.error('[api-server] personal executor unavailable: kaggle-t4 requested but the Kaggle credential is not present on this host');
+    return null;
+  }
+  const def = PROVIDER_DEFINITIONS.find((d) => d.id === KAGGLE_PROVIDER_ID);
+  if (!def) {
+    console.error('[api-server] personal executor unavailable: kaggle-t4 has no provider definition');
+    return null;
+  }
+  if (typeof packageDir !== 'string' || packageDir.length === 0) {
+    console.error('[api-server] personal executor unavailable: no packageDir for the Kaggle executor');
+    return null;
+  }
+  const executor = new KaggleExecutor({ packageDir });
+  assertExecutorMatchesProvider(executor, KAGGLE_PROVIDER_ID);
+  return {
+    providerId: KAGGLE_PROVIDER_ID,
+    providerDef: { ...def, connected: true, status: 'available' },
+    executor,
+  };
+}
+
+// systemd readiness notification (Rev 4.9 §5, Type=notify). Sends READY=1
+// via /usr/bin/systemd-notify --ready, with a bounded timeout and both the
+// spawn error and the exit status checked. Returns true on success (or
+// when there is no notification socket to answer — a plain/manual run),
+// false on any failure. Never throws. NotifyAccess=all is required on the
+// unit because the notification is sent by this short-lived helper process,
+// not directly by the Node main PID. install.sh verifies
+// /usr/bin/systemd-notify exists on the target host.
+export function notifySystemdReady() {
+  if (!process.env.NOTIFY_SOCKET) return true;
+  try {
+    const result = spawnSync('/usr/bin/systemd-notify', ['--ready'], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    if (result.error) return false;
+    if (result.status !== 0) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function createApiServer(config = {}) {
@@ -106,37 +314,69 @@ export function createApiServer(config = {}) {
   });
   manager.attachStorage(storage);
 
-  // Executor registry (Rev 3 §C-1.4 gate 3): controlled-test mode
-  // registers ONLY the controlled-test executor. Production mode
-  // registers NO executor for ltx-video-2b — and refuses to start if a
-  // controlled-test executor is configured.
-  const executor = config.executor ?? new FakeControlledExecutor();
-  if (mode === 'production' && executor && executor.id === 'controlled-test-ltx') {
-    throw new Error('refusing to start: a controlled-test executor is configured in production mode (Rev 3 §C-1.4)');
-  }
+  // Executor registration factory (Rev 4.9 §4, Rev 4.8 §6): production
+  // executor registration is explicit startup configuration, separate from
+  // controlled-test mode. Production mode never creates or defaults to
+  // FakeControlledExecutor; controlled-test mode requires an explicitly
+  // supplied controlled-test executor and registers only that executor.
+  const productionExecutorIds = parseExecutorList(
+    config.productionExecutors ?? process.env.NOVA_PRODUCTION_EXECUTORS ?? '',
+  );
+  const productionExecutors = new Map();
+  const personalExecutors = new Map();
+  let legacyExecutor = null;
   if (mode === 'controlled-test') {
-    if (!executor || executor.id !== 'controlled-test-ltx') {
-      throw new Error('refusing to start: controlled-test mode requires the controlled-test executor only (Rev 3 §C-1.4)');
+    const testExecutor = config.executor;
+    assertControlledTestExecutor(testExecutor);
+    registerControlledTestProvider(manager);
+    manager.registerExecutor('controlled-test-ltx', testExecutor);
+    // The controlled-test executor is NOT a production executor: it is
+    // passed through the legacy single-executor option only, and the
+    // production registry stays empty.
+    legacyExecutor = testExecutor;
+  } else {
+    if (config.executor) {
+      throw new Error('production mode does not accept a single injected test executor');
     }
-    manager.registerProvider({
-      id: 'controlled-test-ltx',
-      kind: 'kaggle',
-      label: 'Controlled-test LTX executor (fake, Phase 3 only)',
-      gpuType: 'NVIDIA T4 (simulated)',
-      vramGb: 16,
-      models: ['ltx-video-2b'],
-      costModel: { type: 'free', perSecondUsd: 0 },
-      availabilityWindow: { type: 'always', description: 'Controlled test only — not public capacity.' },
-      maxConcurrentJobs: 1,
-      connected: true,
-      status: 'available',
+    for (const providerId of productionExecutorIds) {
+      // The allowlist is the gate: an unknown, ungated, or unimplemented
+      // id is a STARTUP FAILURE — never a silent skip. Listing kaggle-t4
+      // (or any other non-permitted provider) here is a startup failure.
+      const registration = PRODUCTION_EXECUTOR_FACTORIES.get(providerId);
+      if (!registration) {
+        throw new Error(`production executor is not permitted or implemented: ${providerId}`);
+      }
+      const provider = manager.registry.get(providerId);
+      if (!provider) {
+        throw new Error(`unknown production provider: ${providerId}`);
+      }
+      const executor = registration.create(config);
+      assertExecutorMatchesProvider(executor, providerId);
+      manager.registerExecutor(providerId, executor);
+      productionExecutors.set(providerId, executor);
+    }
+    // Personal executor (owner-only, opt-in): registered separately from
+    // NOVA_PERSONAL_EXECUTOR, never added to the public allowlist, never
+    // satisfies public capacity. Unavailable personal path does not stop
+    // startup; the owner-token check stays at the Worker boundary.
+    const personal = createPersonalExecutor({
+      personalExecutorId: config.personalExecutor ?? process.env.NOVA_PERSONAL_EXECUTOR ?? '',
+      kaggleCredentialPresent: config.kaggleCredentialPresent ?? null,
+      packageDir: config.packageDir ?? path.join(dataDir, 'packages'),
     });
-    manager.registerExecutor('controlled-test-ltx', executor);
+    if (personal) {
+      manager.registerProvider(personal.providerDef);
+      manager.registerExecutor(personal.providerId, personal.executor);
+      personalExecutors.set(personal.providerId, personal.executor);
+    }
   }
 
   const dispatch = new DispatchManager({
     manager,
-    executor,
+    executor: legacyExecutor,
+    productionExecutors,
+    personalExecutors,
+    runnerHealthPath: config.runnerHealthPath ?? path.join(dataDir, 'runner-health.json'),
     d1Client,
     apiState,
     mode,
@@ -328,30 +568,137 @@ export function createApiServer(config = {}) {
   }
 
   async function start() {
-    // Startup sequence (Rev 2 §9.2, §10.4): catch-up sweep FIRST, then
-    // pending-mutation replay, then startup reconciliation — all BEFORE
-    // accepting any new job (before listen).
-    await sweep.runSweep({ reason: 'startup' });
-    await dispatch.replayPendingMutations();
-    await reconcile.runReconciliation({ source: 'startup' });
+    // Startup sequence (Rev 2 §9.2, §10.4): readiness verification FIRST,
+    // then catch-up sweep, pending-mutation replay, startup reconciliation —
+    // all BEFORE accepting any new job (before listen). Every pre-listen
+    // failure logs its canonical event and throws; the CLI entry decides the
+    // exit code (decideStartupFailureExit). Phase 5 protocol active only when
+    // NOVA_STARTUP_STATE_DIR is set; unset = Phase 3 behaviour, PROVIDED the
+    // new modules are present and load successfully (Rev 4.7, F5-26) — the
+    // startup dependency chain is not unchanged (static imports: api-server.js
+    // -> startup-attempts.js -> startup-counter.mjs), so a missing/broken new
+    // module fails the process at import time (correction (l)).
+    let startupRequestId = null;
+    let startupWindowStart = null;
+    let startupAttempts = null;
+    let startupGeneration = null;
+    if (STARTUP_STATE_DIR) {
+      ({ requestId: startupRequestId, windowStart: startupWindowStart, attempts: startupAttempts, generation: startupGeneration } = verifyStartupReadiness());
+      // failStep normalises non-Error rejections via normaliseError (correction
+      // (e), Rev 4.7 F5-25): a promise may reject with null, a string, a BigInt,
+      // a circular object, or any value — assigning properties to it would throw
+      // and replace the original failure. A non-Error rejection is wrapped in an
+      // Error carrying the original value as `cause`, so the event, the exit
+      // decision, and the diagnostic chain all see the real failure. An Error
+      // input passes through unchanged (no cause added). The formatter never
+      // throws (formatRejectionValue). The identity is attached via
+      // attachStartupIdentity (Rev 4.8, F5-42): a frozen or non-extensible Error
+      // makes a direct property assignment throw, so the attachment falls back
+      // to a wrapper Error with the original as `cause` — the original failure
+      // is never replaced. The event detail is formatted with formatRejectionValue, not read as error.message (Rev 4.8, chunk-17 review): attachStartupIdentity may return the original Error unchanged, so a throwing message getter would throw while building the detail — before the throw into the CLI entry.
+      const failStep = (event, err) => {
+        const error = attachStartupIdentity(normaliseError(err), startupRequestId, startupWindowStart);
+        logStartupEvent(event, { requestId: startupRequestId, windowStart: startupWindowStart, detail: formatRejectionValue(error) });
+        throw error;
+      };
+      try { await sweep.runSweep({ reason: 'startup' }); } catch (err) { failStep('startup-sweep-failed', err); }
+      try { await dispatch.replayPendingMutations(); } catch (err) { failStep('startup-replay-failed', err); }
+      try { await reconcile.runReconciliation({ source: 'startup' }); } catch (err) { failStep('startup-reconcile-failed', err); }
+    } else {
+      await sweep.runSweep({ reason: 'startup' });
+      await dispatch.replayPendingMutations();
+      await reconcile.runReconciliation({ source: 'startup' });
+    }
     server = http.createServer((req, res) => { void handle(req, res); });
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(port, host, resolve);
-    });
+    try {
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(port, host, resolve);
+      });
+    } catch (err) {
+      // Dispose of the created server object after a failed listen (correction
+      // (f)): the process exits via the CLI entry, but a failed listen must not
+      // leave a half-bound socket behind for the brief exit path, and a start()
+      // caller in tests must be able to re-bind the port. close() on a
+      // never-listened server invokes the callback with ERR_SERVER_NOT_RUNNING
+      // (verified on node 24, 26 Nov 2026) — ignored here. The 'error' event
+      // delivers an Error object, but an Error object is not guaranteed
+      // extensible — a frozen/non-extensible Error would make a direct property
+      // assignment throw and replace the listen failure (Rev 4.8, F5-42), so
+      // the identity is attached via attachStartupIdentity, which falls back
+      // to a wrapper Error with the original as `cause`. The event detail is formatted with formatRejectionValue, not read as identified.message (Rev 4.8, chunk-17 review): the identified error may be the original Error with a throwing message getter.
+      // Server ownership (Rev 4.8, chunk-15 review — chunk-14 §3): `server` is
+      // assigned exactly once, above (`server = http.createServer(...)`), and
+      // start() is invoked exactly once per process by the CLI entry (chunk 16)
+      // — there is no second start() call site anywhere in the design, and a
+      // new chain attempt (supervisor or operator) can only start when the unit
+      // is inactive, so no concurrent startup attempt can reuse or overwrite
+      // `server` before this catch executes. The only other path touching the
+      // server is stop(), reached only from the SIGTERM/SIGINT shutdown
+      // handler (chunk 16), which is not a startup path.
+      try { server.close(() => {}); } catch { /* already closed */ }
+      if (STARTUP_STATE_DIR) {
+        const identified = attachStartupIdentity(err, startupRequestId, startupWindowStart);
+        logStartupEvent('startup-listen-failed', { requestId: startupRequestId, windowStart: startupWindowStart, detail: formatRejectionValue(identified) });
+        throw identified;
+      }
+      throw err;
+    }
+    // Rev 4.9 §5 (Type=notify): send READY=1 only after the startup
+    // readiness check, startup sweep/replay/reconciliation, and successful
+    // server.listen() have completed — and BEFORE the counter reset and
+    // the startup-recovery-succeeded log, so a notification failure is
+    // never mislabelled as a successful recovery. On failure the listener
+    // is closed and startup fails (the CLI entry decides the exit code);
+    // the counter is NOT reset, so the attempt stays counted and the
+    // supervisor can re-arm. The notification is attempted only when
+    // running under systemd (NOTIFY_SOCKET set); a plain/manual run has
+    // no notification socket and skips silently.
+    if (!notifySystemdReady()) {
+      try { server.close(() => {}); } catch { /* already closed */ }
+      if (STARTUP_STATE_DIR) {
+        logStartupEvent('startup-service-ready-notify-failed', { requestId: startupRequestId, windowStart: startupWindowStart, detail: 'systemd-notify-ready-failed' });
+      } else {
+        console.error('[api-server] systemd READY notification failed');
+      }
+      throw new Error('systemd READY notification failed');
+    }
+    if (STARTUP_STATE_DIR) {
+      // Reset ONLY after a successful listen() — never after validation alone.
+      // Identity-checked (Blocker 1 + Rev 4.7 F5-20): the counter is deleted ONLY
+      // when the stored state still belongs to THIS startup (same windowStart,
+      // same attempts, same generation, no reservation held). A preserved reset
+      // is NOT a failure — it means a newer attempt's state survived, which is
+      // the correct outcome — and is logged as startup-recovery-reset-preserved
+      // (info). startup-recovery-succeeded means the API IS LISTENING, not that
+      // the counter was reset: the two outcomes stay distinguishable in the
+      // journal (correction (g)).
+      const reset = resetAttemptCounter({ requestId: startupRequestId, windowStart: startupWindowStart, attempts: startupAttempts, generation: startupGeneration });
+      if (!reset.ok && reset.preserved) logStartupEvent('startup-recovery-reset-preserved', { requestId: startupRequestId, windowStart: startupWindowStart, detail: 'newer-attempt-state-survived', level: 'info' });
+      else if (!reset.ok) logStartupEvent('startup-recovery-counter-unwritable', { requestId: startupRequestId, windowStart: startupWindowStart, detail: reset.reason });
+      logStartupEvent('startup-recovery-succeeded', { requestId: startupRequestId, windowStart: startupWindowStart, level: 'info' });
+    }
     // Independent timers (Rev 3.2 §B-3.2.7.2): a sweep failure does not
     // stop reconciliation, and vice versa. Unref'd: timers never hold
     // the process open on their own.
+    // Timer diagnostics (Rev 4.8, chunk-16 review — chunk-15 §2; wording
+    // narrowed Rev 4.8, chunk-17 review): rejection-value formatting cannot
+    // throw — the only operation that could throw while reading or formatting
+    // the rejection value goes through formatRejectionValue, which never throws
+    // (Rev 4.7, F5-25). A promise may reject with a non-Error value, or an
+    // Error-like object with a throwing message getter; either way the handler
+    // cannot fail while reading or formatting the rejection value. The guarantee
+    // covers the formatting step only — it does not extend to the diagnostic sink.
     const sweepIntervalMs = config.sweepIntervalMs ?? SWEEP_INTERVAL_MS;
     const reconcileIntervalMs = config.reconcileIntervalMs ?? RECONCILE_INTERVAL_MS;
     sweepTimer = setInterval(() => {
       sweep.runSweep({ reason: 'interval' }).catch((err) => {
-        console.error('[api-server] sweep failed:', err && err.message);
+        console.error('[api-server] sweep failed:', formatRejectionValue(err));
       });
     }, sweepIntervalMs);
     reconcileTimer = setInterval(() => {
       reconcile.runReconciliation({ source: 'timer' }).catch((err) => {
-        console.error('[api-server] reconciliation failed:', err && err.message);
+        console.error('[api-server] reconciliation failed:', formatRejectionValue(err));
       });
     }, reconcileIntervalMs);
     if (typeof sweepTimer.unref === 'function') sweepTimer.unref();
@@ -372,7 +719,7 @@ export function createApiServer(config = {}) {
   return {
     config: { mode, host, port, dataDir },
     manager,
-    executor,
+    executor: legacyExecutor,
     storage,
     dispatch,
     sweep,
@@ -400,16 +747,54 @@ export function createApiServer(config = {}) {
 // CLI entry: `node gpu-cloud/src/api-server.js`. Env config only; no
 // secrets are ever logged.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const api = createApiServer();
-  api.start().then(({ host, port, mode }) => {
-    console.log(`[api-server] listening on ${host}:${port} mode=${mode} version=${API_SERVER_VERSION}`);
-  }).catch((err) => {
-    console.error('[api-server] failed to start:', err && err.message);
-    process.exit(1);
-  });
-  const shutdown = () => {
-    api.stop().then(() => process.exit(0)).catch(() => process.exit(1));
+  // Common failure boundary (Rev 4.8, F5-43): createApiServer() AND start()
+  // go through the SAME failure handler. A synchronous factory throw used to
+  // escape via the uncaught-exception path without decideStartupFailureExit;
+  // now it is caught, logged as startup-factory-failed, and given the same
+  // exit decision as any other startup failure. A factory failure CAN and
+  // always does occur after the preparation counter was incremented
+  // (preparation runs before the API process starts, in every chain path), so
+  // it consumes exactly one counted attempt and the next restart counts the
+  // next one; at the limit the process exits 42 and does not restart. start() is declared async (chunk 14), so a throw from its body is already a rejected promise caught by .catch; the invocation is additionally wrapped in Promise.resolve().then(() => api.start()) (Rev 4.8, chunk-17 review — belt-and-braces: a synchronous throw from invoking start() itself becomes a rejection instead of escaping, if the declaration ever changes; the one-microtask deferral is harmless — the shutdown handlers are registered synchronously in the same tick, before the deferred invocation runs).
+  // Log delivery before exit (Rev 4.5 finding): a bare process.exit() here
+  // can truncate the pending asynchronous console output — the failure event
+  // line may never reach journald. The exit is therefore taken via
+  // process.exitCode (the process holds no timers or handles on this path — the
+  // only listeners are the SIGTERM/SIGINT shutdown handlers, plain process
+  // listeners that do not hold the loop open — so Node drains pending output
+  // and exits with the code), with an unref'd 100 ms failsafe. The exit code is identical either way.
+  const handleStartupFailure = (err) => {
+    console.error('[api-server] failed to start:', formatRejectionValue(err));
+    // Phase 5: the exit code is decided by the shared counter when the startup
+    // protocol is active; otherwise the shipped exit 1. decideStartupFailureExit
+    // cannot throw on the counter read or the decision (read failure -> 42, fail-closed). Exit-path resources (Rev 4.8, chunk-17 review): on every pre-listen failure path no server socket is open and no timer has started — readiness and internal-step failures happen before the server object is created (start() creates it only after the internal steps), a listen failure closes the server in its catch, a factory failure creates no server at all, and the sweep/reconcile timers start only after a successful listen(); the only registered listeners are the SIGTERM/SIGINT shutdown handlers (registered only on the start() path, inside if (api)), plain process listeners that do not hold the loop open — so the exitCode drain cannot be blocked by a leftover resource. §15 test (aa) gains the no-open-handle case.
+    const code = STARTUP_STATE_DIR ? decideStartupFailureExit(err) : 1;
+    process.exitCode = code;
+    setTimeout(() => process.exit(code), 100).unref();
   };
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  let api;
+  try {
+    api = createApiServer();
+  } catch (err) {
+    // Factory failure: the server object was never created, so there is no
+    // start() to fail — but the attempt was already counted by preparation,
+    // so the exit decision and the canonical event still apply. The identity
+    // is unknown here (readiness runs inside start(), which never ran), so the
+    // event carries requestId=none / windowStart=none; the counter state
+    // decides the exit code. The error is normalised + identity-attached the
+    // same way as every other startup failure (F5-42). The event detail is formatted with formatRejectionValue, not read as error.message (Rev 4.8, chunk-17 review — the required correction): normaliseError preserves an Error input unchanged and attachStartupIdentity may return that same object, so a throwing message getter would throw while building the detail, before handleStartupFailure is called — bypassing the common boundary.
+    const error = attachStartupIdentity(normaliseError(err), null, null);
+    if (STARTUP_STATE_DIR) logStartupEvent('startup-factory-failed', { requestId: null, windowStart: null, detail: formatRejectionValue(error) });
+    handleStartupFailure(error);
+  }
+  if (api) {
+    Promise.resolve().then(() => api.start()).then(({ host, port, mode }) => {
+      console.log(`[api-server] listening on ${host}:${port} mode=${mode} version=${API_SERVER_VERSION}`);
+    }).catch(handleStartupFailure);
+    const shutdown = () => {
+      api.stop().then(() => process.exit(0)).catch(() => process.exit(1));
+    };
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+  }
 }

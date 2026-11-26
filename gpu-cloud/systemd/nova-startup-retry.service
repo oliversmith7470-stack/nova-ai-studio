@@ -1,0 +1,38 @@
+# NOVA AI Studio — startup retry supervisor systemd unit (Phase 5, Rev 4.8 §14).
+#
+# Type=oneshot, the single supervisor that re-attempts the whole startup
+# chain after a dependency failure. RemainAfterExit=no is stated explicitly.
+# No Restart=, no OnFailure= of its own, no timer of its own. Triggered only
+# by OnFailure= on the two dependency units (nova-startup-id.service,
+# nova-storage-recovery.service) — the API unit does NOT carry OnFailure=.
+#
+# Runs /opt/nova-ai-studio/bin/retry-startup.sh, which sleeps 30 s, exits 0
+# if the API is already active (or activating), otherwise reads the shared
+# attempt counter under the lock via the counter CLI and reserves the next
+# attempt slot only when NO reservation is held AND attempts < 5, RELEASES
+# the lock, and then runs `systemctl start nova-api-server.service`
+# (re-attempting the whole chain from the preparation unit). A held
+# reservation refuses with startup-retry-slot-reserved, attempts >= 5
+# refuses with startup-retry-limit-reached. After the start call returns,
+# if the chain failed, attempts < 5, and no reservation is held, the
+# supervisor re-arms itself via a transient 5 s timer (step (9), Rev 4.8
+# F5-33), so a dependency failing during a supervisor-initiated retry is
+# retried after the supervisor exits.
+#
+# TimeoutSec=780: 30 s (supervisor backoff sleep) + 30 s (preparation
+# unit's TimeoutSec) + 600 s (recovery unit's TimeoutSec) + 60 s (API
+# TimeoutStartSec) + 60 s (supervisor post-start release/outcome/re-arm
+# margin). Installed by gpu-cloud/systemd/install.sh.
+# No [Install] section: this unit is never enabled directly; it is
+# triggered by OnFailure=, by its own re-arm timer, or by the operator.
+
+[Unit]
+Description=NOVA AI Studio startup retry supervisor (Phase 5)
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/opt/nova-ai-studio/bin/retry-startup.sh
+TimeoutSec=780
+StandardOutput=journal
+StandardError=journal

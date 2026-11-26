@@ -20,7 +20,7 @@ async function putExpiredObject(api, label, { withJob = false } = {}) {
   const objectId = ref.objectId; // content-addressed: the id IS the hash
   // One delivery reference, so the refs-deleted accounting is exercised.
   // (Issued before expiring: refs cannot be issued for expired objects.)
-  storage.issueDeliveryRef({ namespace: 'outputs', objectId });
+  await storage.issueDeliveryRef({ namespace: 'outputs', objectId });
   // Force expiry in the index record (ttlMs: 1 already expired by the
   // time the sweep reads, but make it explicit).
   const record = storage.index.getObject('outputs', objectId);

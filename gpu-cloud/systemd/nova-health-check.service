@@ -1,0 +1,21 @@
+# NOVA AI Studio — health-check probe service (Phase 5, Rev 4.8 §10).
+#
+# Type=oneshot, runs as root: the probe needs journal read access and
+# write access to /var/lib/nova-api/. ExecStart calls the wrapper
+# (run-health-check.sh), not node directly — the wrapper holds the
+# probe lock (flock, --conflict-exit-code 99) and owns the exit-code
+# contract (0 = probe ok / contention skip, 1 = probe failure,
+# 2 = wrapper infrastructure failure). Installed by
+# gpu-cloud/systemd/install.sh; triggered by nova-health-check.timer,
+# do not enable by hand.
+
+[Unit]
+Description=NOVA AI Studio health-check probe (Phase 5)
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/nova-ai-studio/bin/run-health-check.sh
+StandardOutput=journal
+StandardError=journal

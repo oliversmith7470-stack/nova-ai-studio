@@ -1,0 +1,30 @@
+# NOVA AI Studio — startup-ID preparation systemd unit (Phase 5, Rev 4.8 §14).
+#
+# Type=oneshot, runs once per start attempt: request-id preparation only.
+# RemainAfterExit=no is stated explicitly, so this unit is retriggered on
+# every API start transaction and never left active across restarts.
+#
+# What it does (one function, nothing else): counts this chain attempt in the
+# shared attempt counter (/var/lib/nova-api/startup-attempts, via the counter
+# CLI under the flock lock), then generates a fresh UUID with node
+# (crypto.randomUUID() — not uuidgen, which is absent from the host) and
+# writes it atomically (temp file + rename) to
+# /var/lib/nova-api/startup-request-id, before the recovery unit runs.
+#
+# If it exits non-zero, the chain stops here: the recovery unit never runs
+# and the API never starts — and its OnFailure= fires the retry supervisor.
+# Installed by gpu-cloud/systemd/install.sh. No [Install] section: this unit
+# is never enabled directly; it is pulled in by the recovery unit's Requires=.
+
+[Unit]
+Description=NOVA AI Studio startup-ID preparation (Phase 5)
+After=local-fs.target
+OnFailure=nova-startup-retry.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/opt/nova-ai-studio/bin/prepare-startup-id.sh
+TimeoutSec=30
+StandardOutput=journal
+StandardError=journal

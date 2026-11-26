@@ -7,6 +7,7 @@
 // opens one in production either (Worker-sole-D1-access, Rev 3 §C-1.1).
 
 import { mkdtemp, rm } from 'node:fs/promises';
+import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -336,10 +337,12 @@ export class MemoryD1Client {
 export async function makeApi(overrides = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), 'nova-api-test-'));
   const d1 = new MemoryD1Client();
-  // executor: false => no executor at all (production-mode tests);
-  // otherwise the fake controlled-test executor unless overridden.
+  // executor: false => no executor at all (production-mode tests).
+  // It must be null, not a stub object: production mode rejects ANY
+  // injected executor at construction (Rev 4.9 §4), so a truthy stub
+  // throws instead of letting the submit be refused with 503.
   const executor = overrides.executor === false
-    ? { id: 'none' }
+    ? null
     : (overrides.executor ?? new FakeControlledExecutor());
   const api = createApiServer({
     mode: overrides.mode ?? 'controlled-test',
@@ -361,6 +364,23 @@ export async function makeApi(overrides = {}) {
     now: overrides.now,
     onBeforeComponent: overrides.onBeforeComponent ?? null,
   });
+  // Seed a fresh runner heartbeat (Rev 4.9 §6 gate): in production the
+  // runner's startup catch-up pass writes runner-health.json before the
+  // API listens, so a submit-time gate always sees a fresh heartbeat.
+  // The harness simulates that — otherwise every submit is refused 503
+  // storage-full on the missing file and no submit-path test can run.
+  // Pass seedHeartbeat: false to exercise the gate itself (missing file
+  // → 503 storage-full).
+  if (overrides.seedHeartbeat !== false) {
+    const now = new Date().toISOString();
+    fs.writeFileSync(path.join(dir, 'runner-health.json'), JSON.stringify({
+      lastSuccessfulSweepAt: now,
+      lastAttemptAt: now,
+      status: 'ok',
+      objectsDeleted: 0,
+      error: null,
+    }));
+  }
   return {
     api, d1, executor, dir,
     async cleanup() {

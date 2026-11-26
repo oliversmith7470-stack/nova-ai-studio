@@ -1,0 +1,15 @@
+# NOVA Personal GPU Cloud — local runtime state. Never commit this.
+#
+# data/ holds the manager's job records (data/gpu-manager.json) AND the
+# live NOVA Cloud Storage object store (data/store/ — media bytes, chunk
+# files, the metadata index). Both stay on this machine: job records
+# carry prompts and cost data, and the store carries generated media.
+# A future commit must never sweep media bytes into GitHub.
+data/
+
+# Storage test temp roots (removed after each test run anyway).
+test/storage/.tmp/
+
+# Python bytecode (proof-package builders).
+__pycache__/
+*.pyc

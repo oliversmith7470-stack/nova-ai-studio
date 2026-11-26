@@ -1,0 +1,47 @@
+# NOVA AI Studio — storage runner systemd unit (Phase 5, Rev 4.8 §14,
+# Rev 4.9 §6).
+#
+# Persistent copy. The live unit is /etc/systemd/system/nova-storage-runner.service
+# (/etc is ephemeral on this VM — after a VM replacement, re-install with:
+#   gpu-cloud/systemd/install.sh
+# which copies this file back, enables and starts the service.)
+#
+# Hourly daemon mode of the SAME production implementation as the startup
+# catch-up recovery unit (gpu-cloud/src/storage-runner.js, installed by
+# install.sh to /opt/nova-ai-studio/src/storage-runner.js). It runs on the
+# exact storage root configured for the API (NOVA_API_DATA_DIR/store —
+# /var/lib/nova-api/store in the shipped configuration), NOT the repo-local
+# gpu-cloud/data/store the legacy run-gpu-cloud.mjs script swept. One pass
+# immediately at startup, then one pass every hour, serialised against the
+# catch-up pass by /var/lib/nova-api/sweep.lock. A failed pass is logged and
+# recorded as a failed heartbeat (runner-health.json); the daemon stays up
+# for the next hourly pass. It never touches the job ledger (the API process
+# owns gpu-manager.json while it runs) and never dispatches jobs or touches
+# Kaggle.
+#
+# Deviation from the Oliver example, deliberate: Restart=always (not
+# on-failure). The runner's SIGTERM handler exits 0, so on-failure would
+# NOT restart it after a SIGTERM reap. Restart=always closes that gap;
+# the only way to stop the service is `systemctl stop` (an explicit
+# admin action, which systemd does not restart).
+#
+# No network dependency: the runner only tends the local store — it never
+# dispatches jobs or touches Kaggle.
+
+[Unit]
+Description=NOVA AI Studio storage runner (Phase 5)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=nova-api
+Group=nova-api
+Environment=NOVA_API_DATA_DIR=/var/lib/nova-api
+ExecStart=/usr/bin/node /opt/nova-ai-studio/src/storage-runner.js
+Restart=always
+RestartSec=10
+# Logs go to the systemd journal:
+#   journalctl -u nova-storage-runner -n 100
+
+[Install]
+WantedBy=multi-user.target

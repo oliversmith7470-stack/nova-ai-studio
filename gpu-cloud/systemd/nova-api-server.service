@@ -1,0 +1,121 @@
+# NOVA AI Studio — API process systemd unit (Phase 5, Rev 4.8 §14/§19).
+#
+# Promoted from the Phase 3 draft by the Rev 4.8 design. Installed (not
+# started) by gpu-cloud/systemd/install.sh on the API host. Production
+# activation is a SEPARATE authorised step (§15 M2/M2-P): the activation
+# flags in /etc/nova-api/activation.conf default to false, and until
+# activation the production gate stays closed — the Worker still 503s
+# production requests. Installing this unit does not open production.
+#
+# Startup chain (the dependency chain is the ordering mechanism — there is
+# no ExecStartPre for the request id and none starting the recovery unit):
+#   nova-api-server.service
+#     Requires=nova-storage-recovery.service (and After=)
+#       Requires=nova-startup-id.service (and After=)
+# Every start attempt re-runs the whole chain from the preparation unit, so
+# every attempt gets a fresh request id and a fresh recovery cycle.
+#
+# Retry model (§14): the API unit's own Restart=on-failure covers
+# API-process failures only (pre-listen validation, internal steps,
+# listen()), decided against the shared attempt counter — the process exits
+# 1 if attempts < 5 (systemd restarts the unit) or 42
+# (STARTUP_RETRY_LIMIT_EXIT) if attempts >= 5, and
+# RestartPreventExitStatus=42 prevents the restart. Dependency failures
+# (preparation or recovery unit exits non-zero) are NOT covered by this
+# restart: the start job fails with result `dependency` and the retry
+# supervisor (nova-startup-retry.service, fired by OnFailure= on the two
+# dependency units) re-attempts the whole chain. The API unit itself
+# carries NO OnFailure= — exactly one retry path per failure kind.
+# StartLimitBurst=5 / StartLimitIntervalSec=300s (in [Unit], where they
+# configure something — Rev 4.3 verdict) is the backstop with the same
+# 5-in-300 s numbers as the shared file counter.
+#
+# Constraints encoded here (do not weaken them in the deploy review):
+# - Runs as an unprivileged user, no DynamicUser (it owns state files).
+# - State directory /var/lib/nova-api (api-state.json, gpu-manager.json,
+#   storage) is local to this host; the store is single-writer by design.
+# - The API secret arrives from a file only (EnvironmentFile), never
+#   from a command line, never committed to the repo, never in a shell
+#   history. Rotation = edit the file, restart the unit, update the
+#   Worker secret, verify with a signed health-check + old-secret 401.
+# - No CapabilityBoundingSet, no network egress to Kaggle from this unit
+#   in controlled-test mode (the fake executor performs no network call).
+#   A production deployment must add the Kaggle CLI path and its own
+#   egress review before any real executor is registered. (No provider
+#   CLI path is added here: none is specified by the design, and no
+#   permitted provider exists yet — NOVA_PRODUCTION_EXECUTORS is empty.)
+# - No tunnel dependency is declared here: no tunnel unit exists yet
+#   (out of scope for this install).
+# - PrivateTmp, ProtectSystem=strict, ProtectHome, NoNewPrivileges.
+# - Restart on failure only; a crash loop must surface to the operator
+#   (startup reconciliation re-runs on every start, so a crash does not
+#   lose dispatch state — the journal is durable).
+
+[Unit]
+Description=NOVA AI Studio API process (Phase 5, production)
+After=network-online.target nova-storage-recovery.service
+Wants=network-online.target
+Requires=nova-storage-recovery.service
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+
+[Service]
+Type=notify
+NotifyAccess=all
+# TimeoutStartSec (Rev 4.9, F-5a): 60 s — the API unit's OWN post-dependency
+# startup bound (readiness verification + startup sweep + pending-mutation
+# replay + startup reconciliation + listen() + READY=1). The design's 780 s
+# is the RETRY service's total (30 s supervisor sleep + 30 s preparation +
+# 600 s recovery + 60 s API spawn/margin + 60 s supervisor post-start
+# release/outcome/re-arm margin), NOT this unit's start timeout:
+# under Type=notify the supervisor's `systemctl start` blocks until READY=1,
+# so the API's post-dependency startup must fit the 60 s margin — measured
+# at <1 s on the dev VM (see the Rev 4.9 implementation report), and the
+# 60 s bound fails the start job (supervisor re-arms) rather than hanging
+# the supervisor's 780 s TimeoutSec. Do NOT copy 780 s here.
+TimeoutStartSec=60s
+User=nova-api
+Group=nova-api
+WorkingDirectory=/opt/nova-ai-studio
+Environment=NOVA_API_MODE=production
+Environment=NOVA_API_DATA_DIR=/var/lib/nova-api
+Environment=NOVA_API_HOST=127.0.0.1
+Environment=NOVA_API_PORT=8788
+Environment=NOVA_STARTUP_STATE_DIR=/var/lib/nova-api
+# No permitted production provider exists yet (§6 gate unpassed), so the
+# authorisation list is empty and publicProductionAuthorised is false for
+# reason no-production-executor.
+Environment=NOVA_PRODUCTION_EXECUTORS=
+# Owner-only personal executor id (§6/§12). Registration at process start
+# is conditional on the Kaggle credential being present on the host AND the
+# owner token being configured; the activation flags (default false) gate
+# any dispatch.
+Environment=NOVA_PERSONAL_EXECUTOR=kaggle-t4
+# Quota floors (§11/§13): Kaggle experiment floor 5 h/week; quota floor
+# fraction 0.15; provider-selection weights 0.5,0.5.
+Environment=NOVA_KAGGLE_EXPERIMENT_FLOOR_HOURS=5
+Environment=NOVA_QUOTA_FLOOR_FRACTION=0.15
+Environment=NOVA_SELECTION_WEIGHTS=0.5,0.5
+# Queue bounds (§14): public 0 (a public job is accepted only when an
+# execution slot is actually free), personal 2. Reservation TTL 30 min.
+Environment=NOVA_PUBLIC_QUEUE_MAX=0
+Environment=NOVA_PERSONAL_QUEUE_MAX=2
+Environment=NOVA_RESERVATION_TTL_MINUTES=30
+# Allocation timeouts (§14): public 10 min, personal 75 min.
+Environment=NOVA_PUBLIC_ALLOC_TIMEOUT_MINUTES=10
+Environment=NOVA_PERSONAL_ALLOC_TIMEOUT_MINUTES=75
+EnvironmentFile=/etc/nova-api/api.env
+ExecStart=/usr/bin/node /opt/nova-ai-studio/gpu-cloud/src/api-server.js
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=42
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/nova-api
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

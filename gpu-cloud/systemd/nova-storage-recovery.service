@@ -1,0 +1,47 @@
+# NOVA AI Studio — storage recovery systemd unit (Phase 5, Rev 4.8 §14).
+#
+# Type=oneshot, runs once per start attempt: catch-up pass only.
+# RemainAfterExit=no is stated explicitly, so this unit is retriggered on
+# every API start transaction and never left active across restarts.
+#
+# Declares Requires=nova-startup-id.service + After=nova-startup-id.service,
+# so the preparation unit runs first and this unit reads the fresh request id
+# from /var/lib/nova-api/startup-request-id (never a previous attempt's id,
+# never a missing id). It runs one catch-up pass (delete every object past
+# expiry, rebuild + reconcile the store index), writes the readiness record
+# /var/lib/nova-api/readiness.json (cycleId, startupRequestId echoed from
+# the request-id file, bootId, startedAt, completedAt, status, counts) and
+# the runner heartbeat /var/lib/nova-api/runner-health.json on completion.
+# Exits 0 on success / non-zero on failure, logging
+# startup-recovery-failed (tag nova-storage-recovery) with the error on
+# failure. If it exits non-zero, the API never starts and its OnFailure=
+# fires the retry supervisor.
+#
+# The catch-up pass itself is implemented by the storage runner
+# (gpu-cloud/src/storage-runner.js --catch-up, installed by install.sh to
+# /opt/nova-ai-studio/src/storage-runner.js); this unit only orders and
+# supervises it. Installed by gpu-cloud/systemd/install.sh. No [Install]
+# section: this unit is never enabled directly; it is pulled in by the API
+# unit's Requires=.
+#
+# Runs as User=nova-api (same as the API and the hourly runner daemon):
+# every state file this pass creates (readiness.json, runner-health.json,
+# deletion-log.jsonl, sweep.lock) must be writable by the hourly daemon,
+# which runs as nova-api; a root-created sweep.lock would make the daemon's
+# pass fail with EACCES.
+
+[Unit]
+Description=NOVA AI Studio storage recovery (Phase 5)
+Requires=nova-startup-id.service
+After=nova-startup-id.service
+OnFailure=nova-startup-retry.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+User=nova-api
+Group=nova-api
+ExecStart=/usr/bin/node /opt/nova-ai-studio/src/storage-runner.js --catch-up
+TimeoutSec=600
+StandardOutput=journal
+StandardError=journal

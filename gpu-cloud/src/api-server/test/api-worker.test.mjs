@@ -21,6 +21,7 @@ import { randomBytes, randomUUID, createHash } from 'node:crypto';
 
 import { createApiServer } from '../../api-server.js';
 import { HttpD1Client } from '../d1-client.js';
+import { FakeControlledExecutor } from '../fake-executor.js';
 import { signApiCall } from '../auth.js';
 
 const requireA2 = createRequire(new URL('../../../../a2-impl/package.json', import.meta.url));
@@ -96,6 +97,9 @@ test('end-to-end: generate -> 202 -> accept -> fileReport -> succeeded -> downlo
     port: 0,
     host: '127.0.0.1',
     dataDir: path.join(dir, 'api-data'),
+    // Controlled-test mode requires an explicitly supplied executor
+    // (Rev 3 §C-1.4); without it construction refuses to start.
+    executor: new FakeControlledExecutor(),
     d1Client: new HttpD1Client({
       workerOrigin: 'http://127.0.0.1:1',
       secret: TEST_SECRET,

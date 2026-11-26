@@ -1,0 +1,14 @@
+{
+  "description": "NOVA Personal GPU Cloud — Stage 2: Kaggle + Colab executors, offline staging (VDP-04), weekly hours tracking, VDP-06 data boundary. Local code + tests only. No live GPU, no accounts, no keys, no deploy.",
+  "engines": {
+    "node": ">=20"
+  },
+  "name": "nova-gpu-cloud",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/*.test.mjs test/storage/*.test.mjs",
+    "test:all": "node --test test/job-lifecycle.test.mjs test/idempotency.test.mjs test/queue.test.mjs test/reservations.test.mjs test/ceiling.test.mjs test/kill-switch.test.mjs test/timeouts.test.mjs test/reconcile.test.mjs test/store.test.mjs test/data-guard.test.mjs test/hours.test.mjs test/staging.test.mjs test/executors.test.mjs test/stage2-integration.test.mjs test/storage-wiring.test.mjs test/phase5-startup.test.mjs test/phase5-alert.test.mjs test/phase5-wrapper.test.mjs test/phase5-transport.test.mjs test/phase5-installed.test.mjs test/phase5-installed-slow.test.mjs test/storage/engine.test.mjs test/storage/chunking.test.mjs test/storage/integrity.test.mjs test/storage/expiry.test.mjs test/storage/quota.test.mjs test/storage/delivery.test.mjs"
+  },
+  "type": "module",
+  "version": "0.2.0"
+}

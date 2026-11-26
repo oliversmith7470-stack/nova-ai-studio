@@ -1,0 +1,16 @@
+# NOVA AI Studio — health-check probe timer (Phase 5, Rev 4.8 §10).
+#
+# Fires the health-check probe every 5 minutes. Persistent=true, so a
+# missed run (e.g. the host was down) catches up on the next boot.
+# Installed by gpu-cloud/systemd/install.sh; do not enable by hand.
+
+[Unit]
+Description=NOVA AI Studio health-check probe timer (Phase 5)
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+Unit=nova-health-check.service
+
+[Install]
+WantedBy=timers.target

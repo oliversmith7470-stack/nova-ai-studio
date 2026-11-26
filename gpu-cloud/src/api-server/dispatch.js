@@ -58,6 +58,7 @@ import {
 } from './constants.js';
 import { normalizeExecutorState, kaggleCancelReason } from './kaggle-status.js';
 import { D1AuthError, D1RetryableError } from './d1-client.js';
+import { checkRunnerHeartbeat } from './runner-heartbeat.js';
 
 const JOB_ID_RE = /^nova-job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -84,9 +85,28 @@ const WORKER_STATE_FOR_DISPATCH_STATE = {
 };
 
 export class DispatchManager {
+  // Executor registry (Rev 4.9 §4): the manager routes by the provider id
+  // it actually reserved, so this class takes an executor REGISTRY keyed by
+  // provider id — productionExecutors + personalExecutors (Maps), or a
+  // single merged `executors` Map — instead of one executor object. The
+  // legacy single `executor` option is still accepted (controlled-test
+  // mode and existing callers): it is registered under its own id and
+  // remains the fallback for executions recorded before the registry
+  // existed. An explicitly-passed EMPTY registry is legitimate: production
+  // mode with no production executor starts in the no-capacity state and
+  // every production submit fails closed with 503 no-capacity. Passing
+  // neither an executor nor any registry is a programming error and throws.
+  // runnerHealthPath (optional): when set, every submit revalidates the
+  // storage-runner heartbeat (Rev 4.9 §6/F-6a) and refuses 503
+  // storage-full while the runner is unhealthy; when unset the gate is
+  // skipped (direct-construction callers that own no runner).
   constructor({
     manager,
     executor,
+    executors,
+    productionExecutors,
+    personalExecutors,
+    runnerHealthPath = null,
     d1Client,
     apiState,
     mode = 'controlled-test',
@@ -98,11 +118,40 @@ export class DispatchManager {
     now = () => Date.now(),
   } = {}) {
     if (!manager) throw new Error('DispatchManager requires a GpuManager');
-    if (!executor) throw new Error('DispatchManager requires an executor');
     if (!d1Client) throw new Error('DispatchManager requires a d1Client');
     if (!apiState) throw new Error('DispatchManager requires an ApiStateStore');
     this.manager = manager;
-    this.executor = executor;
+    this.executors = new Map();
+    this.productionExecutorIds = new Set();
+    this.personalExecutorIds = new Set();
+    let registryArg = false;
+    const mergeRegistry = (map, ids) => {
+      if (map === undefined || map === null) return;
+      registryArg = true;
+      const entries = map instanceof Map ? map.entries() : Object.entries(map);
+      for (const [id, ex] of entries) {
+        if (typeof ex?.start !== 'function') throw new Error(`DispatchManager registry entry ${id} requires a start(job) function`);
+        this.executors.set(id, ex);
+        if (ids) ids.add(id);
+      }
+    };
+    mergeRegistry(executors, null);
+    mergeRegistry(productionExecutors, this.productionExecutorIds);
+    mergeRegistry(personalExecutors, this.personalExecutorIds);
+    if (executor) {
+      if (typeof executor?.start !== 'function') throw new Error('DispatchManager requires an executor with a start(job) function');
+      this.executor = executor;
+      // Executor identity: BaseExecutor-family executors carry providerId,
+      // the controlled-test fake carries id.
+      const legacyId = executor.providerId ?? executor.id ?? null;
+      if (legacyId && !this.executors.has(legacyId)) this.executors.set(legacyId, executor);
+    } else {
+      this.executor = this.executors.size === 1 ? [...this.executors.values()][0] : null;
+    }
+    if (!this.executor && this.executors.size === 0 && !registryArg) {
+      throw new Error('DispatchManager requires an executor or executor registry');
+    }
+    this.runnerHealthPath = runnerHealthPath;
     this.d1Client = d1Client;
     this.apiState = apiState;
     this.mode = mode;
@@ -114,6 +163,42 @@ export class DispatchManager {
     this.now = now;
     this._submitQueue = Promise.resolve();
     this._ackTimer = null;
+  }
+
+  // -- executor resolution (Rev 4.9 §4) -----------------------------------
+
+  // The executor for one execution: the provider id the manager actually
+  // reserved, recorded as entry.executorId at slot-claim. Falls back to
+  // the legacy single executor ONLY when the entry carries no provider id
+  // (pre-registry executions). When the entry carries a provider id that
+  // is not registered, returns null — the caller treats that as unknown;
+  // a supplied-but-unknown provider id must NEVER fall back to the legacy
+  // executor (Rev 4.9, ChatGPT correction 4A).
+  _executorForExecution(executionId) {
+    const entry = this.journalEntry(executionId);
+    if (entry?.executorId) {
+      return this.executors.get(entry.executorId) ?? null;
+    }
+    return this.executor;
+  }
+
+  // The executor for a provider id: the legacy fallback applies ONLY
+  // when there is NO provider id at all. A supplied provider id that is
+  // not registered returns null — the caller treats that as unknown
+  // (Rev 4.9, ChatGPT correction 4A).
+  _executorForProvider(providerId) {
+    if (providerId) {
+      return this.executors.get(providerId) ?? null;
+    }
+    return this.executor;
+  }
+
+  // True when at least one production executor is registered. The
+  // production submit gate is registry-aware, not unconditional: with the
+  // empty Rev 4.9 allowlist it is false and production submits fail closed
+  // with 503 no-capacity — the correct honest state, not a fake dispatch.
+  _hasProductionExecutor() {
+    return this.productionExecutorIds.size > 0;
   }
 
   // -- journal ------------------------------------------------------------
@@ -291,10 +376,28 @@ export class DispatchManager {
     if (body.deploymentMode && body.deploymentMode !== this.mode) {
       return { status: 503, body: { error: 'no-capacity' } };
     }
-    if (this.mode === 'production') {
-      // No production executor is registered in Phase 3 (Rev 2 §6.4):
-      // public generation is honestly unavailable.
+    if (this.mode === 'production' && !this._hasProductionExecutor()) {
+      // Rev 4.9 §4: no production executor is registered (the Rev 4.9
+      // allowlist is empty — no provider has passed the §6 gate), so public
+      // generation is honestly unavailable. This is a registry-aware gate,
+      // not the old unconditional branch: when a production executor IS
+      // registered, the submit proceeds through the provider-routed path
+      // below (the manager reserves the provider; the per-execution
+      // executor handles submit/start, state query, cancel, and report).
       return { status: 503, body: { error: 'no-capacity' } };
+    }
+
+    // Storage-runner heartbeat gate (Rev 4.9 §6, §14 Stage 2): every submit
+    // revalidates the live heartbeat. A missing, unreadable, failed, or
+    // older-than-two-hours heartbeat refuses the submit with 503
+    // capacity_unavailable / storage-full; in-flight work is not cancelled.
+    // The gate runs inside the serialised submit section, before any
+    // reservation is made, so a refusal holds nothing.
+    if (this.runnerHealthPath) {
+      const heartbeat = checkRunnerHeartbeat(this.runnerHealthPath, this.now());
+      if (!heartbeat.healthy) {
+        return { status: 503, body: { error: 'storage-full' } };
+      }
     }
 
     const executions = body.sceneExecutions;
@@ -471,8 +574,12 @@ export class DispatchManager {
     for (const [managerJobId, { x, providerId }] of placed) {
       const idx = executions.findIndex((e) => e.executionId === x.executionId);
       managerJobIds[idx] = managerJobId;
-      const submission = this.executor.submissions
-        ? this.executor.submissions.get(managerJobId)
+      // Rev 4.9 §4: the submission record comes from the executor for the
+      // provider the manager actually reserved — never from a single
+      // assumed executor.
+      const placedExecutor = this._executorForProvider(providerId);
+      const submission = placedExecutor?.submissions
+        ? placedExecutor.submissions.get(managerJobId)
         : null;
       this._journalMutate(x.executionId, (entry) => {
         entry.managerJobId = managerJobId;
@@ -562,8 +669,15 @@ export class DispatchManager {
   // -- executor state query (authoritative, at the source) ----------------
 
   _queryExecutor(executionId) {
+    // Rev 4.9 §4: state is queried from the executor for the provider
+    // reserved for THIS execution — a different provider's executor must
+    // never answer for it.
+    const executor = this._executorForExecution(executionId);
+    if (!executor || typeof executor.getExecutionState !== 'function') {
+      return { state: 'unknown', evidence: { raw: null } };
+    }
     try {
-      const res = this.executor.getExecutionState(executionId);
+      const res = executor.getExecutionState(executionId);
       if (res && typeof res.state === 'string') return res;
     } catch (err) {
       return { state: 'unknown', evidence: { queryError: String(err && err.message ? err.message : err) } };
@@ -678,8 +792,12 @@ export class DispatchManager {
     const managerJobId = entry.managerJobId;
     if (managerJobId) {
       let resolved = false;
-      if (typeof this.executor.reportFailure === 'function') {
-        try { resolved = this.executor.reportFailure(managerJobId, reason); } catch { resolved = false; }
+      // Rev 4.9 §4: the failure is reported through the executor that ran
+      // this execution (the reserved provider's executor), not a single
+      // assumed executor.
+      const executor = this._executorForExecution(executionId);
+      if (executor && typeof executor.reportFailure === 'function') {
+        try { resolved = executor.reportFailure(managerJobId, reason); } catch { resolved = false; }
       }
       if (!resolved) {
         const job = this.manager.getJob(managerJobId);
@@ -843,8 +961,11 @@ export class DispatchManager {
       return;
     }
     // Manager succeeded: the output must still validate before storage.
-    const report = this.executor.lastReport
-      ? this.executor.lastReport(managerJobId)
+    // Rev 4.9 §4: the completion report comes from the executor that ran
+    // this execution (the reserved provider's executor).
+    const executor = this._executorForExecution(x.executionId);
+    const report = executor?.lastReport
+      ? executor.lastReport(managerJobId)
       : null;
     const outputPath = report ? report.outputPath : null;
     if (!outputPath) {
@@ -888,7 +1009,7 @@ export class DispatchManager {
         source: outputPath,
         contentType: 'video/mp4',
       });
-      const ref = this.manager.issueJobDeliveryRef(managerJobId, {});
+      const ref = await this.manager.issueJobDeliveryRef(managerJobId, {});
       this._releaseHeadroom(x.executionId);
       await this._applyD1([{
         type: 'scene-update', jobId: entry ? entry.jobId : x.jobId, sceneIndex: x.sceneIndex,
@@ -1051,7 +1172,13 @@ export class DispatchManager {
     const status = report.status === 'complete' || report.status === 'succeeded'
       ? 'succeeded'
       : 'failed';
-    return this.executor.fileReport({
+    // Rev 4.9 §4: the report is filed with the executor that ran this
+    // execution (the reserved provider's executor).
+    const executor = this._executorForExecution(executionId);
+    if (!executor || typeof executor.fileReport !== 'function') {
+      return { filed: false, reason: 'no-executor-for-provider' };
+    }
+    return executor.fileReport({
       ...report,
       status,
       outputPath,

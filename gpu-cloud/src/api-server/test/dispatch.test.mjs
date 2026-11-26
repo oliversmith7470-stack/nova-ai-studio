@@ -55,6 +55,20 @@ test('production mode refuses every submit with no-capacity', async (t) => {
   assert.equal(api.manager.listJobs().length, 0);
 });
 
+test('submit refused 503 storage-full when the runner heartbeat is missing', async (t) => {
+  // Rev 4.9 §6 gate: the submit-time heartbeat check fails closed. The
+  // harness seeds a fresh heartbeat by default; this test opts out to
+  // prove the gate itself refuses the submit (and holds nothing).
+  const { api, d1, cleanup } = await makeApi({ seedHeartbeat: false });
+  t.after(cleanup);
+  const body = submitBody('job-noheartbeat');
+  seedJobForSubmit(d1, body);
+  const res = await api.dispatch.submitExecutions(body);
+  assert.equal(res.status, 503);
+  assert.equal(res.body.error, 'storage-full');
+  assert.equal(api.manager.listJobs().length, 0);
+});
+
 test('no executor wired: reservation created then released, 503 no-executor', async (t) => {
   const { api, d1, cleanup } = await makeApi();
   t.after(cleanup);
