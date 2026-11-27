@@ -112,10 +112,10 @@ async function main() {
     check('head() metadata agrees', head && head.sizeBytes === originalSize && head.objectId === originalHash);
 
     // --- 4. Delivery reference through the manager.
-    const ref = manager.issueJobDeliveryRef(job.id);
+    const ref = await manager.issueJobDeliveryRef(job.id);
     check('delivery ref issued (opaque nova://)', ref.ref.startsWith('nova://delivery/'));
     check('job resultRef holds the ref, not bytes', manager.getJob(job.id).resultRef === ref.ref);
-    const redeemed = cloud.storage.redeemDeliveryRef(ref.ref);
+    const redeemed = await cloud.storage.redeemDeliveryRef(ref.ref);
     check('delivery ref redeems to the stored clip', redeemed.objectId === originalHash);
 
     // --- 5. Usage accounting.
@@ -142,8 +142,8 @@ async function main() {
       ttlMs: 3000,
     });
     check('short-TTL object present before expiry', manager.headJobOutput(expiryJob.id) !== null);
-    const expiryRef = manager.issueJobDeliveryRef(expiryJob.id);
-    check('short-TTL object has a live delivery ref', cloud.storage.redeemDeliveryRef(expiryRef.ref).objectId === sha256Buffer(shortBytes));
+    const expiryRef = await manager.issueJobDeliveryRef(expiryJob.id);
+    check('short-TTL object has a live delivery ref', (await cloud.storage.redeemDeliveryRef(expiryRef.ref)).objectId === sha256Buffer(shortBytes));
     console.log('  waiting 4s for the 3s TTL to pass…');
     await sleep(4000);
     const sweep = await manager.runStorageSweep();
@@ -157,7 +157,7 @@ async function main() {
     check('job outputRef cleared after expiry', manager.getJob(expiryJob.id).outputRef === null);
     let refFailed = false;
     try {
-      cloud.storage.redeemDeliveryRef(expiryRef.ref);
+      await cloud.storage.redeemDeliveryRef(expiryRef.ref);
     } catch (err) {
       refFailed = err.name === 'DeliveryRefError';
     }

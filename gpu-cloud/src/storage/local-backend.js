@@ -174,7 +174,17 @@ export class LocalBackend {
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const dir = path.join(this.stagingDir, entry.name);
-      const stat = fs.statSync(dir);
+      let stat;
+      try {
+        stat = fs.statSync(dir);
+      } catch (err) {
+        // A concurrent API write can complete (and remove its staging
+        // dir) between readdir and stat. A vanished dir is not stale —
+        // skip it instead of failing the whole sweep (10C race, found
+        // 27 Nov 2026 during the be69bc4 verification).
+        if (err && err.code === 'ENOENT') continue;
+        throw err;
+      }
       if (now - stat.mtimeMs > olderThanMs) stale.push(entry.name);
     }
     return stale;
