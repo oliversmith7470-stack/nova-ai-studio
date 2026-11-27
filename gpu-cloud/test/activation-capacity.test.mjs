@@ -36,6 +36,7 @@ import {
 } from '../src/api-server/activation.js';
 import { verifyWorkerAuth, processStartMs, signApiCall } from '../src/api-server/auth.js';
 import { ApiStateStore } from '../src/api-server/state-store.js';
+import { SqliteNonceStore } from '../src/api-server/nonce-store.js';
 import { createApiServer } from '../src/api-server.js';
 import { createStorage } from '../src/storage/index.js';
 import {
@@ -52,6 +53,17 @@ function tempDir(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nova-m2p-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return dir;
+}
+
+// The millisecond process-start rule rejects a request signed in the
+// module-load second (ts*1000 <= processStartMs). A live-server test
+// that fetches within that second would flake with a 401. Wait until
+// the wall-clock second has advanced past the module-load second
+// (at most ~1 s) before the first signed fetch in a (u6) test.
+async function awaitPastStartSecond() {
+  const boundary = (Math.floor(processStartMs() / 1000) + 1) * 1000;
+  const wait = boundary - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait + 5));
 }
 
 function writeActivationConf(dir, text) {
@@ -403,69 +415,110 @@ test('(u4) activation audit log: one JSON line per change; bad flag or missing r
   assert.throws(() => appendActivationAuditLog({ logPath, operator: 'x', flag: 'personalProductionActivated', oldValue: false, newValue: true }), /authorisationRef is required/);
 });
 
-// -- (u5) process-start rule (§15) -------------------------------------------
+// -- (u5) process-start rule (§15, millisecond rule) -----------------------
+// Reviewer correction: timestampSeconds * 1000 <= processStartMs rejects
+// (equality AND earlier). A timestamp is second granularity, so the
+// call's whole second at or before the process-start second is rejected;
+// the first acceptable second is the second after start, and a
+// legitimate caller re-signs. The six reviewer tests:
+//   1. timestamp before the process start -> step 3;
+//   2. timestamp exactly equal to the process start -> step 3;
+//   3. timestamp in the same second but before the actual start -> step 3;
+//   4. timestamp in the next second -> ok;
+//   5. fresh request after process start -> ok;
+//   6. nonce replay -> step 5.
+// The HMAC is keyed by the SIGNING secret; the TRANSPORT secret is only
+// presented. The nonce store is the local SQLite store, not ApiStateStore.
 
-function signedRequestHeaders({ secret, method, path: p, bodyText, timestamp, nonce }) {
+function signedRequestHeaders({ transport, signing, method, path: p, bodyText, timestamp, nonce }) {
   const bodyHash = createHash('sha256').update(bodyText, 'utf8').digest('hex');
   const canonical = [method, p, timestamp, nonce, bodyHash].join('\n');
-  const signature = createHmac('sha256', secret).update(canonical, 'utf8').digest('hex');
+  const signature = createHmac('sha256', signing).update(canonical, 'utf8').digest('hex');
   return {
-    'x-nova-api-secret': secret,
+    'x-nova-api-secret': transport,
     'x-nova-signature': signature,
     'x-nova-timestamp': timestamp,
     'x-nova-nonce': nonce,
   };
 }
 
-test('(u5) process-start rule: a request timestamped before the process-start second is rejected, one in that second passes', (t) => {
-  const secret = 'test-secret';
+function u5Auth(ctx, headers, opts) {
+  return verifyWorkerAuth({ headers }, 'GET', '/internal/health', '', {
+    transportSecrets: ['test-secret'],
+    signingSecrets: [TEST_SIGNING_SECRET],
+    apiState: ctx.apiState,
+    nonceStore: ctx.nonceStore,
+  }, opts);
+}
+
+test('(u5) process-start rule (millisecond): the reviewer six tests', (t) => {
   const dir = tempDir(t);
   const apiState = new ApiStateStore(path.join(dir, 'api-state.json'));
+  const nonceStore = new SqliteNonceStore(path.join(dir, 'nonces.db'));
+  t.after(() => { try { nonceStore.close(); } catch { /* ignore */ } });
+  const ctx = { apiState, nonceStore };
   const nowSec = Math.floor(Date.now() / 1000);
-  // The boundary is injectable, so the test is deterministic no matter
-  // when the suite reaches it. The comparison is in seconds: a
-  // timestamp 31 s ago with a process start 30 s ago is a replay from
-  // a previous process era — inside the ±60 s freshness window, but
-  // from a second before the start second, so the rule (not the window)
-  // rejects it at step 3. A timestamp in the start second itself is
-  // allowed: second-granularity timestamps cannot tell whether it was
-  // created before or after the process started in that second.
-  const boundaryMs = (nowSec - 30) * 1000;
+  // A deterministic boundary: the process "started" at nowSec-30 plus
+  // 700 ms into that second (N.700). The boundary is injectable, so the
+  // test is deterministic no matter when the suite reaches it.
+  const boundaryMs = (nowSec - 30) * 1000 + 700;
+
+  // 1. A timestamp before the process start is rejected at step 3 —
+  // even though it is inside the ±60 s freshness window (31 s ago vs a
+  // 30 s old process): the rule, not the window, rejects it.
   const beforeStart = signedRequestHeaders({
-    secret, method: 'GET', path: '/internal/health', bodyText: '',
+    transport: 'test-secret', signing: TEST_SIGNING_SECRET,
+    method: 'GET', path: '/internal/health', bodyText: '',
     timestamp: String(nowSec - 31), nonce: randomBytes(16).toString('hex'),
   });
-  const replayed = verifyWorkerAuth(
-    { headers: beforeStart }, 'GET', '/internal/health', '', [secret], apiState,
-    { processStartMs: boundaryMs },
-  );
-  assert.deepEqual(replayed, { ok: false, step: 3 });
-  const inStartSecond = signedRequestHeaders({
-    secret, method: 'GET', path: '/internal/health', bodyText: '',
+  assert.deepEqual(u5Auth(ctx, beforeStart, { processStartMs: boundaryMs }), { ok: false, step: 3 });
+
+  // 2. A timestamp exactly equal to the process start (ts*1000 ==
+  // processStartMs) is rejected: equality is a replay from the previous
+  // process era (or from before this process existed).
+  const exactStart = signedRequestHeaders({
+    transport: 'test-secret', signing: TEST_SIGNING_SECRET,
+    method: 'GET', path: '/internal/health', bodyText: '',
     timestamp: String(nowSec - 30), nonce: randomBytes(16).toString('hex'),
   });
+  // boundaryMs is (nowSec-30)*1000 + 700, so ts*1000 < boundaryMs —
+  // this is case 3's shape too; for the exact-equality case use a
+  // boundary exactly on the second.
   assert.deepEqual(
-    verifyWorkerAuth(
-      { headers: inStartSecond }, 'GET', '/internal/health', '', [secret], apiState,
-      { processStartMs: boundaryMs },
-    ),
-    { ok: true },
+    u5Auth(ctx, exactStart, { processStartMs: (nowSec - 30) * 1000 }),
+    { ok: false, step: 3 },
   );
-  // A fresh timestamp passes against the real module-load boundary; a
-  // second identical request fails at step 5 (nonce consumed), not 3.
+
+  // 3. A timestamp in the same second but before the actual start
+  // (start at N.700, timestamp N) is rejected: the call's whole second
+  // at or before the process-start second is rejected.
+  assert.deepEqual(u5Auth(ctx, exactStart, { processStartMs: boundaryMs }), { ok: false, step: 3 });
+
+  // 4. A timestamp in the next second (N+1, start N.700) is accepted:
+  // the first acceptable second is the second after start.
+  const nextSecond = signedRequestHeaders({
+    transport: 'test-secret', signing: TEST_SIGNING_SECRET,
+    method: 'GET', path: '/internal/health', bodyText: '',
+    timestamp: String(nowSec - 29), nonce: randomBytes(16).toString('hex'),
+  });
+  assert.deepEqual(u5Auth(ctx, nextSecond, { processStartMs: boundaryMs }), { ok: true });
+
+  // 5. A fresh request after process start passes — against an injected
+  // boundary 5 s in the past (the real module-load boundary would make
+  // this test timing-dependent: a request signed in the module-load
+  // second is rejected by design, and this test runs in that second).
   const freshNonce = randomBytes(16).toString('hex');
   const fresh = signedRequestHeaders({
-    secret, method: 'GET', path: '/internal/health', bodyText: '',
+    transport: 'test-secret', signing: TEST_SIGNING_SECRET,
+    method: 'GET', path: '/internal/health', bodyText: '',
     timestamp: String(nowSec), nonce: freshNonce,
   });
-  assert.deepEqual(
-    verifyWorkerAuth({ headers: fresh }, 'GET', '/internal/health', '', [secret], apiState),
-    { ok: true },
-  );
-  const replaySameNonce = verifyWorkerAuth(
-    { headers: fresh }, 'GET', '/internal/health', '', [secret], apiState,
-  );
-  assert.deepEqual(replaySameNonce, { ok: false, step: 5 });
+  assert.deepEqual(u5Auth(ctx, fresh, { processStartMs: (nowSec - 5) * 1000 }), { ok: true });
+
+  // 6. A second identical request fails at step 5 (nonce consumed),
+  // not step 3 — the nonce store, not the start rule, rejects it.
+  assert.deepEqual(u5Auth(ctx, fresh, { processStartMs: (nowSec - 5) * 1000 }), { ok: false, step: 5 });
+
   // processStartMs() is a real module-load timestamp, not zero.
   assert.ok(processStartMs() > 0 && processStartMs() <= Date.now());
 });
@@ -494,9 +547,10 @@ test('(u6) capacity route: signed GET returns a verifiable response; flags are N
     assert.equal(api.activation.signingSecretPresent, true);
 
     const { port } = await api.start();
+    await awaitPastStartSecond();
     const nonce = randomBytes(16).toString('hex');
     const pathWithQuery = `/internal/capacity?audience=personal&requestNonce=${nonce}`;
-    const headers = signApiCall('test-secret', 'GET', pathWithQuery, '');
+    const headers = signApiCall('test-secret', TEST_SIGNING_SECRET, 'GET', pathWithQuery, '');
     const res = await fetch(`http://127.0.0.1:${port}${pathWithQuery}`, { headers });
     assert.equal(res.status, 200);
     const bodyText = await res.text();
@@ -537,17 +591,18 @@ test('(u6) capacity route: unsigned request is 401; bad audience and bad nonce a
   });
   try {
     const { port } = await api.start();
+    await awaitPastStartSecond();
     const nonce = randomBytes(16).toString('hex');
     const unauth = await fetch(`http://127.0.0.1:${port}/internal/capacity?audience=personal&requestNonce=${nonce}`);
     assert.equal(unauth.status, 401);
     const badAudiencePath = `/internal/capacity?audience=owner&requestNonce=${nonce}`;
     const badAudience = await fetch(`http://127.0.0.1:${port}${badAudiencePath}`, {
-      headers: signApiCall('test-secret', 'GET', badAudiencePath, ''),
+      headers: signApiCall('test-secret', TEST_SIGNING_SECRET, 'GET', badAudiencePath, ''),
     });
     assert.equal(badAudience.status, 400);
     const badNoncePath = '/internal/capacity?audience=personal&requestNonce=xyz';
     const badNonce = await fetch(`http://127.0.0.1:${port}${badNoncePath}`, {
-      headers: signApiCall('test-secret', 'GET', badNoncePath, ''),
+      headers: signApiCall('test-secret', TEST_SIGNING_SECRET, 'GET', badNoncePath, ''),
     });
     assert.equal(badNonce.status, 400);
   } finally {
@@ -555,7 +610,7 @@ test('(u6) capacity route: unsigned request is 401; bad audience and bad nonce a
   }
 });
 
-test('(u6) capacity route: a process without a signing secret serves nothing (503), never unsigned', async (t) => {
+test('(u6) capacity route: a process without a signing secret authenticates nothing (401), never unsigned', async (t) => {
   const dir = tempDir(t);
   const confPath = writeActivationConf(dir, 'NOVA_PUBLIC_PRODUCTION_ACTIVATED=false\nNOVA_PERSONAL_PRODUCTION_ACTIVATED=false\n');
   const { api, cleanup } = await makeApi({
@@ -567,11 +622,28 @@ test('(u6) capacity route: a process without a signing secret serves nothing (50
     const { port } = await api.start();
     const nonce = randomBytes(16).toString('hex');
     const pathWithQuery = `/internal/capacity?audience=public&requestNonce=${nonce}`;
+    // The request is signed by hand in the legacy single-secret shape
+    // (HMAC keyed by the transport secret): signApiCall would throw
+    // without a signing secret, and the legacy shape must NOT verify.
+    // Request auth fails closed with 401 before the route is reached —
+    // the route-level 503 (capacity-unavailable) is defence in depth
+    // for a process without a signing secret, unreachable while request
+    // auth requires one. Either way the process serves nothing unsigned.
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const bodyHash = createHash('sha256').update('', 'utf8').digest('hex');
+    const canonical = ['GET', pathWithQuery, timestamp, nonce, bodyHash].join('\n');
+    const signature = createHmac('sha256', 'test-secret').update(canonical, 'utf8').digest('hex');
     const res = await fetch(`http://127.0.0.1:${port}${pathWithQuery}`, {
-      headers: signApiCall('test-secret', 'GET', pathWithQuery, ''),
+      headers: {
+        'X-NOVA-API-SECRET': 'test-secret',
+        'X-NOVA-SIGNATURE': signature,
+        'X-NOVA-TIMESTAMP': timestamp,
+        'X-NOVA-NONCE': nonce,
+        'Content-Type': 'application/json',
+      },
     });
-    assert.equal(res.status, 503);
-    assert.deepEqual(await res.json(), { error: 'capacity-unavailable' });
+    assert.equal(res.status, 401);
+    assert.deepEqual(await res.json(), { error: 'unauthorised' });
   } finally {
     await cleanup();
   }

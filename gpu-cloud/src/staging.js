@@ -37,8 +37,15 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+// The LTX checkpoint identity is the Phase 6 Run 10 baseline's single
+// source of truth — the manifest below cites it, never a copy.
+import { CHECKPOINT_SHA256 } from './phase6/config.js';
 
 export const PROOF_MODEL_ID = 'wan2.2-ti2v-5b';
+
+// The production model (Phase 6, Run 10 baseline, 25 Nov 2026 — Shina's
+// "Wow perfect"). The only model the personal executor runs.
+export const LTX_MODEL_ID = 'ltx-video-2b';
 
 // File sizes in bytes, as listed on huggingface.co/Wan-AI/Wan2.2-TI2V-5B
 // on 24 Nov 2026 (GB figures are the listing's rounded values).
@@ -150,6 +157,80 @@ export const STAGING_MANIFESTS = Object.freeze({
         headroomBytes: 1_850_000_000,
         route: 'working-storage',
         routeNote: 'Fits /kaggle/working only if the 20 GB figure holds and nothing else competes for it. If the first proof shows pressure, move to the dataset route.',
+      }),
+    }),
+  }),
+  // LTX-Video 2B distilled (Lightricks) — the PRODUCTION model (Phase 6).
+  // Verified against the Run 10 proof (25 Nov 2026, kernel
+  // oliversmithh/nova-gpu-cloud-ltx-proof-20261124-01, output
+  // run10/ltx-proof-report.json): 121 frames, 1024x576, 24 fps, 8 steps,
+  // guidance 1.0, seed 42, peak VRAM 12.64 GiB, 5.04 s h264 yuv420p.
+  // Weights ride Kaggle Model mounts under /kaggle/input/models
+  // (read-only) — nothing large is downloaded in-session, so the 20 GB
+  // /kaggle/working limit is not the constraint; the mounts are.
+  'ltx-video-2b': Object.freeze({
+    official: Object.freeze({
+      modelId: 'ltx-video-2b',
+      route: 'official',
+      source: Object.freeze({
+        repo: 'Lightricks/LTX-Video',
+        codeRepo: 'Lightricks/LTX-Video',
+        licence: 'LTXV Open Weights License 0.X (15 Apr 2025)',
+        download: 'Kaggle Model marcelolmesilva/ltxv-2b-0.9.8-distilled.safetensors (mount, no download in-session); T5-XXL FP16 + tokenizer via the sanderland/flux.1-schnell model mount',
+        notes: 'Run 10 baseline (phase6/run10-baseline.json + packages/ltx-proof-20261124-01/ltx-proof.ipynb). Checkpoint sha256 is phase6/config.js CHECKPOINT_SHA256 — the single source of truth.',
+      }),
+      // VDP-04 categories: diffusion weights, text encoder + tokenizer,
+      // keyframes (first/last), inference code + packages, LoRAs (none).
+      // The checkpoint + T5 encoder are single files/dirs on the mounts;
+      // the prep test checks the checkpoint size and the dirs' presence.
+      files: Object.freeze([
+        { path: 'ltxv-2b-0.9.8-distilled.safetensors', role: 'diffusion-model', sizeBytes: 6_340_744_492, sha256: CHECKPOINT_SHA256, required: true },
+        // T5-XXL FP16 encoder (9,524,669,251 bytes, 4 files) + tokenizer
+        // (special_tokens_map.json, spiece.model, tokenizer.json,
+        // tokenizer_config.json) from the FLUX model mount — enumerated
+        // by the notebook's asset inventory (find_one globs), not a
+        // fixed file list here; the prep test checks each dir exists
+        // and is non-empty.
+        { path: 'text_encoder_2/', role: 'text-encoder', sizeBytes: null, required: true, dir: true },
+        { path: 'tokenizer_2/', role: 'tokenizer', sizeBytes: null, required: true, dir: true },
+        { path: 'first_frame.png', role: 'keyframe-first', sizeBytes: null, required: true },
+        { path: 'last_frame.png', role: 'keyframe-last', sizeBytes: null, required: true },
+      ]),
+      pythonPackages: Object.freeze([
+        { name: 'diffusers', version: '==0.40.0', purpose: 'LTXConditionPipeline', source: 'Run 10 pinned set (packages/ltx-proof-20261124-01/ltx-proof.ipynb cell 2)' },
+        { name: 'transformers', version: '==5.16.1', purpose: 'T5-XXL encoder/tokenizer', source: 'Run 10 pinned set' },
+        { name: 'accelerate', version: 'latest', purpose: 'model loading / device placement', source: 'Run 10 pinned set' },
+        { name: 'sentencepiece', version: 'latest', purpose: 'T5 tokenizer', source: 'Run 10 pinned set' },
+        { name: 'protobuf', version: 'latest', purpose: 'T5 tokenizer', source: 'Run 10 pinned set' },
+        { name: 'imageio-ffmpeg', version: 'latest', purpose: 'yuv420p MP4 export', source: 'Run 10 pinned set' },
+        // torch is NOT pinned — the Kaggle image ships torch 2.11.0+cu130
+        // (Run 10 used it). Pinning torch would fight the image.
+      ]),
+      installSpec: Object.freeze({
+        kind: 'pip',
+        steps: Object.freeze([
+          'pip install diffusers==0.40.0 transformers==5.16.1 accelerate sentencepiece protobuf imageio-ffmpeg  (one invocation, Kaggle image torch 2.11.0+cu130)',
+        ]),
+        offlineInstall: 'Weights ride Kaggle Model mounts under /kaggle/input/models (read-only) — no weight is downloaded in-session. The single pip install of pinned packages needs the kernel\'s internet flag (Run 10 used enable_internet: true); the generation itself uses only mounted weights.',
+      }),
+      loras: Object.freeze([]), // none required for the proof
+      runPlan: Object.freeze([
+        { id: 'env-check', description: 'Check torch/CUDA, GPU name + free VRAM, imageio-ffmpeg binary', needsNetwork: false },
+        { id: 'asset-inventory', description: 'Locate checkpoint + T5 encoder/tokenizer + keyframes under /kaggle/input; verify checkpoint size (6,340,744,492 bytes) and sha256; verify keyframes are 1024x576', needsNetwork: false },
+        { id: 'load-pipeline', description: 'LTXConditionPipeline.from_single_file (FP16) with the passed-in T5 encoder + tokenizer, config Lightricks/LTX-Video-0.9.5; assert the pipeline components ARE the passed-in ones', needsNetwork: false },
+        { id: 'generate', description: 'Generate 121 frames, 1024x576, 24 fps, 8 steps, guidance 1.0, seed 42, first/last keyframe conditions (strength 1.0), decode_timestep 0.0, image_cond_noise_scale 0.15, max_sequence_length 128', needsNetwork: false },
+        { id: 'write-report', description: 'Write report JSON + yuv420p MP4 to /kaggle/working', needsNetwork: false },
+      ]),
+      storage: Object.freeze({
+        // Checkpoint 6,340,744,492 + T5 encoder 9,524,669,251 = 15.9 GB
+        // of mounted weights. The tokenizer (~4 MB) and keyframes
+        // (~MB) are not counted — negligible at this scale. Mounts are
+        // read-only under /kaggle/input/models; nothing large is
+        // downloaded into /kaggle/working.
+        totalBytes: 15_865_413_743,
+        fitsWorkingStorage20Gb: false,
+        route: 'kaggle-model',
+        routeNote: 'Stage the weights as Kaggle Model mounts (marcelolmesilva/ltxv-2b-0.9.8-distilled.safetensors + sanderland/flux.1-schnell) and the keyframes as a Kaggle Dataset mount. Do NOT copy into /kaggle/working.',
       }),
     }),
   }),

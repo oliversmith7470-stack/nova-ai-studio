@@ -1,53 +1,78 @@
 // NOVA AI Studio — Phase 3 API process: HMAC signing / verification.
 //
-// Canonical request (Rev 2 §11.2, unchanged by Rev 3):
-//   METHOD + "\n" + PATH (incl. query) + "\n" + TIMESTAMP (unix seconds)
-//   + "\n" + NONCE (128-bit hex) + "\n" + SHA256_HEX(BODY)
-// Algorithm: HMAC-SHA-256 with the shared secret.
+// TWO-SECRET request authentication (Rev 4.8 §8 — the intended scheme,
+// implemented here; the earlier single-secret mechanism is NOT a
+// conforming implementation and must not be described as one):
+//   NOVA_API_SECRET — authenticates the TRANSPORT. Presented in the
+//     X-NOVA-API-SECRET header (current or previous, 1-hour rotation
+//     overlap); compared by SHA-256 hash so the comparison is
+//     constant-time; a fingerprint present in the revocation record
+//     rejects the secret even inside the overlap window (revocation
+//     overrides overlap).
+//   NOVA_SIGNING_SECRET — signs the CANONICAL REQUEST. The HMAC-SHA-256
+//     is computed over METHOD + "\n" + PATH (incl. query) + "\n" +
+//     TIMESTAMP (unix seconds) + "\n" + NONCE (128-bit hex) + "\n" +
+//     SHA256_HEX(BODY), keyed by the SIGNING secret (current or previous
+//     during rotation). The transport secret NEVER signs anything.
+// A single compromised secret cannot forge a job: the transport secret
+// alone cannot produce a valid signature, and the signing secret alone
+// cannot pass step 1 (it is not a transport secret). Full compromise of
+// BOTH secrets + the signing code path CAN forge a job — that is the
+// design's honest threat model (Rev 4.8 §8 S4), not a defect to hide.
 //
-// Verification order (Rev 3 §C-1.10, as amended by Rev 3.2 §B-3.2.4.2):
-//   (1) secret present (current or previous — 1-hour rotation overlap),
-//       compared by SHA-256 hash so the comparison is constant-time;
-//       a fingerprint present in the revocation record rejects the secret
-//       even inside the overlap window (revocation overrides overlap);
+// Verification order (Rev 4.8 §8, Worker→API direction; the Worker side
+// mirrors it in _worker.js verifyInternalAuth):
+//   (1) transport secret present (current or previous), hash-compared,
+//       and not revoked; AND signing secrets configured (a process
+//       without a signing secret authenticates nothing — fail closed);
 //   (2) signature present and well-formed (64 hex), nonce present and
 //       well-formed (32 hex);
 //   (3) timestamp within ±60 s;
-//   (3b) timestamp after process start (Rev 4.8 §15 process-start rule:
-//         a timestamp from a second before the process-start second is
-//         a replay from a previous process era — rejected even within
-//         the window; the comparison is in seconds because timestamps
-//         have second granularity);
-//   (4) signature verifies (constant-time comparison);
-//   (5) nonce unseen — recorded as used ONLY now, after step 4 passes,
-//       so a failed request can never burn a nonce;
+//   (3b) MILLISECOND process-start rule (Rev 4.8 §15 as corrected by
+//         the reviewer): timestampSeconds * 1000 <= processStartMs
+//         rejects — equality AND earlier. A timestamp is second
+//         granularity, so the call's whole second at or before the
+//         process-start second is rejected; the first acceptable second
+//         is the second after start, and a legitimate caller re-signs.
+//         (The earlier seconds-only rule — "the start second itself is
+//         allowed" — was wrong: a nonce issued before this process
+//         started could be replayed into it in the same second, and a
+//         restart would otherwise share a nonce era with the process
+//         it replaced.)
+//   (4) signature verifies against a configured SIGNING secret
+//       (constant-time comparison; a revoked signing secret is skipped
+//       — revocation overrides the rotation overlap for both secrets);
+//   (5) nonce unseen — consumed ONLY now, after step 4 passes, by a
+//       single atomic statement in the API process's own local SQLite
+//       nonce store (nonce-store.js, <dataDir>/nonces.db); a failed
+//       request can never burn a nonce, and two concurrent consumers
+//       of the same nonce admit exactly one;
 //   (6) body parses and validates (caller's job).
 // Any failure returns 401 with { error: "unauthorised" } and no detail.
 // Only the step number and request ID are logged.
 //
-// The nonce store lives in ApiStateStore (persisted across restarts, so
-// a restart cannot resurrect a consumed nonce). Revocation is checked
-// against the revocation list re-read from disk when it changed (≤ 5 s
-// specified maximum propagation, Rev 3.2 §B-3.2.4.2 — this implementation
-// re-reads on mtime change, which is immediate in practice; the 5-second
-// figure is the specified maximum, not a measured figure).
+// The nonce store is SQLite (nonce-store.js). ApiStateStore keeps its own
+// roles (kill-switch, activation flags, revocation record) and is NOT a
+// nonce store — its mutate() reload+save is not atomic across processes,
+// so two concurrent consumers could both see a nonce absent. There is no
+// fallback to the JSON store: verifyWorkerAuth requires a nonce store.
+//
+// Revocation is checked against the revocation list re-read from disk
+// when it changed (≤ 5 s specified maximum propagation, Rev 3.2
+// §B-3.2.4.2 — this implementation re-reads on mtime change, which is
+// immediate in practice; the 5-second figure is the specified maximum,
+// not a measured figure).
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { HMAC_TIMESTAMP_WINDOW_S } from './constants.js';
+import { NONCE_VALIDITY_SECONDS } from './nonce-store.js';
 
-// Process-start boundary (Rev 4.8 §15): a nonce issued before this
-// process started can never be replayed into it, even within the ±60 s
-// freshness window. A restart starts a fresh nonce era; a timestamp
-// from a second before the process-start second is rejected as stale.
-// The comparison is in SECONDS, not milliseconds, because request
-// timestamps have second granularity: a timestamp in the same second
-// the process started may have been created after start (the process
-// loaded at N.215, a legitimate request timestamped N was created at
-// N.500), so comparing ts*1000 against the millisecond start would
-// reject legitimate first-second requests. The persisted nonce store
-// (ApiStateStore, shared across restarts) covers the ambiguous same
-// second: a consumed nonce stays consumed. The value is captured at
-// module load (process start) and is injectable for tests via the
+// Process-start boundary (Rev 4.8 §15, millisecond rule): a nonce issued
+// before this process started can never be replayed into it, even within
+// the ±60 s freshness window. A restart starts a fresh nonce era. The
+// comparison is in MILLISECONDS against the actual process-start instant:
+// ts * 1000 <= processStartMs rejects. The value is captured at module
+// load (process start) and is injectable for tests via the
 // opts.processStartMs parameter.
 const PROCESS_START_MS = Date.now();
 
@@ -76,16 +101,33 @@ function constantTimeHexEqual(a, b) {
   return timingSafeEqual(ba, bb);
 }
 
+function isRevoked(apiState, fingerprint) {
+  apiState.reloadIfChanged();
+  return (apiState.state.revocations || []).some(
+    (r) => r.fingerprint === fingerprint,
+  );
+}
+
 // Sign an outgoing call (API process -> Worker, /internal/d1-*).
-// Returns the headers to send.
-export function signApiCall(secret, method, path, bodyText) {
+// Two-secret: the TRANSPORT secret is presented in X-NOVA-API-SECRET;
+// the SIGNING secret keys the HMAC. Both are required — a missing
+// signing secret throws instead of silently falling back to the
+// transport secret (the single-secret fallback is not a conforming
+// implementation). Returns the headers to send.
+export function signApiCall(transportSecret, signingSecret, method, path, bodyText) {
+  if (typeof transportSecret !== 'string' || transportSecret.length === 0) {
+    throw new Error('signApiCall requires the transport secret (NOVA_API_SECRET)');
+  }
+  if (typeof signingSecret !== 'string' || signingSecret.length === 0) {
+    throw new Error('signApiCall requires the signing secret (NOVA_SIGNING_SECRET)');
+  }
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const nonce = randomBytes(16).toString('hex');
   const bodyHash = sha256Hex(bodyText);
   const canonical = [method, path, timestamp, nonce, bodyHash].join('\n');
-  const signature = hmacSha256Hex(secret, canonical);
+  const signature = hmacSha256Hex(signingSecret, canonical);
   return {
-    'X-NOVA-API-SECRET': secret,
+    'X-NOVA-API-SECRET': transportSecret,
     'X-NOVA-SIGNATURE': signature,
     'X-NOVA-TIMESTAMP': timestamp,
     'X-NOVA-NONCE': nonce,
@@ -95,21 +137,39 @@ export function signApiCall(secret, method, path, bodyText) {
 
 // Verify an incoming call (Worker -> API process, /internal/*).
 // `req` is a Node http IncomingMessage (headers lower-cased by Node).
-// `secrets` is [current, previous?] (empty strings filtered).
-// `apiState` is an ApiStateStore (nonce + revocation persistence).
+// `auth` is { transportSecrets, signingSecrets, apiState, nonceStore }:
+//   transportSecrets — [current, previous?] (empty strings filtered);
+//   signingSecrets   — [current, previous?] (empty strings filtered);
+//   apiState         — an ApiStateStore (revocation record only);
+//   nonceStore       — a SqliteNonceStore (REQUIRED; no JSON fallback).
+// `opts.processStartMs` injects the process-start boundary for tests.
 // Returns { ok: true } or { ok: false, step }.
-export function verifyWorkerAuth(req, method, path, bodyText, secrets, apiState, opts = {}) {
+export function verifyWorkerAuth(req, method, path, bodyText, auth, opts = {}) {
   const processStartMsBoundary = opts.processStartMs ?? PROCESS_START_MS;
-  const configured = (secrets || []).filter((s) => typeof s === 'string' && s.length > 0);
-  if (configured.length === 0) return { ok: false, step: 1 };
+  const { apiState, nonceStore } = auth || {};
+  if (!apiState || typeof apiState.reloadIfChanged !== 'function') {
+    throw new Error('verifyWorkerAuth requires apiState (revocation record)');
+  }
+  if (!nonceStore || typeof nonceStore.consume !== 'function') {
+    throw new Error('verifyWorkerAuth requires a SqliteNonceStore');
+  }
+  const transportConfigured = (auth.transportSecrets || [])
+    .filter((s) => typeof s === 'string' && s.length > 0);
+  const signingConfigured = (auth.signingSecrets || [])
+    .filter((s) => typeof s === 'string' && s.length > 0);
+  // (1) A process without a signing secret authenticates nothing.
+  if (transportConfigured.length === 0 || signingConfigured.length === 0) {
+    return { ok: false, step: 1 };
+  }
 
-  // (1) secret present: must match a configured secret (hash-compared).
+  // (1) transport secret present: must match a configured secret
+  // (hash-compared).
   const presented = req.headers['x-nova-api-secret'] || '';
   if (typeof presented !== 'string' || presented.length === 0) {
     return { ok: false, step: 1 };
   }
   let presentedMatches = false;
-  for (const s of configured) {
+  for (const s of transportConfigured) {
     if (constantTimeHexEqual(sha256Hex(presented), sha256Hex(s))) {
       presentedMatches = true;
     }
@@ -117,12 +177,12 @@ export function verifyWorkerAuth(req, method, path, bodyText, secrets, apiState,
   if (!presentedMatches) return { ok: false, step: 1 };
 
   // (1b) revocation overrides the rotation overlap (Rev 3.2 §B-3.2.4.2).
-  // The fingerprint of the presented secret is checked against the
-  // revocation record (re-read from disk if another process changed it).
-  apiState.reloadIfChanged();
-  const fp = fingerprintOfSecret(presented);
-  const revoked = (apiState.state.revocations || []).some((r) => r.fingerprint === fp);
-  if (revoked) return { ok: false, step: 1 };
+  // The fingerprint of the presented transport secret is checked against
+  // the revocation record (re-read from disk if another process
+  // changed it).
+  if (isRevoked(apiState, fingerprintOfSecret(presented))) {
+    return { ok: false, step: 1 };
+  }
 
   // (2) signature + nonce well-formed.
   const signature = req.headers['x-nova-signature'] || '';
@@ -137,35 +197,37 @@ export function verifyWorkerAuth(req, method, path, bodyText, secrets, apiState,
   const nowSec = Math.floor(Date.now() / 1000);
   if (Math.abs(nowSec - ts) > HMAC_TIMESTAMP_WINDOW_S) return { ok: false, step: 3 };
 
-  // (3b) Rev 4.8 §15 process-start rule: a timestamp from a second
-  // before the process-start second is a replay from a previous process
-  // era — rejected even though it is within the freshness window. The
-  // comparison is in seconds (see the module header): the process-start
-  // second itself is allowed, because a request timestamped in that
-  // second may have been created after the process started.
-  if (ts < Math.floor(processStartMsBoundary / 1000)) return { ok: false, step: 3 };
+  // (3b) Millisecond process-start rule (reviewer correction): the
+  // call's whole second at or before the process-start second is
+  // rejected — timestampSeconds * 1000 <= processStartMs. A timestamp
+  // is second granularity, so equality is a replay from the previous
+  // process era (or from before this process existed). The first
+  // acceptable second is the second after start; a legitimate caller
+  // re-signs.
+  if (ts * 1000 <= processStartMsBoundary) return { ok: false, step: 3 };
 
-  // (4) signature verifies (constant-time).
+  // (4) signature verifies against a configured SIGNING secret
+  // (constant-time). A revoked signing secret is skipped — revocation
+  // overrides the rotation overlap for both secrets.
   const bodyHash = sha256Hex(bodyText);
   const canonical = [method, path, timestamp, nonce, bodyHash].join('\n');
-  const expected = hmacSha256Hex(presented, canonical);
-  if (!constantTimeHexEqual(expected, signature)) return { ok: false, step: 4 };
+  let signatureOk = false;
+  for (const signingSecret of signingConfigured) {
+    if (isRevoked(apiState, fingerprintOfSecret(signingSecret))) continue;
+    const expected = hmacSha256Hex(signingSecret, canonical);
+    if (constantTimeHexEqual(expected, signature)) {
+      signatureOk = true;
+      break;
+    }
+  }
+  if (!signatureOk) return { ok: false, step: 4 };
 
-  // (5) nonce unseen — consumed ONLY now, after the signature verified.
-  // Expired nonces are pruned first (validity window + 5 minutes).
-  const nowMs = Date.now();
-  const expiryMs = (ts + 360) * 1000;
-  let consumed = false;
-  apiState.mutate((s) => {
-    for (const [n, exp] of Object.entries(s.nonces)) {
-      if (exp < nowMs) delete s.nonces[n];
-    }
-    if (!(nonce in s.nonces)) {
-      s.nonces[nonce] = expiryMs;
-      consumed = true;
-    }
-  });
-  if (!consumed) return { ok: false, step: 5 };
+  // (5) nonce unseen — consumed ONLY now, after the signature verified,
+  // by one atomic INSERT OR IGNORE in the SQLite nonce store. A failed
+  // request can never burn a nonce; two concurrent consumers of the
+  // same nonce admit exactly one.
+  const expiryMs = (ts + NONCE_VALIDITY_SECONDS) * 1000;
+  if (!nonceStore.consume(nonce, expiryMs)) return { ok: false, step: 5 };
 
   return { ok: true };
 }

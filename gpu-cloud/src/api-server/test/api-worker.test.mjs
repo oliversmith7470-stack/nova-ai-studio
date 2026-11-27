@@ -10,7 +10,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -30,7 +30,15 @@ const execFileAsync = promisify(execFile);
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
 const SITE = 'http://test.invalid';
+
+// workerd refuses any module path containing ".." relative to its
+// starting directory (the process cwd). The suite runs from gpu-cloud,
+// one level below the repo root where _worker.js lives, so the boot
+// must start from the repo root — without this, the end-to-end test
+// fails at Miniflare startup (the long-standing workerd error).
+process.chdir(ROOT);
 const TEST_SECRET = 'phase3-integration-secret';
+const TEST_SIGNING_SECRET = 'phase3-integration-signing-secret';
 const TEST_KEY = 'phase3-test-key';
 const TEST_SALT = 'phase3-test-salt';
 
@@ -91,18 +99,35 @@ test('end-to-end: generate -> 202 -> accept -> fileReport -> succeeded -> downlo
     return workerFetch(SITE + u.pathname + u.search, init);
   };
 
+  const apiDataDir = path.join(dir, 'api-data');
+  // Seed a fresh runner heartbeat (Rev 4.9 §6 gate): in production the
+  // runner's startup catch-up pass writes runner-health.json before the
+  // API listens, so a submit-time gate always sees a fresh heartbeat.
+  // Without it every submit is refused 503 storage-full on the missing
+  // file — the same seeding the makeApi harness does.
+  mkdirSync(apiDataDir, { recursive: true });
+  const _hbNow = new Date().toISOString();
+  writeFileSync(path.join(apiDataDir, 'runner-health.json'), JSON.stringify({
+    lastSuccessfulSweepAt: _hbNow,
+    lastAttemptAt: _hbNow,
+    status: 'ok',
+    objectsDeleted: 0,
+    error: null,
+  }));
   const api = createApiServer({
     mode: 'controlled-test',
     secret: TEST_SECRET,
+    signingSecret: TEST_SIGNING_SECRET,
     port: 0,
     host: '127.0.0.1',
-    dataDir: path.join(dir, 'api-data'),
+    dataDir: apiDataDir,
     // Controlled-test mode requires an explicitly supplied executor
     // (Rev 3 §C-1.4); without it construction refuses to start.
     executor: new FakeControlledExecutor(),
     d1Client: new HttpD1Client({
       workerOrigin: 'http://127.0.0.1:1',
       secret: TEST_SECRET,
+      signingSecret: TEST_SIGNING_SECRET,
       fetchImpl,
     }),
     usageSource: async () => ({ readable: true, usageFraction: 0.1 }),
@@ -114,7 +139,7 @@ test('end-to-end: generate -> 202 -> accept -> fileReport -> succeeded -> downlo
   const unauth = await fetch(`http://127.0.0.1:${apiPort}/internal/health`);
   assert.equal(unauth.status, 401);
   const signed = await fetch(`http://127.0.0.1:${apiPort}/internal/health`, {
-    headers: signApiCall(TEST_SECRET, 'GET', '/internal/health', ''),
+    headers: signApiCall(TEST_SECRET, TEST_SIGNING_SECRET, 'GET', '/internal/health', ''),
   });
   assert.equal(signed.status, 200);
   assert.equal((await signed.json()).status, 'ok');
@@ -129,6 +154,7 @@ test('end-to-end: generate -> 202 -> accept -> fileReport -> succeeded -> downlo
     compatibilityDate: '2025-01-01',
     bindings: {
       NOVA_API_SECRET: TEST_SECRET,
+      NOVA_SIGNING_SECRET: TEST_SIGNING_SECRET,
       NOVA_API_MODE: 'controlled-test',
       NOVA_TEST_KEY: TEST_KEY,
       NOVA_IP_HASH_SALT: TEST_SALT,

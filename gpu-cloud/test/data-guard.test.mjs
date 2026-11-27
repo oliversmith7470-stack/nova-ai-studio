@@ -99,3 +99,72 @@ test('assertStage2Safe throws DataBoundaryError with the reason', () => {
     (err) => err instanceof DataBoundaryError && /userImage/.test(err.reason),
   );
 });
+
+// -- Personal production marker (Rev 4.8 §12, M2-P) -------------------------
+// A personal-audience job carrying the full non-commercial attestation
+// is the second lawful marker: it passes the boundary, while the
+// credential scan still applies. The attestation facts are verified
+// upstream (Worker binds the ownerTokenId from its environment; the API
+// submit path re-checks purpose + token id), so the guard checks their
+// presence and shape only.
+
+function personalJob(overrides = {}) {
+  const { params = {}, ...rest } = overrides;
+  return {
+    id: 'job-personal-1',
+    modelId: 'ltx-video-2b',
+    prompt: 'A dragon rests on a misty mountain ridge at dawn',
+    params: {
+      audience: 'personal',
+      nonCommercialAttested: true,
+      nonCommercialPurpose: 'proof',
+      ownerTokenId: 'owner-token-v1',
+      ...params,
+    },
+    ...rest,
+  };
+}
+
+test('a personal job with the full non-commercial attestation passes', () => {
+  assert.deepEqual(checkStage2Safe(personalJob()), { ok: true });
+  for (const purpose of ['test', 'proof', 'benchmark', 'experiment', 'own-non-monetised-film']) {
+    assert.deepEqual(
+      checkStage2Safe(personalJob({ params: { nonCommercialPurpose: purpose } })),
+      { ok: true },
+      `purpose ${purpose} should pass`,
+    );
+  }
+});
+
+test('a personal job missing any attestation fact is refused', () => {
+  const missing = [
+    { audience: 'public' },
+    { audience: undefined },
+    { nonCommercialAttested: false },
+    { nonCommercialAttested: undefined },
+    { nonCommercialPurpose: 'monetised-film' },
+    { nonCommercialPurpose: 'learning' },
+    { nonCommercialPurpose: undefined },
+    { ownerTokenId: '' },
+    { ownerTokenId: undefined },
+  ];
+  for (const params of missing) {
+    const j = personalJob({ params });
+    if (params.audience === undefined) delete j.params.audience;
+    if (params.nonCommercialAttested === undefined) delete j.params.nonCommercialAttested;
+    if (params.nonCommercialPurpose === undefined) delete j.params.nonCommercialPurpose;
+    if (params.ownerTokenId === undefined) delete j.params.ownerTokenId;
+    const r = checkStage2Safe(j);
+    assert.equal(r.ok, false, `${JSON.stringify(params)} should be refused`);
+    assert.match(r.reason, /not marked as a Stage 2 synthetic test job/);
+  }
+});
+
+test('the credential scan still applies to a personal job', () => {
+  const r = checkStage2Safe(personalJob({ prompt: 'api_key: hunter2' }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /credential-like pattern/);
+  const r2 = checkStage2Safe(personalJob({ params: { userImage: 'photo.png' } }));
+  assert.equal(r2.ok, false);
+  assert.match(r2.reason, /forbidden key "userImage"/);
+});

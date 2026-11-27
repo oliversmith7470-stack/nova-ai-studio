@@ -399,7 +399,7 @@ test('d1-client: listTerminalJobs / listExpiredRateLimits call the signed Worker
       : { op: 'list-expired-rate-limits', rateLimits: [{ key: 'k', window_start: 1, window_end: 2, count: 1, updated_at: 2 }] };
     return { status: 200, text: async () => JSON.stringify(body) };
   };
-  const client = new HttpD1Client({ workerOrigin: 'http://localhost:8787', secret: 'test-secret', fetchImpl });
+  const client = new HttpD1Client({ workerOrigin: 'http://localhost:8787', secret: 'test-secret', signingSecret: 'test-signing-secret', fetchImpl });
   const jobs = await client.listTerminalJobs({ beforeMs: 123456, limit: 5 });
   assert.deepEqual(jobs, [{ id: 'nova-job-x', status: 'failed', terminalAtMs: 123 }]);
   assert.match(calls[0].url, /\/internal\/d1-read\?op=list-terminal-jobs&beforeMs=123456&limit=5/);

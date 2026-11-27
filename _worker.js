@@ -444,7 +444,12 @@ const PHASE3_SUBMIT_TIMEOUT_MS = 10000; // Rev 2 §3.5
 const PHASE3_STATUS_TIMEOUT_MS = 5000; // Rev 2 §3.5
 const PHASE3_DOWNLOAD_IDLE_TIMEOUT_MS = 30000; // Rev 2 §3.5
 
-const CANONICAL_REQUEST_VERSION = "canonical-request-v1";
+// v2: the canonical request includes the audience (and, for personal
+// requests, the non-commercial purpose) — two requests that differ only
+// in audience are different requests with different identity hashes, so
+// a public request can never become personal by changing a field, and a
+// personal request can never be replayed as a public one.
+const CANONICAL_REQUEST_VERSION = "canonical-request-v2";
 
 function phase3ApiMode(env) {
   return env.NOVA_API_MODE === "controlled-test"
@@ -682,10 +687,22 @@ function isStrictInteger(parsed, path, value) {
 // exact JSON.stringify escaping, no normalisation, whitespace verbatim).
 
 const GENERATE_ALLOWED_SINGLE = new Set([
-  "jobId", "mode", "prompt", "model", "frames", "resolution", "fps"
+  "jobId", "mode", "prompt", "model", "frames", "resolution", "fps",
+  "audience", "nonCommercialPurpose"
 ]);
 const GENERATE_ALLOWED_PLAN = new Set([
-  "jobId", "mode", "scenes", "model", "frames", "resolution", "fps"
+  "jobId", "mode", "scenes", "model", "frames", "resolution", "fps",
+  "audience", "nonCommercialPurpose"
+]);
+
+// The five non-commercial purposes a personal (owner-only) job may
+// attest (Rev 4.8 §12, item D, option (b) — Kaggle commercial-use
+// decision 26 Nov 2026: personal Kaggle = demonstrably non-commercial
+// work only). This MUST match the API-side NON_COMMERCIAL_PURPOSES in
+// gpu-cloud/src/api-server/activation.js — a purpose outside the shared
+// five is refused by one gate or the other.
+const NON_COMMERCIAL_PURPOSES = new Set([
+  "test", "proof", "benchmark", "experiment", "own-non-monetised-film"
 ]);
 
 function buildCanonicalRequest(normalized) {
@@ -697,7 +714,8 @@ function buildCanonicalRequest(normalized) {
       model: "ltx-video-2b",
       frames: 121,
       resolution: "1024x576",
-      fps: 24
+      fps: 24,
+      audience: normalized.audience
     };
   } else {
     obj = {
@@ -709,8 +727,15 @@ function buildCanonicalRequest(normalized) {
       model: "ltx-video-2b",
       frames: 121,
       resolution: "1024x576",
-      fps: 24
+      fps: 24,
+      audience: normalized.audience
     };
+  }
+  // A personal request's non-commercial purpose is part of its identity:
+  // two personal requests that differ only in purpose are different
+  // requests. Public requests carry no purpose.
+  if (normalized.audience === "personal") {
+    obj.nonCommercialPurpose = normalized.nonCommercialPurpose;
   }
   return JSON.stringify(obj);
 }
@@ -760,6 +785,25 @@ function validateGenerateBody(parsed) {
   if (!isStrictInteger(parsed, "fps", body.fps) || body.fps !== 24) {
     return bad("fps must be 24.");
   }
+  // Audience (Rev 4.8 §5.3): absent means public. Unknown values fail
+  // closed — a request that does not name a known audience is not a
+  // request at all. A personal request may attest a non-commercial
+  // purpose (one of the five); a public request may not carry one.
+  const audience = body.audience === undefined ? "public" : body.audience;
+  if (audience !== "public" && audience !== "personal") {
+    return bad("audience must be public or personal.");
+  }
+  let nonCommercialPurpose = null;
+  if (audience === "personal") {
+    nonCommercialPurpose = body.nonCommercialPurpose === undefined
+      ? "proof"
+      : body.nonCommercialPurpose;
+    if (!NON_COMMERCIAL_PURPOSES.has(nonCommercialPurpose)) {
+      return bad("nonCommercialPurpose must be one of: proof, test, learning, evaluation, personal.");
+    }
+  } else if (body.nonCommercialPurpose !== undefined) {
+    return bad("nonCommercialPurpose is only valid for a personal audience.");
+  }
 
   const checkPrompt = (prompt, label) => {
     if (typeof prompt !== "string" || prompt.length < 1 || prompt.length > 2000) {
@@ -780,7 +824,9 @@ function validateGenerateBody(parsed) {
         jobId: body.jobId,
         mode: "single",
         prompt: body.prompt,
-        scenes: [{ index: 0, prompt: body.prompt }]
+        scenes: [{ index: 0, prompt: body.prompt }],
+        audience,
+        nonCommercialPurpose
       }
     };
   }
@@ -821,19 +867,26 @@ function validateGenerateBody(parsed) {
   }
   return {
     ok: true,
-    normalized: { jobId: body.jobId, mode: "plan", scenes }
+    normalized: { jobId: body.jobId, mode: "plan", scenes, audience, nonCommercialPurpose }
   };
 }
 
 // ------------------------------------------------------- HMAC (Rev 2 §11)
 // Canonical request: METHOD + "\n" + PATH (incl. query) + "\n" + TIMESTAMP
 // (unix seconds) + "\n" + NONCE (128-bit hex) + "\n" + SHA256_HEX(BODY).
-// HMAC-SHA-256 with the shared secret. Verification order (Rev 3 §C-1.10):
-// (1) secret present, (2) signature present and well-formed, (3) timestamp
-// within ±60 s, (4) signature verifies (constant-time), (5) nonce unseen —
-// recorded as used ONLY after step 4 passes, so a failed request can never
-// burn a nonce, (6) body parses and validates. Any failure -> 401 with
-// { error: "unauthorised" } and no further detail.
+// TWO-SECRET request authentication (Rev 4.8 §8): NOVA_API_SECRET
+// authenticates the transport (presented in X-NOVA-API-SECRET, current or
+// previous); NOVA_SIGNING_SECRET signs the canonical request (HMAC-SHA-256,
+// current or previous during rotation). The transport secret NEVER signs
+// anything. Verification order (Rev 3 §C-1.10, as amended by Rev 4.8 §8):
+// (1) transport secret present, (2) signature present and well-formed,
+// (3) timestamp within ±60 s, (4) signature verifies against a SIGNING
+// secret (constant-time), (5) nonce unseen — recorded as used ONLY after
+// step 4 passes, so a failed request can never burn a nonce, (6) body
+// parses and validates. Any failure -> 401 with { error: "unauthorised" }
+// and no further detail. The Worker side has no revocation record (the
+// API side owns revocation): a revoked Worker secret is removed from the
+// environment on redeploy.
 
 async function hmacSha256Hex(keyText, message) {
   const key = await crypto.subtle.importKey(
@@ -853,8 +906,17 @@ async function hmacSha256Hex(keyText, message) {
     .join("");
 }
 
-// Worker as signer (Worker -> API process). Returns the headers to send.
-async function signApiCall(secret, method, path, bodyText) {
+// Worker as signer (Worker -> API process). Two-secret: the TRANSPORT
+// secret is presented in X-NOVA-API-SECRET; the SIGNING secret keys the
+// HMAC. Both are required — a missing signing secret throws instead of
+// silently falling back to the transport secret. Returns the headers.
+async function signApiCall(transportSecret, signingSecret, method, path, bodyText) {
+  if (typeof transportSecret !== "string" || transportSecret.length === 0) {
+    throw new Error("signApiCall requires the transport secret (NOVA_API_SECRET)");
+  }
+  if (typeof signingSecret !== "string" || signingSecret.length === 0) {
+    throw new Error("signApiCall requires the signing secret (NOVA_SIGNING_SECRET)");
+  }
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const nonceBytes = new Uint8Array(16);
   crypto.getRandomValues(nonceBytes);
@@ -863,9 +925,9 @@ async function signApiCall(secret, method, path, bodyText) {
     .join("");
   const bodyHash = await sha256Hex(bodyText);
   const canonical = [method, path, timestamp, nonce, bodyHash].join("\n");
-  const signature = await hmacSha256Hex(secret, canonical);
+  const signature = await hmacSha256Hex(signingSecret, canonical);
   return {
-    "X-NOVA-API-SECRET": secret,
+    "X-NOVA-API-SECRET": transportSecret,
     "X-NOVA-SIGNATURE": signature,
     "X-NOVA-TIMESTAMP": timestamp,
     "X-NOVA-NONCE": nonce,
@@ -882,7 +944,10 @@ async function verifyInternalAuth(request, env, bodyText) {
   if (!db) return { ok: false, step: 1 };
   const secrets = [env.NOVA_API_SECRET, env.NOVA_API_SECRET_PREVIOUS]
     .filter((s) => typeof s === "string" && s.length > 0);
-  if (secrets.length === 0) return { ok: false, step: 1 };
+  const signingSecrets = [env.NOVA_SIGNING_SECRET, env.NOVA_SIGNING_SECRET_PREVIOUS]
+    .filter((s) => typeof s === "string" && s.length > 0);
+  // (1) A Worker without a signing secret authenticates nothing.
+  if (secrets.length === 0 || signingSecrets.length === 0) return { ok: false, step: 1 };
 
   // (1) secret present: the presented secret must match a configured one.
   // Compared by hash so the comparison itself is constant-time.
@@ -911,16 +976,23 @@ async function verifyInternalAuth(request, env, bodyText) {
   const nowSec = Math.floor(Date.now() / 1000);
   if (Math.abs(nowSec - ts) > 60) return { ok: false, step: 3 };
 
-  // (4) signature verifies (constant-time). Verified against the presented
-  // secret, which step 1 already established is a configured secret.
+  // (4) signature verifies against a configured SIGNING secret
+  // (constant-time; current, then previous during rotation). The
+  // transport secret never signs anything — a signature made with it
+  // fails here even though step 1 passed.
   const url = new URL(request.url);
   const path = url.pathname + url.search;
   const bodyHash = await sha256Hex(bodyText);
   const canonical = [request.method, path, timestamp, nonce, bodyHash].join("\n");
-  const expected = await hmacSha256Hex(presented, canonical);
-  if (!timingSafeEqual(hexToBytes(expected), hexToBytes(signature))) {
-    return { ok: false, step: 4 };
+  let signatureOk = false;
+  for (const signingSecret of signingSecrets) {
+    const expected = await hmacSha256Hex(signingSecret, canonical);
+    if (timingSafeEqual(hexToBytes(expected), hexToBytes(signature))) {
+      signatureOk = true;
+      break;
+    }
   }
+  if (!signatureOk) return { ok: false, step: 4 };
 
   // (5) nonce unseen — consumed ONLY now, after the signature verified.
   try {
@@ -1193,13 +1265,14 @@ function apiOrigin(env) {
 async function callApi(env, method, path, bodyObj, timeoutMs) {
   const origin = apiOrigin(env);
   const secret = env.NOVA_API_SECRET;
-  if (!origin || !secret) {
+  const signingSecret = env.NOVA_SIGNING_SECRET;
+  if (!origin || !secret || !signingSecret) {
     const e = new Error("API process is not configured.");
     e.code = "NOT_CONFIGURED";
     throw e;
   }
   const bodyText = bodyObj === undefined ? "" : JSON.stringify(bodyObj);
-  const headers = await signApiCall(secret, method, path, bodyText);
+  const headers = await signApiCall(secret, signingSecret, method, path, bodyText);
   let response;
   try {
     response = await fetch(origin + path, {
@@ -1221,6 +1294,187 @@ async function callApi(env, method, path, bodyObj, timeoutMs) {
     json = null;
   }
   return { status: response.status, json, text };
+}
+
+// ------------------------------------------------- Owner-token gate (§4.1)
+// Rev 4.8 §5.3 + reviewer correction: the Worker verifies the ACTUAL
+// owner token (env.NOVA_OWNER_TOKEN) with a constant-time comparison.
+// The API-side ownerTokenId check is only a secondary consistency check
+// — it is NEVER described as authoritative owner authentication, because
+// an identifier is not a credential: anyone who can name the id would
+// pass it. The token VALUE never touches the API host and never leaves
+// this Worker; it is compared here, in the Worker, and only the
+// Worker-asserted ownerTokenId (env.NOVA_OWNER_TOKEN_ID) is bound to the
+// job record and the submit body.
+// Returns { ok: true } or { ok: false, reason } where reason is
+// "not-configured" (no token configured on this Worker — a deployment
+// error, surfaced as 500), "missing" (no token presented), or "invalid"
+// (wrong token, or a revoked/previous-generation token — indistinguishable
+// by design, both fail closed).
+function verifyOwnerToken(env, presented) {
+  const expected = env.NOVA_OWNER_TOKEN;
+  if (typeof expected !== "string" || expected.length === 0) {
+    return { ok: false, reason: "not-configured" };
+  }
+  if (typeof presented !== "string" || presented.length === 0) {
+    return { ok: false, reason: "missing" };
+  }
+  if (presented.length !== expected.length) {
+    return { ok: false, reason: "invalid" };
+  }
+  const ok = timingSafeEqual(
+    new TextEncoder().encode(presented),
+    new TextEncoder().encode(expected)
+  );
+  return ok ? { ok: true } : { ok: false, reason: "invalid" };
+}
+
+// ------------------------------------------------- Capacity preflight (§4.3)
+// The Worker-side port of the API's verifyCapacityResponse
+// (gpu-cloud/src/api-server/activation.js): verifies a signed capacity
+// response through the actual Worker boundary before routing on it.
+// Checks, in order: the signing secret is configured; the signature is
+// well-formed; the timestamp is well-formed and within ±5 s; the nonce
+// is well-formed; the HMAC verifies (constant-time) over
+// timestamp + "\n" + requestNonce + "\n" + SHA256_HEX(body); the body
+// parses and carries the required boolean fields; the audience and the
+// nonce echo match the request; and the body is internally consistent
+// (authorised implies activated, production mode, no kill-switch; a
+// reason is present exactly when the mode is unauthorised). Returns
+// { ok: true, body } or { ok: false, reason }.
+const CAPACITY_REASONS = [
+  "kill-switch-engaged",
+  "not-activated",
+  "no-production-executor",
+  "ceiling",
+  "quota-exhausted",
+  "storage-full",
+  "no-worker"
+];
+const CAPACITY_FRESHNESS_SECONDS = 5;
+
+async function verifyCapacityResponseWorker({
+  signingSecret,
+  timestamp,
+  signature,
+  requestNonce,
+  expectedAudience,
+  bodyText,
+  nowSec = Math.floor(Date.now() / 1000)
+} = {}) {
+  const reject = (reason) => ({ ok: false, reason });
+  if (typeof signingSecret !== "string" || signingSecret.length === 0) {
+    return reject("no-signing-secret");
+  }
+  if (!/^[0-9a-f]{64}$/i.test(signature ?? "")) return reject("bad-signature");
+  if (!/^[0-9]+$/.test(String(timestamp ?? ""))) return reject("bad-timestamp");
+  const ts = Number(timestamp);
+  if (Math.abs(nowSec - ts) > CAPACITY_FRESHNESS_SECONDS) return reject("stale-timestamp");
+  if (!/^[0-9a-f]{32}$/i.test(requestNonce ?? "")) return reject("bad-nonce");
+  const expected = await hmacSha256Hex(
+    signingSecret,
+    ts + "\n" + requestNonce + "\n" + (await sha256Hex(bodyText ?? ""))
+  );
+  if (!timingSafeEqual(hexToBytes(expected), hexToBytes(signature))) {
+    return reject("signature-mismatch");
+  }
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    return reject("malformed-body");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return reject("malformed-body");
+  }
+  const boolField = (name) => typeof body[name] === "boolean";
+  if (typeof body.mode !== "string") return reject("malformed-body");
+  if (!boolField("publicProductionAuthorised")) return reject("malformed-body");
+  if (!boolField("publicProductionActivated")) return reject("malformed-body");
+  if (!boolField("personalProductionAuthorised")) return reject("malformed-body");
+  if (!boolField("personalProductionActivated")) return reject("malformed-body");
+  if (!boolField("killSwitchEngaged")) return reject("malformed-body");
+  if (body.requestedAudience !== expectedAudience) return reject("audience-mismatch");
+  if (body.requestNonce !== requestNonce) return reject("nonce-mismatch");
+  if (body.publicProductionAuthorised && !body.publicProductionActivated) {
+    return reject("inconsistent-authorised-without-activated");
+  }
+  if (body.personalProductionAuthorised && !body.personalProductionActivated) {
+    return reject("inconsistent-authorised-without-activated");
+  }
+  if (body.publicProductionAuthorised && body.mode !== "production") {
+    return reject("inconsistent-authorised-without-production-mode");
+  }
+  if (body.personalProductionAuthorised && body.mode !== "production") {
+    return reject("inconsistent-authorised-without-production-mode");
+  }
+  if (body.publicProductionAuthorised && body.killSwitchEngaged) {
+    return reject("inconsistent-authorised-with-kill-switch");
+  }
+  if (body.personalProductionAuthorised && body.killSwitchEngaged) {
+    return reject("inconsistent-authorised-with-kill-switch");
+  }
+  const reasonOk = (present, value) => {
+    if (present) return CAPACITY_REASONS.includes(value);
+    return value === undefined;
+  };
+  if (!reasonOk(!body.publicProductionAuthorised, body.reason)) {
+    return reject("inconsistent-reason");
+  }
+  if (!reasonOk(!body.personalProductionAuthorised, body.personalReason)) {
+    return reject("inconsistent-reason");
+  }
+  return { ok: true, body };
+}
+
+// Capacity preflight for a personal request (Rev 4.8 §4.3): the Worker
+// asks the API for a signed capacity response for the personal audience
+// (two-secret signed, 5 s timeout) and verifies it through
+// verifyCapacityResponseWorker before routing on it. Returns
+// { ok: true, body } or { ok: false, reason } where reason is
+// "not-configured" (no API origin / transport secret / signing secret),
+// "api-unreachable" (transport failure or a non-200 response), or the
+// verification rejection reason. A failed preflight creates NO job
+// record — the request is 503'd before anything is saved.
+async function callCapacityPreflight(env, audience, timeoutMs = 5000) {
+  const origin = apiOrigin(env);
+  const transport = env.NOVA_API_SECRET;
+  const signing = env.NOVA_SIGNING_SECRET;
+  if (!origin || !transport || !signing) {
+    return { ok: false, reason: "not-configured" };
+  }
+  const nonceBytes = new Uint8Array(16);
+  crypto.getRandomValues(nonceBytes);
+  const nonce = [...nonceBytes]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  const path =
+    "/internal/capacity?audience=" + audience + "&requestNonce=" + nonce;
+  let res;
+  try {
+    const headers = await signApiCall(transport, signing, "GET", path, "");
+    res = await fetch(origin + path, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+  } catch {
+    return { ok: false, reason: "api-unreachable" };
+  }
+  const bodyText = await res.text();
+  if (res.status !== 200) return { ok: false, reason: "api-unreachable" };
+  const timestamp = res.headers.get("X-NOVA-Capacity-Timestamp") || "";
+  const signature = res.headers.get("X-NOVA-Capacity-Signature") || "";
+  const verified = await verifyCapacityResponseWorker({
+    signingSecret: signing,
+    timestamp,
+    signature,
+    requestNonce: nonce,
+    expectedAudience: audience,
+    bodyText
+  });
+  if (!verified.ok) return { ok: false, reason: verified.reason };
+  return { ok: true, body: verified.body };
 }
 
 // POST /internal/submit (Rev 2 §3.4, Rev 3.2 §B-3.2.8): the response
@@ -1249,6 +1503,19 @@ async function submitToApi(env, job, executions, deploymentMode) {
     body.prompt = job.prompt;
   } else {
     body.scenes = job.scenes;
+  }
+  // Personal binding (Rev 4.8 §5.3): the submit carries the audience and
+  // the attestation the WORKER verified — the ownerTokenId is the
+  // Worker-asserted identity (env.NOVA_OWNER_TOKEN_ID), never a
+  // request-supplied identifier. The API's own ownerTokenId check is a
+  // secondary consistency check on this value, not owner authentication.
+  // Public jobs carry no audience field here (the API defaults them to
+  // public) and no attestation.
+  if (job.audience === "personal") {
+    body.audience = "personal";
+    body.nonCommercialAttested = true;
+    body.nonCommercialPurpose = job.nonCommercialPurpose || "proof";
+    body.ownerTokenId = job.ownerTokenId;
   }
   return callApi(env, "POST", "/internal/submit", body, PHASE3_SUBMIT_TIMEOUT_MS);
 }
@@ -1898,7 +2165,7 @@ async function waitForSubmitted(db, jobId, budgetMs) {
 async function handleGenerate(request, env) {
   const headers = corsHeaders(
     request,
-    "Content-Type, X-NOVA-JOB-TOKEN, X-NOVA-TEST-KEY",
+    "Content-Type, X-NOVA-JOB-TOKEN, X-NOVA-TEST-KEY, X-NOVA-OWNER-TOKEN",
     "POST, OPTIONS"
   );
   const respond = (status, data, extra) =>
@@ -1953,8 +2220,59 @@ async function handleGenerate(request, env) {
     });
   }
 
+  // Personal audience — owner-token gate (Rev 4.8 §5.3, reviewer
+  // correction). The ACTUAL owner token is verified here, in the Worker,
+  // with a constant-time comparison against env.NOVA_OWNER_TOKEN. A
+  // request-supplied ownerTokenId or any other identifier is NOT
+  // authentication and is ignored: the verified identity bound to the
+  // job is env.NOVA_OWNER_TOKEN_ID, asserted by this Worker. Missing,
+  // wrong, or revoked (previous-generation) tokens all fail closed
+  // with 401 and the same generic message; a Worker with no owner
+  // token configured is a deployment error (500). This runs before the
+  // controlled-test gate and before any job record is created, so a
+  // personal request without a valid owner token can never create a
+  // personal job — fresh or duplicate.
+  const isPersonal = normalized.audience === "personal";
+  let verifiedOwnerTokenId = null;
+  if (isPersonal) {
+    const ownerCheck = verifyOwnerToken(
+      env,
+      request.headers.get("X-NOVA-OWNER-TOKEN") || ""
+    );
+    if (!ownerCheck.ok) {
+      if (ownerCheck.reason === "not-configured") {
+        return respond(500, {
+          jobId,
+          status: "failed",
+          message: "NOVA could not save the production job. Please try again."
+        });
+      }
+      return respond(401, {
+        jobId,
+        status: "failed",
+        message: "A valid owner token is required."
+      });
+    }
+    verifiedOwnerTokenId = env.NOVA_OWNER_TOKEN_ID;
+    if (typeof verifiedOwnerTokenId !== "string" || verifiedOwnerTokenId.length === 0) {
+      return respond(500, {
+        jobId,
+        status: "failed",
+        message: "NOVA could not save the production job. Please try again."
+      });
+    }
+  }
+
   // Controlled-test mode gate (deployment fact, never a request field).
-  const gate = controlledTestGate(request, env);
+  // A personal request in PRODUCTION mode bypasses this gate — the gate
+  // 503s all production requests, and the personal path is instead gated
+  // by the capacity preflight below (owner token + signed capacity).
+  // In controlled-test mode the test key is still required for personal
+  // requests, exactly as for public ones. A public request never
+  // bypasses the gate, even when it carries an owner token.
+  const gate = isPersonal && phase3ApiMode(env) === "production"
+    ? null
+    : controlledTestGate(request, env);
   if (gate) {
     return respond(gate.status, { jobId, status: "failed", ...gate.body });
   }
@@ -1997,6 +2315,22 @@ async function handleGenerate(request, env) {
     return respond(503, { jobId, ...capacityUnavailableBody() });
   }
 
+  // Personal capacity preflight (Rev 4.8 §4.3): before any job record is
+  // created, the Worker asks the API for a signed capacity response for
+  // the personal audience and verifies it (signature, ±5 s freshness,
+  // nonce echo, audience binding, internal consistency) through the
+  // actual Worker boundary. A failed or unverifiable preflight — or a
+  // response that does not authorise personal production — is a 503 with
+  // NO job record. The kill-switch, the flags, and the quota all flow
+  // through this check: a kill-switch-engaged API answers
+  // personalProductionAuthorised: false, so this blocks both modes.
+  if (isPersonal) {
+    const preflight = await callCapacityPreflight(env, "personal");
+    if (!preflight.ok || preflight.body.personalProductionAuthorised !== true) {
+      return respond(503, { jobId, ...capacityUnavailableBody() });
+    }
+  }
+
   const tokenHash = await sha256Hex(token);
   const canonical = buildCanonicalRequest(normalized);
   const requestIdentityHash = await sha256Hex(canonical);
@@ -2021,6 +2355,17 @@ async function handleGenerate(request, env) {
     creationToken,
     deploymentMode: phase3ApiMode(env)
   };
+  // Personal binding: the verified identity (Worker-asserted, never a
+  // request field), the audience, and the non-commercial attestation are
+  // stored on the job record and carried into the submit body by
+  // submitToApi. The API-side ownerTokenId check is a secondary
+  // consistency check on this value.
+  if (isPersonal) {
+    jobData.audience = "personal";
+    jobData.ownerTokenId = verifiedOwnerTokenId;
+    jobData.nonCommercialAttested = true;
+    jobData.nonCommercialPurpose = normalized.nonCommercialPurpose || "proof";
+  }
   if (normalized.mode === "single") {
     jobData.prompt = normalized.prompt;
   } else {
@@ -2764,7 +3109,8 @@ async function handleDownload(request, env) {
 
   const apiBase = apiOrigin(env);
   const secret = env.NOVA_API_SECRET;
-  if (!apiBase || !secret) {
+  const signingSecret = env.NOVA_SIGNING_SECRET;
+  if (!apiBase || !secret || !signingSecret) {
     console.error("[NOVA] download: API process origin not configured.");
     return respond(503, {
       jobId,
@@ -2782,7 +3128,7 @@ async function handleDownload(request, env) {
   try {
     upstream = await fetch(apiBase + apiPath, {
       method: "GET",
-      headers: await signApiCall(secret, "GET", apiPath, ""),
+      headers: await signApiCall(secret, signingSecret, "GET", apiPath, ""),
       signal: controller.signal
     });
   } catch (e) {

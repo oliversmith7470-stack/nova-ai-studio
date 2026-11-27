@@ -65,16 +65,27 @@ export function validateWorkerOrigin(origin) {
 }
 
 export class HttpD1Client {
-  constructor({ workerOrigin, secret, fetchImpl = fetch, timeoutMs = 5000 } = {}) {
+  constructor({ workerOrigin, secret, signingSecret = '', fetchImpl = fetch, timeoutMs = 5000 } = {}) {
     this.origin = validateWorkerOrigin(workerOrigin);
     this.secret = secret;
+    // Two-secret request authentication (Rev 4.8 §8): the signing secret
+    // keys the HMAC; the transport secret is only presented. A missing
+    // signing secret fails at _call time (fail closed) rather than at
+    // construction, so a controlled-test server that never calls D1 can
+    // still be constructed — but no D1 callback is ever signed without it.
+    this.signingSecret = signingSecret;
     this.fetchImpl = fetchImpl;
     this.timeoutMs = timeoutMs;
   }
 
   async _call(method, path, bodyObj) {
     const bodyText = bodyObj === undefined ? '' : JSON.stringify(bodyObj);
-    const headers = signApiCall(this.secret, method, path, bodyText);
+    if (typeof this.signingSecret !== 'string' || this.signingSecret.length === 0) {
+      throw new D1AuthError(
+        'NOVA_SIGNING_SECRET is required to sign D1 callbacks (two-secret request authentication, Rev 4.8 §8)',
+      );
+    }
+    const headers = signApiCall(this.secret, this.signingSecret, method, path, bodyText);
     let res;
     try {
       res = await this.fetchImpl(this.origin + path, {

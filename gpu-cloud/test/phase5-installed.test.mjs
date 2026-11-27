@@ -1018,3 +1018,67 @@ test('(z)/(t) live spot checks: journal event lines from the installed runs pars
     assert.ok(seen.has(name), `observed live: ${name} (seen: ${[...seen].sort().join(', ')})`);
   }
 });
+
+// -- Quota proof plumbing in the installed configuration (M2-P §7) --------
+// Verifies the 30h/week allocation, the Saturday 00:00 UTC reset
+// boundary, and the 5h floor in the INSTALLED configuration — the unit
+// file, the staged provider definition, and the staged week/quota code.
+// Live quota proof stays gated on the separately authorised proof run:
+// this proves the installed plumbing, not live enforcement.
+test('(quota) installed config: 30h/week, Saturday 00:00 UTC reset, 5h floor', skip, async () => {
+  // 1. The installed unit carries the 5h experimental floor.
+  const unit = fs.readFileSync('/etc/systemd/system/nova-api-server.service', 'utf8');
+  const floorMatch = /^Environment=NOVA_KAGGLE_EXPERIMENT_FLOOR_HOURS=(\d+)$/m.exec(unit);
+  assert.ok(floorMatch, 'installed unit sets NOVA_KAGGLE_EXPERIMENT_FLOOR_HOURS');
+  const floorHours = Number(floorMatch[1]);
+  assert.equal(floorHours, 5);
+
+  // 2. The installed provider definition allocates 30h/week to kaggle-t4.
+  const { PROVIDER_DEFINITIONS } = await import('/opt/nova-ai-studio/gpu-cloud/src/providers.js');
+  const kaggle = PROVIDER_DEFINITIONS.find((p) => p.id === 'kaggle-t4');
+  assert.ok(kaggle, 'kaggle-t4 is a defined provider in the installed tree');
+  assert.equal(kaggle.availabilityWindow.type, 'weekly-hours');
+  assert.equal(kaggle.availabilityWindow.hoursPerWeek, 30);
+
+  // 3. The installed week boundary is Saturday 00:00 UTC.
+  const { weekStartMs, DEFAULT_WEEK_START_DAY } = await import('/opt/nova-ai-studio/gpu-cloud/src/hours.js');
+  assert.equal(DEFAULT_WEEK_START_DAY, 6, 'week starts Saturday (day 6)');
+  const saturday = Date.UTC(2026, 10, 28, 0, 0, 0); // a Saturday
+  assert.equal(new Date(saturday).getUTCDay(), 6);
+  assert.equal(weekStartMs(saturday), saturday);
+  assert.equal(weekStartMs(saturday - 1), Date.UTC(2026, 10, 21, 0, 0, 0));
+  assert.equal(weekStartMs(saturday + 60 * 1000), saturday);
+
+  // 4. The floor boundary at the authorisation level, on the installed
+  // code: exactly 5h remaining stops, 5.5h may authorise, an invalid
+  // quota never authorises.
+  const { computeAuthorisation } = await import('/opt/nova-ai-studio/gpu-cloud/src/api-server/activation.js');
+  const base = {
+    mode: 'production',
+    flags: { publicProductionActivated: false, personalProductionActivated: true },
+    killSwitchEngaged: false,
+    storage: { headroomBytes: 10 * 1024 * 1024 * 1024, reservedBytes: 0, ok: true },
+    productionExecutorIds: [],
+    personalExecutorRegistered: true,
+    kaggleCredentialPresent: true,
+    ownerTokenConfigured: true,
+    personalDispatchable: true,
+    queueDepth: 0,
+    requestedAudience: 'personal',
+    requestNonce: 'a'.repeat(32),
+  };
+  const atFloor = computeAuthorisation({ ...base, kaggleQuota: { remaining: floorHours, total: kaggle.availabilityWindow.hoursPerWeek, floor: floorHours } });
+  assert.equal(atFloor.personalProductionAuthorised, false, 'exactly 5h remaining stops');
+  assert.equal(atFloor.personalReason, 'quota-exhausted');
+  const aboveFloor = computeAuthorisation({ ...base, kaggleQuota: { remaining: 5.5, total: kaggle.availabilityWindow.hoursPerWeek, floor: floorHours } });
+  assert.equal(aboveFloor.personalProductionAuthorised, true, '5.5h remaining may authorise');
+  assert.equal(aboveFloor.personalReason, undefined, 'no reason word when authorised');
+  for (const invalid of [{ remaining: NaN, total: 30, floor: 5 }, { remaining: -1, total: 30, floor: 5 }, { remaining: 10, total: 5, floor: 5 }]) {
+    const body = computeAuthorisation({ ...base, kaggleQuota: invalid });
+    assert.equal(body.personalProductionAuthorised, false, `invalid quota ${JSON.stringify(invalid)} never authorises`);
+    assert.equal(body.personalReason, 'quota-exhausted');
+  }
+  // A null quota means "untracked" by design (no tracker configured) and
+  // authorises when storage and the worker are fine — it is not an
+  // invalid quota, so it is not in the list above.
+});

@@ -39,9 +39,14 @@ import { randomUUID } from 'node:crypto';
 import { GpuManager } from './gpu-manager.js';
 import { PROVIDER_DEFINITIONS } from './providers.js';
 import { KaggleExecutor, KAGGLE_PROVIDER_ID } from './kaggle-executor.js';
+// The real personal executor (Rev 4.8 §7, reviewer correction): the LTX
+// executor that builds the Run 10 notebook, replacing the Wan default
+// notebook builder the generic KaggleExecutor ships with.
+import { LtxKaggleExecutor } from './engines/ltx-executor.js';
 import { createStorage } from './storage/index.js';
 import { ApiStateStore } from './api-server/state-store.js';
 import { verifyWorkerAuth } from './api-server/auth.js';
+import { SqliteNonceStore } from './api-server/nonce-store.js';
 import { HttpD1Client } from './api-server/d1-client.js';
 import { DispatchManager } from './api-server/dispatch.js';
 import { SweepRunner } from './api-server/sweep.js';
@@ -291,7 +296,14 @@ export function createPersonalExecutor({ personalExecutorId = '', kaggleCredenti
     console.error('[api-server] personal executor unavailable: no packageDir for the Kaggle executor');
     return null;
   }
-  const executor = new KaggleExecutor({ packageDir, hoursTracker, registry });
+  const executor = new LtxKaggleExecutor({ packageDir, hoursTracker, registry });
+  // The personal executor is the REAL LTX executor (engines/ltx-executor.js):
+  // it builds the Run 10 notebook (121f, 1024x576, 24 fps, 8 steps) with
+  // the Kaggle Model mounts, NOT the generic KaggleExecutor's Wan default.
+  // The transport stays null (human channel) until the owner supplies a
+  // Kaggle credential AND the proof run is separately authorised — the
+  // executor never dispatches without it, and submit() without a
+  // transport returns a pending promise (no fake completion).
   assertExecutorMatchesProvider(executor, KAGGLE_PROVIDER_ID);
   return {
     providerId: KAGGLE_PROVIDER_ID,
@@ -354,6 +366,10 @@ export function createApiServer(config = {}) {
   if (mode === 'production' && signingSecret.length === 0) {
     throw new Error('NOVA_SIGNING_SECRET is required in production mode (Rev 4.8 §8 key separation)');
   }
+  // Previous signing secret (1-hour rotation overlap, same rule as the
+  // transport secret): the HMAC may verify against either during the
+  // overlap; revocation overrides the overlap for both secrets.
+  const signingSecretPrevious = config.signingSecretPrevious ?? process.env.NOVA_SIGNING_SECRET_PREVIOUS ?? '';
   // Owner-token identifier (the token VALUE never touches this host):
   // personal executor registration additionally requires it configured.
   const ownerTokenId = config.ownerTokenId ?? process.env.NOVA_OWNER_TOKEN_ID ?? '';
@@ -411,11 +427,19 @@ export function createApiServer(config = {}) {
 
   const apiState = new ApiStateStore(path.join(dataDir, 'api-state.json'));
 
+  // Rev 4.8 §8 nonce store (reviewer correction): the API process's own
+  // local SQLite nonce store at <dataDir>/nonces.db — /var/lib/nova-api/
+  // nonces.db in production. Consumption is one atomic INSERT OR IGNORE,
+  // so two concurrent consumers of the same nonce admit exactly one.
+  // ApiStateStore is NOT a nonce store and is never used as one.
+  const nonceStore = config.nonceStore ?? new SqliteNonceStore(path.join(dataDir, 'nonces.db'));
+
   // D1 client: the Worker origin is required — the API process cannot
   // function without its D1 callbacks (it never touches D1 directly).
   const d1Client = config.d1Client ?? new HttpD1Client({
     workerOrigin: config.workerOrigin ?? process.env.NOVA_WORKER_ORIGIN ?? '',
     secret,
+    signingSecret,
     timeoutMs: config.d1TimeoutMs ?? 5000,
   });
 
@@ -724,8 +748,12 @@ export function createApiServer(config = {}) {
       // including health-check, requires the secret + HMAC (Rev 2 §3.4).
       const isGet = req.method === 'GET';
       const bodyText = isGet ? '' : await readBody(req);
-      const auth = verifyWorkerAuth(req, req.method, pathWithQuery, bodyText,
-        [secret, secretPrevious], apiState);
+      const auth = verifyWorkerAuth(req, req.method, pathWithQuery, bodyText, {
+        transportSecrets: [secret, secretPrevious],
+        signingSecrets: [signingSecret, signingSecretPrevious],
+        apiState,
+        nonceStore,
+      });
       if (!auth.ok) {
         console.error(`[api-server] auth rejected step ${auth.step} requestId=${requestId} ${req.method} ${url.pathname}`);
         return send(res, 401, { error: 'unauthorised' });
@@ -750,14 +778,19 @@ export function createApiServer(config = {}) {
       }
 
       // Rev 4.8 §4.3: signed capacity. The caller is the Worker (request
-      // auth is the existing verifyWorkerAuth, unchanged — single
-      // transport secret). The response is signed with NOVA_SIGNING_SECRET
-      // and carries the request nonce back; the Worker verifies the
-      // signature, the ±5 s freshness, the nonce echo, and the audience
-      // binding before routing on it. A request without a valid audience
-      // or nonce is 400; a capacity read failure is 500 (the Worker
-      // treats it as api-unreachable); a process without a signing
-      // secret serves nothing (503) rather than an unsigned response.
+      // auth is two-secret verifyWorkerAuth, Rev 4.8 §8: transport secret
+      // presented, signing secret keys the HMAC, nonce consumed in the
+      // local SQLite store). The response is signed with
+      // NOVA_SIGNING_SECRET and carries the request nonce back; the
+      // Worker verifies the signature, the ±5 s freshness, the nonce
+      // echo, and the audience binding before routing on it. A request
+      // without a valid audience or nonce is 400; a capacity read
+      // failure is 500 (the Worker treats it as api-unreachable); a
+      // process without a signing secret serves nothing (503) rather
+      // than an unsigned response. (The route-level 503 is defence in
+      // depth: request auth already fails closed with 401 before the
+      // route is reached, so it is unreachable while the signing secret
+      // is required — kept so the route never serves unsigned.)
       // The body is the §4.2 authorisation calculation over live state.
       if (req.method === 'GET' && url.pathname === '/internal/capacity') {
         const audience = url.searchParams.get('audience');
@@ -1028,6 +1061,11 @@ export function createApiServer(config = {}) {
       await new Promise((resolve) => server.close(resolve));
       server = null;
     }
+    // Close the SQLite nonce store (only if this server owns it — a
+    // test-injected store is the caller's to close).
+    if (!config.nonceStore) {
+      try { nonceStore.close(); } catch { /* ignore */ }
+    }
   }
 
   return {
@@ -1055,6 +1093,7 @@ export function createApiServer(config = {}) {
     sweep,
     reconcile,
     apiState,
+    nonceStore,
     d1Client,
     gatewayPolicy,
     authorizationStore,

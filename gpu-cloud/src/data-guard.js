@@ -1,4 +1,5 @@
 // NOVA Personal GPU Cloud — Stage 2: VDP-06 data-handling boundary.
+import { NON_COMMERCIAL_PURPOSES } from './api-server/activation.js';
 //
 // Kaggle and Colab are both Google-owned infrastructure. Stage 2 runs use
 // a SYNTHETIC prompt and a NON-SENSITIVE test image only. No private user
@@ -8,17 +9,33 @@
 // Enforcement is two layers, and both REFUSE (the executor resolves a
 // failed report — it never merely warns):
 //
-//   1. THE MARKER (primary, enforceable): a Stage 2 job must carry
-//      params.stage2Test === true — the submitter's explicit assertion
-//      that this is a synthetic Stage 2 test job. An unmarked job is
-//      refused. The guard cannot tell a synthetic prompt from a real
-//      user's prompt by content alone, so the marker is what makes the
-//      boundary enforceable rather than aspirational.
+//   1. THE MARKER (primary, enforceable): a job must carry one of the
+//      two lawful markers:
+//        (a) Stage 2: params.stage2Test === true — the submitter's
+//            explicit assertion that this is a synthetic Stage 2 test
+//            job. An unmarked job is refused. The guard cannot tell a
+//            synthetic prompt from a real user's prompt by content
+//            alone, so the marker is what makes the boundary
+//            enforceable rather than aspirational.
+//        (b) Personal production (Rev 4.8 §12, M2-P): a personal-
+//            audience job carrying the full non-commercial attestation
+//            (nonCommercialAttested === true, a purpose in the five
+//            NON_COMMERCIAL_PURPOSES, and a non-empty ownerTokenId).
+//            The attestation is verified upstream — the Worker binds
+//            the ownerTokenId from its own environment (never from the
+//            request) and the API submit path re-checks the purpose
+//            and the token id against its configured values — so by
+//            the time the executor sees the job, the marker means an
+//            owner-only, demonstrably non-commercial job. A personal
+//            job missing any attestation fact is refused here, exactly
+//            like an unmarked Stage 2 job.
 //   2. THE SCAN (second line, heuristic): the prompt and params are
 //      scanned for credential-like patterns and for keys that carry user
 //      or private media. A match is refused. The scan is a heuristic —
 //      it catches obvious leaks, not a determined exfiltration — and is
-//      documented as such; the marker is the real boundary.
+//      documented as such; the marker is the real boundary. The scan
+//      applies to BOTH markers: a personal job carrying an API key in
+//      its prompt is refused just like a Stage 2 job is.
 //
 // The image rule: a Stage 2 job may carry NO image, or the single value
 // params.testImage === 'synthetic' (a named synthetic fixture — the
@@ -78,13 +95,23 @@ export const SYNTHETIC_IMAGE = 'synthetic';
 export function checkStage2Safe(job) {
   const params = job?.params ?? {};
 
-  // 1. The marker.
-  if (params.stage2Test !== true) {
+  // 1. The marker — one of the two lawful markers (see the module
+  // header). A job with neither is refused; a personal job missing any
+  // attestation fact is refused exactly like an unmarked Stage 2 job.
+  const stage2Marked = params.stage2Test === true;
+  const personalMarked = params.audience === 'personal'
+    && params.nonCommercialAttested === true
+    && NON_COMMERCIAL_PURPOSES.includes(params.nonCommercialPurpose)
+    && typeof params.ownerTokenId === 'string'
+    && params.ownerTokenId.length > 0;
+  if (!stage2Marked && !personalMarked) {
     return {
       ok: false,
       reason:
         'job is not marked as a Stage 2 synthetic test job ' +
-        '(params.stage2Test must be true)',
+        '(params.stage2Test must be true) and carries no personal ' +
+        'attestation (personal audience + nonCommercialAttested + a ' +
+        'purpose in the five + ownerTokenId)',
     };
   }
 
@@ -139,8 +166,7 @@ export function checkStage2Safe(job) {
 }
 
 // Check a job against the boundary, throwing DataBoundaryError on refusal.
-export function assertStage2Safe(job) {
-  const result = checkStage2Safe(job);
+export function assertStage2Safe(job) {  const result = checkStage2Safe(job);
   if (!result.ok) throw new DataBoundaryError(result.reason);
   return true;
 }
