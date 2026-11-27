@@ -212,6 +212,34 @@ test('expired timestamp fails at step 3', async (t) => {
   assert.equal(out.step, 3);
 });
 
+test('a non-safe-integer timestamp fails at step 3 (finite-integer check before the millisecond multiply)', async (t) => {
+  const ctx = await makeStore();
+  t.after(ctx.cleanup);
+  // Reviewer condition 5(a): the timestamp must be confirmed a finite,
+  // correctly typed integer before ts * 1000. A digit string longer
+  // than the safe-integer range is not one — it is refused at step 3.
+  // The ±60 s freshness check already bounds ts in practice, so this
+  // guard is defence in depth; the test proves the refusal, not the
+  // reachability.
+  const hugeTs = '9'.repeat(25);
+  const nonce = randomBytes(16).toString('hex');
+  const canonical = ['GET', '/internal/health', hugeTs, nonce, sha256Hex('')].join('\n');
+  const headers = lower({
+    'X-NOVA-API-SECRET': SECRET,
+    'X-NOVA-SIGNATURE': hmacSha256Hex(SIGNING, canonical),
+    'X-NOVA-TIMESTAMP': hugeTs,
+    'X-NOVA-NONCE': nonce,
+  });
+  const out = verifyWorkerAuth({ headers }, 'GET', '/internal/health', '', {
+    transportSecrets: [SECRET, PREVIOUS],
+    signingSecrets: [SIGNING, SIGNING_PREVIOUS],
+    apiState: ctx.store,
+    nonceStore: ctx.nonceStore,
+  }, { processStartMs: 0 });
+  assert.equal(out.ok, false);
+  assert.equal(out.step, 3);
+});
+
 test('replay of the same timestamp+nonce+signature is rejected', async (t) => {
   const ctx = await makeStore();
   t.after(ctx.cleanup);

@@ -87,10 +87,10 @@ export class KaggleExecutor extends BaseExecutor {
   } = {}) {
     super({ providerId: KAGGLE_PROVIDER_ID, ...rest });
     // Rev 4.8 §5.3/§7: the Kaggle executor serves the personal
-    // (owner-only) audience exclusively. _start() refuses a present,
-    // mismatched job audience; submit() refuses a public job at the
-    // transport boundary too, so no single layer's failure can route a
-    // public prompt to Kaggle.
+    // (owner-only) audience exclusively. _start() refuses a missing,
+    // unknown, or mismatched job audience; submit() accepts only an
+    // explicitly personal audience at the transport boundary too, so no
+    // single layer's failure can route a public prompt to Kaggle.
     this.audience = 'personal';
     this.transport = transport;
     this.kaggleUsername = kaggleUsername;
@@ -101,13 +101,18 @@ export class KaggleExecutor extends BaseExecutor {
   }
 
   async submit(job, manifest) {
-    // Rev 4.8 §5.3/§7, layer 3 — transport: the Kaggle transport refuses
-    // any job whose audience is `public`. _start() already refuses a
-    // present, mismatched audience, so this fires only for a direct
-    // submit() call — defense in depth, not the primary gate. A throw
-    // here becomes a failed report via start()'s catch.
-    if (job?.params?.audience === 'public') {
-      throw new Error('audience-mismatch: kaggle transport refuses public jobs');
+    // Rev 4.8 §5.3/§7, layer 3 — transport (M2-P round 2,
+    // reviewer-prescribed strict check): the Kaggle transport accepts
+    // ONLY an explicitly personal audience. A missing, unknown, or
+    // public audience throws audience-mismatch — no package is built,
+    // no push is attempted. _start() already refuses a non-matching
+    // audience, so this fires for a direct submit() call — defense in
+    // depth, not the primary gate. A throw here becomes a failed report
+    // via start()'s catch.
+    if (job?.params?.audience !== 'personal') {
+      throw new Error(
+        'audience-mismatch: Kaggle transport requires personal audience',
+      );
     }
     const dir = this._packageDirFor(job.id);
     // The notebook builder is injectable (see the constructor): the

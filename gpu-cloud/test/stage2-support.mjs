@@ -39,7 +39,10 @@ export function disableMock(cloud) {
 }
 
 // Submit a Stage 2-safe video job (synthetic prompt + synthetic test
-// image, marked stage2Test). Extra params override the defaults.
+// image, marked stage2Test). Extra params override the defaults. The
+// job carries NO audience by default — it routes like a public job
+// (never to a personal provider); a test that needs the personal path
+// passes audience: 'personal' explicitly (M2-P round 2).
 export function submitStage2Job(manager, key, extra = {}) {
   const { params = {}, ...rest } = extra;
   return manager.submit({

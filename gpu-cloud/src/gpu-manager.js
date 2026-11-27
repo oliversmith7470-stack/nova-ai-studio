@@ -79,11 +79,13 @@ export class GpuManager {
     this.registry = new ProviderRegistry();
     // Rev 4.8 §5.3/§7 audience routing: the provider ids that serve
     // personal (owner-only) jobs. A personal job routes ONLY to these;
-    // a public job routes NEVER to these. The set is shared by
+    // a public job routes NEVER to these. A job WITHOUT an audience is
+    // treated like a public job for routing — it routes NEVER to a
+    // personal provider (M2-P round 2: only an explicitly personal
+    // audience proceeds on the personal path). The set is shared by
     // reference with the API factory, which fills it when the personal
     // executor registers. Empty (the default) means no personal
-    // provider is known and the audience filter changes nothing for
-    // jobs without an audience (legacy/controlled-test callers).
+    // provider is known and the audience filter changes nothing.
     this.personalProviderIds = personalProviderIds instanceof Set ? personalProviderIds : new Set();
     this.config = {
       maxQueueDepth: config.maxQueueDepth ?? 100,
@@ -355,23 +357,24 @@ export class GpuManager {
       .filter((p) => providerSupports(p, job).ok)
       .filter((p) => this._activeJobsOn(p.id) < p.maxConcurrentJobs);
 
-    // Rev 4.8 §5.3 audience routing (layer 1 — dispatcher): a personal
-    // job routes ONLY to the personal executors; a public job routes
-    // NEVER to them. A job without an audience (legacy/controlled-test
-    // callers) is unfiltered — the API submit path always sets the
-    // audience in production, so an unaudited job cannot reach a
-    // personal executor through the site path. An unknown audience value
-    // fails closed: no provider is capable.
+    // Rev 4.8 §5.3 audience routing (layer 1 — dispatcher; M2-P round
+    // 2): a personal job routes ONLY to the personal executors; a public
+    // job routes NEVER to them. A job WITHOUT an audience is treated
+    // like a public job for routing — it routes NEVER to a personal
+    // executor (the old unfiltered legacy allowance is removed: only an
+    // explicitly personal audience proceeds on the personal path, so an
+    // unaudited job cannot reach a personal executor through any path).
+    // An unknown audience value fails closed: no provider is capable.
     const jobAudience = job?.params?.audience;
     if (jobAudience === 'personal') {
       for (let i = capable.length - 1; i >= 0; i--) {
         if (!this.personalProviderIds.has(capable[i].id)) capable.splice(i, 1);
       }
-    } else if (jobAudience === 'public') {
+    } else if (jobAudience === 'public' || jobAudience === undefined || jobAudience === null) {
       for (let i = capable.length - 1; i >= 0; i--) {
         if (this.personalProviderIds.has(capable[i].id)) capable.splice(i, 1);
       }
-    } else if (jobAudience !== undefined && jobAudience !== null) {
+    } else {
       capable.length = 0;
     }
 

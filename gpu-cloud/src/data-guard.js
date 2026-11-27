@@ -17,18 +17,21 @@ import { NON_COMMERCIAL_PURPOSES } from './api-server/activation.js';
 //            synthetic prompt from a real user's prompt by content
 //            alone, so the marker is what makes the boundary
 //            enforceable rather than aspirational.
-//        (b) Personal production (Rev 4.8 §12, M2-P): a personal-
-//            audience job carrying the full non-commercial attestation
-//            (nonCommercialAttested === true, a purpose in the five
-//            NON_COMMERCIAL_PURPOSES, and a non-empty ownerTokenId).
-//            The attestation is verified upstream — the Worker binds
-//            the ownerTokenId from its own environment (never from the
-//            request) and the API submit path re-checks the purpose
-//            and the token id against its configured values — so by
-//            the time the executor sees the job, the marker means an
-//            owner-only, demonstrably non-commercial job. A personal
-//            job missing any attestation fact is refused here, exactly
-//            like an unmarked Stage 2 job.
+//        (b) Personal production (Rev 4.8 §12, M2-P; round 2): a
+//            personal-audience job carrying a SERVER-GENERATED, SIGNED
+//            attestation (params.personalAttestation) that verifies at
+//            this boundary through verifyPersonalAttestation: the
+//            signature must authenticate under a server-held signing
+//            secret, and the attestation must bind the verified
+//            owner-token identifier, an explicitly selected purpose from
+//            the five NON_COMMERCIAL_PURPOSES, and this specific job
+//            (the Worker job id in params.jobId). An incoming
+//            nonCommercialAttested boolean is NEVER a marker — it is
+//            ignored outright. A personal job without a valid signed
+//            attestation is refused here, exactly like an unmarked
+//            Stage 2 job. The verifier is injected by the executor
+//            (opts.attestationVerifier); without one, no personal job
+//            can verify — fail closed.
 //   2. THE SCAN (second line, heuristic): the prompt and params are
 //      scanned for credential-like patterns and for keys that carry user
 //      or private media. A match is refused. The scan is a heuristic —
@@ -92,26 +95,47 @@ export const SYNTHETIC_IMAGE = 'synthetic';
 
 // Check a job against the Stage 2 data boundary. Returns
 // { ok: true } or { ok: false, reason }. Does not throw.
-export function checkStage2Safe(job) {
+// `opts.attestationVerifier` is the (attestation, expected, opts) =>
+// boolean the executor injects, bound to the API host's signing
+// secrets; `opts.nowMs` injects the clock for tests. Without a
+// verifier, no personal job can verify (fail closed).
+export function checkStage2Safe(job, opts = {}) {
   const params = job?.params ?? {};
 
   // 1. The marker — one of the two lawful markers (see the module
-  // header). A job with neither is refused; a personal job missing any
-  // attestation fact is refused exactly like an unmarked Stage 2 job.
+  // header). A job with neither is refused. verifyPersonalAttestation
+  // performs actual authenticity and binding checks, not field
+  // comparison: the signature must authenticate under a server-held
+  // signing secret, and the attestation must bind the verified
+  // owner-token identifier, an explicitly selected purpose from the
+  // five, and this specific job (the Worker job id, params.jobId — the
+  // manager's internal job.id is a different, idempotency-derived
+  // value and is NOT what the attestation binds). The credential scan
+  // below still runs for both markers.
   const stage2Marked = params.stage2Test === true;
-  const personalMarked = params.audience === 'personal'
-    && params.nonCommercialAttested === true
-    && NON_COMMERCIAL_PURPOSES.includes(params.nonCommercialPurpose)
-    && typeof params.ownerTokenId === 'string'
-    && params.ownerTokenId.length > 0;
-  if (!stage2Marked && !personalMarked) {
+  const verifyAttestation = typeof opts?.attestationVerifier === 'function'
+    ? opts.attestationVerifier
+    : null;
+  const lawfulMarker = stage2Marked || (
+    params.audience === 'personal'
+    && verifyAttestation !== null
+    && verifyAttestation(params.personalAttestation, {
+      audience: 'personal',
+      ownerTokenId: params.ownerTokenId,
+      purpose: NON_COMMERCIAL_PURPOSES,
+      recordedPurpose: params.nonCommercialPurpose,
+      jobId: params.jobId,
+    }, { nowMs: opts?.nowMs })
+  );
+  if (!lawfulMarker) {
     return {
       ok: false,
       reason:
-        'job is not marked as a Stage 2 synthetic test job ' +
-        '(params.stage2Test must be true) and carries no personal ' +
-        'attestation (personal audience + nonCommercialAttested + a ' +
-        'purpose in the five + ownerTokenId)',
+        'VDP-06: lawful execution marker missing — the job is not marked ' +
+        'as a Stage 2 synthetic test job (params.stage2Test must be ' +
+        'true) and carries no valid signed personal attestation ' +
+        '(personal audience + a server-generated attestation binding ' +
+        'ownerTokenId, one of the five purposes, and this job id)',
     };
   }
 
@@ -166,7 +190,8 @@ export function checkStage2Safe(job) {
 }
 
 // Check a job against the boundary, throwing DataBoundaryError on refusal.
-export function assertStage2Safe(job) {  const result = checkStage2Safe(job);
+export function assertStage2Safe(job, opts = {}) {
+  const result = checkStage2Safe(job, opts);
   if (!result.ok) throw new DataBoundaryError(result.reason);
   return true;
 }

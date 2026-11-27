@@ -787,19 +787,24 @@ function validateGenerateBody(parsed) {
   }
   // Audience (Rev 4.8 §5.3): absent means public. Unknown values fail
   // closed — a request that does not name a known audience is not a
-  // request at all. A personal request may attest a non-commercial
-  // purpose (one of the five); a public request may not carry one.
+  // request at all. A personal request must EXPLICITLY select a
+  // non-commercial purpose (one of the five) — the selection, together
+  // with the verified owner token, is the owner's deliberate
+  // non-commercial confirmation (M2-P round 2). There is NO default
+  // purpose: an absent or unknown purpose is a 400, never a silent
+  // default to "proof". A public request may not carry one.
   const audience = body.audience === undefined ? "public" : body.audience;
   if (audience !== "public" && audience !== "personal") {
     return bad("audience must be public or personal.");
   }
   let nonCommercialPurpose = null;
   if (audience === "personal") {
-    nonCommercialPurpose = body.nonCommercialPurpose === undefined
-      ? "proof"
-      : body.nonCommercialPurpose;
+    if (body.nonCommercialPurpose === undefined || body.nonCommercialPurpose === null) {
+      return bad("nonCommercialPurpose is required for a personal audience — select one of: " + [...NON_COMMERCIAL_PURPOSES].join(", ") + ".");
+    }
+    nonCommercialPurpose = body.nonCommercialPurpose;
     if (!NON_COMMERCIAL_PURPOSES.has(nonCommercialPurpose)) {
-      return bad("nonCommercialPurpose must be one of: proof, test, learning, evaluation, personal.");
+      return bad("nonCommercialPurpose must be one of: " + [...NON_COMMERCIAL_PURPOSES].join(", ") + ".");
     }
   } else if (body.nonCommercialPurpose !== undefined) {
     return bad("nonCommercialPurpose is only valid for a personal audience.");
@@ -1504,17 +1509,19 @@ async function submitToApi(env, job, executions, deploymentMode) {
   } else {
     body.scenes = job.scenes;
   }
-  // Personal binding (Rev 4.8 §5.3): the submit carries the audience and
-  // the attestation the WORKER verified — the ownerTokenId is the
-  // Worker-asserted identity (env.NOVA_OWNER_TOKEN_ID), never a
-  // request-supplied identifier. The API's own ownerTokenId check is a
-  // secondary consistency check on this value, not owner authentication.
+  // Personal binding (Rev 4.8 §5.3, M2-P round 2): the submit carries
+  // the audience, the explicitly selected purpose, and the
+  // Worker-asserted ownerTokenId (env.NOVA_OWNER_TOKEN_ID, never a
+  // request-supplied identifier). It does NOT carry a
+  // nonCommercialAttested boolean — the API never trusts one, and
+  // generates its own signed attestation server-side after its own
+  // checks. The API's own ownerTokenId check is a secondary
+  // consistency check on this value, not owner authentication.
   // Public jobs carry no audience field here (the API defaults them to
   // public) and no attestation.
   if (job.audience === "personal") {
     body.audience = "personal";
-    body.nonCommercialAttested = true;
-    body.nonCommercialPurpose = job.nonCommercialPurpose || "proof";
+    body.nonCommercialPurpose = job.nonCommercialPurpose;
     body.ownerTokenId = job.ownerTokenId;
   }
   return callApi(env, "POST", "/internal/submit", body, PHASE3_SUBMIT_TIMEOUT_MS);
@@ -2356,15 +2363,21 @@ async function handleGenerate(request, env) {
     deploymentMode: phase3ApiMode(env)
   };
   // Personal binding: the verified identity (Worker-asserted, never a
-  // request field), the audience, and the non-commercial attestation are
-  // stored on the job record and carried into the submit body by
-  // submitToApi. The API-side ownerTokenId check is a secondary
-  // consistency check on this value.
+  // request field), the audience, and the owner's explicitly selected
+  // purpose are stored on the job record. nonCommercialAttested here is
+  // the WORKER-side audit record of the verified deliberate act (owner
+  // token verified against the actual secret + purpose explicitly
+  // selected in the same authenticated session) — it is NOT sent to the
+  // API and the API never trusts it; the API generates its own signed
+  // attestation. No purpose default: normalized.nonCommercialPurpose is
+  // always set for personal jobs (validateGenerateBody refuses the
+  // request without one). The API-side ownerTokenId check is a
+  // secondary consistency check on this value.
   if (isPersonal) {
     jobData.audience = "personal";
     jobData.ownerTokenId = verifiedOwnerTokenId;
     jobData.nonCommercialAttested = true;
-    jobData.nonCommercialPurpose = normalized.nonCommercialPurpose || "proof";
+    jobData.nonCommercialPurpose = normalized.nonCommercialPurpose;
   }
   if (normalized.mode === "single") {
     jobData.prompt = normalized.prompt;

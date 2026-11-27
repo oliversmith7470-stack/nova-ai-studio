@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
+  tempDir,
   makeCloud,
   connectProvider,
   disableMock,
@@ -18,6 +19,9 @@ import {
   completionReport,
 } from './stage2-support.mjs';
 import { fileReport } from '../src/setup.js';
+import { KaggleExecutor } from '../src/kaggle-executor.js';
+import { BaseExecutor } from '../src/executor-base.js';
+import { getStagingManifest } from '../src/staging.js';
 
 // A simulated Kaggle CLI transport: push succeeds, status reports
 // 'running' N times then 'complete', output returns the given report.
@@ -47,7 +51,10 @@ function stage2Job(id = 'job-exec-1') {
     id,
     modelId: 'wan2.2-ti2v-5b',
     prompt: 'a synthetic test dragon flies over a test valley',
-    params: { stage2Test: true, testImage: 'synthetic' },
+    // Round 2: a job reaching the Kaggle executor must carry an
+    // EXPLICIT audience — a missing audience is refused with
+    // audience-mismatch before any other check.
+    params: { stage2Test: true, testImage: 'synthetic', audience: 'personal' },
   };
 }
 
@@ -183,7 +190,9 @@ test('an unknown model is refused as a failed report', async (t) => {
     id: 'job-exec-8',
     modelId: 'no-such-model',
     prompt: 'x',
-    params: { stage2Test: true },
+    // Round 2: an explicit personal audience, so the job passes the
+    // audience check and reaches the manifest check it is testing.
+    params: { stage2Test: true, audience: 'personal' },
   });
   assert.equal(report.status, 'failed');
   assert.match(report.error, /no-staging-manifest/);
@@ -214,7 +223,9 @@ test('cancel through the manager keeps the job running until the report lands (V
   const cloud = makeCloud(t);
   connectProvider(cloud, 'kaggle-t4');
   disableMock(cloud);
-  const { job } = submitStage2Job(cloud.manager, 'key-cancel-1');
+  // Round 2: an explicit personal audience routes the job to the
+  // personal provider.
+  const { job } = submitStage2Job(cloud.manager, 'key-cancel-1', { params: { audience: 'personal' } });
   const dispatched = cloud.manager.dispatchNext();
   assert.equal(dispatched.dispatched, true);
   assert.equal(dispatched.providerId, 'kaggle-t4');
@@ -280,4 +291,94 @@ test('the staging prep test gates dispatch when a local staging dir is supplied'
   assert.equal(report.status, 'failed');
   assert.match(report.error, /staging-prep-failed/);
   assert.match(report.error, /diffusion_pytorch_model-00001-of-00003\.safetensors/);
+});
+
+// -- Audience enforcement, M2-P round 2 (reviewer-prescribed strict check) --
+// The Kaggle executor serves the personal audience exclusively. At the
+// executor layer (_start) only an explicitly personal audience proceeds;
+// at the transport layer (submit) the same rule applies. A missing,
+// unknown, or mismatched audience refuses with audience-mismatch — no
+// execution, no reservation, no package. The jobs below carry the
+// stage2Test marker so the VDP-06 boundary passes and the audience
+// check is what is exercised.
+
+function audienceJob(audience, id = 'job-aud-1') {
+  const params = { stage2Test: true, testImage: 'synthetic' };
+  if (audience !== undefined) params.audience = audience;
+  return {
+    id,
+    modelId: 'wan2.2-ti2v-5b',
+    prompt: 'a synthetic test dragon flies over a test valley',
+    params,
+  };
+}
+
+test('executor layer: public / missing / unknown audiences refuse with audience-mismatch', async (t) => {
+  const cloud = makeCloud(t);
+  for (const [label, audience, received] of [
+    ['public', 'public', 'public'],
+    ['missing', undefined, 'missing'],
+    ['unknown', 'owner', 'owner'],
+  ]) {
+    const report = await cloud.kaggle.start(audienceJob(audience, `job-aud-${label}`));
+    assert.equal(report.status, 'failed', label);
+    assert.match(
+      report.error,
+      new RegExp(`^audience-mismatch: executor requires personal, received ${received}$`),
+      label,
+    );
+  }
+});
+
+test('executor layer: an explicitly personal audience proceeds past the audience check', async (t) => {
+  const cloud = makeCloud(t);
+  const job = audienceJob('personal', 'job-aud-personal');
+  const promise = cloud.kaggle.start(job);
+  // The promise must stay pending (no transport, no report yet) — it
+  // does NOT resolve to a failed report — and the package must have
+  // been written, proving the job passed the audience check into submit.
+  let settled = false;
+  promise.then(() => { settled = true; });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(settled, false);
+  assert.ok(fs.existsSync(path.join(cloud.packageDir, job.id, 'notebook.ipynb')));
+});
+
+test('transport layer: KaggleExecutor.submit accepts only personal; public / missing / unknown throw audience-mismatch', async (t) => {
+  const dir = tempDir(t);
+  const executor = new KaggleExecutor({ packageDir: path.join(dir, 'packages') });
+  assert.equal(executor.audience, 'personal');
+  const manifest = getStagingManifest('wan2.2-ti2v-5b');
+  const out = await executor.submit(audienceJob('personal', 'job-sub-personal'), manifest);
+  assert.equal(out.channel, 'kaggle-cli-human');
+  for (const audience of ['public', undefined, 'owner']) {
+    const job = audienceJob(audience, `job-sub-${audience ?? 'missing'}`);
+    await assert.rejects(
+      () => executor.submit(job, manifest),
+      /audience-mismatch: Kaggle transport requires personal audience/,
+      `audience ${audience ?? 'missing'} should throw`,
+    );
+  }
+});
+
+test('audience-agnostic executors (this.audience null) keep no audience check — the controlled-test path is retained', async (t) => {
+  const dir = tempDir(t);
+  let submitted = false;
+  class AgnosticExecutor extends BaseExecutor {
+    constructor(opts) { super({ providerId: 'test-agnostic', ...opts }); }
+    async submit() {
+      submitted = true;
+      return { channel: 'test-agnostic', packageDir: path.join(this.packageDir, 'x') };
+    }
+  }
+  const executor = new AgnosticExecutor({ packageDir: path.join(dir, 'packages') });
+  assert.equal(executor.audience, null);
+  // A public-audience stage2Test job reaches submit: the null-audience
+  // executor performs no audience check.
+  const promise = executor.start(audienceJob('public', 'job-agnostic'));
+  let settled = false;
+  promise.then(() => { settled = true; });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(submitted, true);
+  assert.equal(settled, false);
 });

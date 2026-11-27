@@ -179,6 +179,25 @@ test('LtxKaggleExecutor refuses a public job at submit (transport boundary)', as
   await assert.rejects(() => executor.submit(job, manifest), /audience-mismatch/);
 });
 
+test('LtxKaggleExecutor refuses missing and unknown audiences at submit (transport boundary)', async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'nova-ltx-exec-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const executor = new LtxKaggleExecutor({ packageDir: path.join(dir, 'packages') });
+  const manifest = getStagingManifest('ltx-video-2b');
+  // Missing audience: no audience field at all.
+  const missing = makeJob({ params: {} });
+  await assert.rejects(
+    () => executor.submit(missing, manifest),
+    /audience-mismatch: Kaggle transport requires personal audience/,
+  );
+  // Unknown audience value.
+  const unknown = makeJob({ params: { audience: 'owner' } });
+  await assert.rejects(
+    () => executor.submit(unknown, manifest),
+    /audience-mismatch: Kaggle transport requires personal audience/,
+  );
+});
+
 test('LTX admission: the 121-frame profile needs 15.64 GB (16 GB admits, 15 GB refuses)', async () => {
   const { admitJob } = await import('../src/phase6/resource-profiles.js');
   const key = {

@@ -49,7 +49,9 @@ test('a manual Kaggle run completes end to end through the manager', async (t) =
   const cloud = makeCloud(t);
   connectProvider(cloud, 'kaggle-t4');
   disableMock(cloud);
-  const { job } = submitStage2Job(cloud.manager, 'key-int-2');
+  // Round 2: the job must carry an explicitly personal audience to
+  // route to the personal provider and pass the executor's check.
+  const { job } = submitStage2Job(cloud.manager, 'key-int-2', { params: { audience: 'personal' } });
   const dispatched = cloud.manager.dispatchNext();
   assert.equal(dispatched.dispatched, true);
   assert.equal(dispatched.providerId, 'kaggle-t4');
@@ -128,7 +130,7 @@ test('a spent budget is refused at the executor level if dispatch happens anyway
   // Registry still says available (the flip has not run yet).
   assert.equal(cloud.registry.dispatchable('kaggle-t4'), true);
 
-  const { job } = submitStage2Job(cloud.manager, 'key-int-5');
+  const { job } = submitStage2Job(cloud.manager, 'key-int-5', { params: { audience: 'personal' } });
   const dispatched = cloud.manager.dispatchNext();
   assert.equal(dispatched.dispatched, true);
   // The executor refuses; the manager finalizes the job failed.
@@ -146,7 +148,10 @@ test('a refused job (VDP-06) fails through the manager and releases its reservat
     type: 'video',
     modelId: 'wan2.2-ti2v-5b',
     prompt: 'animate this photo of me',
-    params: { userImage: 'photo.png' }, // NOT a Stage 2 synthetic job
+    // Round 2: an explicit personal audience routes the job to the
+    // personal executor — where the boundary still refuses it (the
+    // test's point); a missing audience would never reach it.
+    params: { userImage: 'photo.png', audience: 'personal' }, // NOT a Stage 2 synthetic job
   });
   const dispatched = cloud.manager.dispatchNext();
   assert.equal(dispatched.dispatched, true);

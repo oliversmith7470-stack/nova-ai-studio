@@ -60,6 +60,7 @@ import { normalizeExecutorState, kaggleCancelReason } from './kaggle-status.js';
 import { D1AuthError, D1RetryableError } from './d1-client.js';
 import { checkRunnerHeartbeat } from './runner-heartbeat.js';
 import { NON_COMMERCIAL_PURPOSES } from './activation.js';
+import { signPersonalAttestation } from './attestation.js';
 import { requiredVramGb } from '../phase6/resource-profiles.js';
 import {
   buildGatewayPolicy,
@@ -118,6 +119,13 @@ export class DispatchManager {
   // (NOVA_OWNER_TOKEN_ID). A personal submit's ownerTokenId must match
   // it when configured; null means the host is unconfigured and no
   // personal submit can be authorised.
+  // attestationSigningSecret (optional, M2-P round 2): the API host's
+  // server-held signing secret (NOVA_SIGNING_SECRET) the dispatcher
+  // uses to generate the personal attestation at submit time. Without
+  // it the API cannot generate an attestation, so a personal submit is
+  // refused (fail closed) — the API never trusts an incoming
+  // nonCommercialAttested boolean, and never accepts a personal submit
+  // it cannot attest itself.
   constructor({
     manager,
     executor,
@@ -136,6 +144,7 @@ export class DispatchManager {
     validateOutput = null,
     authorisationCheck = null,
     ownerTokenId = null,
+    attestationSigningSecret = null,
     now = () => Date.now(),
   } = {}) {
     if (!manager) throw new Error('DispatchManager requires a GpuManager');
@@ -177,6 +186,7 @@ export class DispatchManager {
     this.apiState = apiState;
     this.authorisationCheck = typeof authorisationCheck === 'function' ? authorisationCheck : null;
     this.ownerTokenId = typeof ownerTokenId === 'string' && ownerTokenId.length > 0 ? ownerTokenId : null;
+    this.attestationSigningSecret = typeof attestationSigningSecret === 'string' && attestationSigningSecret.length > 0 ? attestationSigningSecret : null;
     // FreeLLMAPI (A5): the gateway policy for submit-time prompt
     // resolution. Defaults to the production policy (fail closed: no
     // enhancement in production, no authorization store).
@@ -474,6 +484,11 @@ export class DispatchManager {
     if (body.deploymentMode && body.deploymentMode !== this.mode) {
       return { status: 503, body: { error: 'no-capacity' } };
     }
+    // The server-generated personal attestation for this submit (M2-P
+    // round 2): created below, only for a personal submit that passes
+    // the purpose + token-identifier checks, and carried into the
+    // journal entry and the manager job. A refused submit discards it.
+    let personalAttestation = null;
     if (this.mode === 'production') {
       // Rev 4.9 §4, audience-aware (Rev 4.8 §5.3): a public submit needs
       // a registered permitted production executor; a personal submit
@@ -490,16 +505,23 @@ export class DispatchManager {
       } else if (!this._hasProductionExecutor()) {
         return { status: 503, body: { error: 'no-capacity' } };
       }
-      // Non-commercial attestation (Rev 4.8 §12, option (b)): a personal
-      // submit carries the per-session attestation (nonCommercialAttested,
-      // with the purpose and the token identifier) recorded in the job's
-      // audit record. A personal submit without it is refused 400. The
-      // token identifier must match the host's configured identifier
-      // when one is configured — a submit attested under a different
-      // token generation is not the owner's current attestation.
+      // Non-commercial attestation (Rev 4.8 §12, M2-P round 2): the API
+      // NEVER trusts an incoming nonCommercialAttested boolean — an
+      // incoming boolean is ignored outright, and a personal submit
+      // carrying one but no explicit purpose is still refused. The
+      // attestation is generated HERE, server-side, only after the
+      // Worker-authenticated submit passes the checks below: it binds
+      // the verified owner-token identifier, the explicitly selected
+      // purpose (one of the five — no default), and this job id, signed
+      // with the API host's server-held signing secret. Without a
+      // signing secret configured the API cannot generate one, so a
+      // personal submit is refused (503, fail closed). The token
+      // identifier must match the host's configured identifier when one
+      // is configured — a submit attested under a different token
+      // generation is not the owner's current attestation.
       if (audience === 'personal') {
-        if (body.nonCommercialAttested !== true) {
-          return { status: 400, body: { error: 'invalid-submit', message: 'nonCommercialAttested is required for personal submissions' } };
+        if (this.attestationSigningSecret === null) {
+          return { status: 503, body: { error: 'no-capacity' } };
         }
         if (!NON_COMMERCIAL_PURPOSES.includes(body.nonCommercialPurpose)) {
           return { status: 400, body: { error: 'invalid-submit', message: `nonCommercialPurpose must be one of: ${NON_COMMERCIAL_PURPOSES.join(', ')}` } };
@@ -510,6 +532,12 @@ export class DispatchManager {
         if (this.ownerTokenId !== null && body.ownerTokenId !== this.ownerTokenId) {
           return { status: 400, body: { error: 'invalid-submit', message: 'ownerTokenId does not match the configured token identifier' } };
         }
+        personalAttestation = signPersonalAttestation({
+          ownerTokenId: body.ownerTokenId,
+          purpose: body.nonCommercialPurpose,
+          jobId: body.jobId,
+          attestedAt: this.now(),
+        }, this.attestationSigningSecret);
       }
       // Authorisation revalidation at acceptance (Rev 4.8 §6): the
       // §4.2 calculation (flag for this audience, kill-switch, quota
@@ -625,9 +653,11 @@ export class DispatchManager {
     for (const { x } of stillMissing) this._reserveHeadroom(x.executionId);
 
     // Record the submission in the journal before dispatch. The audience
-    // and (for personal jobs) the non-commercial attestation, purpose,
-    // and token identifier are recorded here so the job's audit record
-    // carries them from intake (§5.2, §12).
+    // and (for personal jobs) the server-generated signed attestation,
+    // purpose, and token identifier are recorded here so the job's audit
+    // record carries them from intake (§5.2, §12). The incoming
+    // nonCommercialAttested boolean is never recorded — it is not a
+    // marker and is never trusted.
     for (const { x } of stillMissing) {
       this._journalMutate(x.executionId, (entry) => {
         entry.jobId = body.jobId;
@@ -637,7 +667,7 @@ export class DispatchManager {
         entry.timestamps.submitted = this.now();
         if (audience !== null) entry.audience = audience;
         if (audience === 'personal') {
-          entry.nonCommercialAttested = true;
+          entry.personalAttestation = personalAttestation;
           entry.nonCommercialPurpose = body.nonCommercialPurpose;
           entry.ownerTokenId = body.ownerTokenId;
         }
@@ -676,11 +706,12 @@ export class DispatchManager {
             sceneIndex: x.sceneIndex,
             // Rev 4.8 §5.3/§12: the audience travels with the job so the
             // dispatcher, executor, and transport each re-check it; a
-            // personal job also carries its attestation, purpose, and
-            // token identifier in the job record.
+            // personal job also carries its server-generated signed
+            // attestation, purpose, and token identifier in the job
+            // record (never an incoming nonCommercialAttested boolean).
             ...(audience !== null ? { audience } : {}),
             ...(audience === 'personal' ? {
-              nonCommercialAttested: true,
+              personalAttestation,
               nonCommercialPurpose: body.nonCommercialPurpose,
               ownerTokenId: body.ownerTokenId,
             } : {}),

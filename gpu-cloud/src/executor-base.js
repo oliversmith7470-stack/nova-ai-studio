@@ -73,6 +73,7 @@ export class BaseExecutor {
     route = 'official',
     stagingRootDir = null,
     packageDir,
+    attestationVerifier = null,
   } = {}) {
     if (!providerId) throw new Error('executor requires providerId');
     if (!packageDir) throw new Error('executor requires packageDir');
@@ -80,9 +81,18 @@ export class BaseExecutor {
     // Rev 4.8 §5.3/§7: the audience this executor serves, or null when
     // the executor is audience-agnostic (controlled-test fakes). The
     // Kaggle executor sets 'personal'; a subclass that serves public
-    // production sets 'public'. _start() refuses a present, mismatched
-    // job audience.
+    // production sets 'public'. _start() refuses a missing, unknown, or
+    // mismatched job audience when one is declared — only an explicitly
+    // matching audience proceeds. An audience-agnostic executor (null)
+    // performs no audience check; that is the retained controlled-test
+    // path, and it must never be used for a production executor.
     this.audience = null;
+    // M2-P round 2: the verifier for the server-generated personal
+    // attestation, bound to the API host's signing secrets by the API
+    // factory. Null means no attestation can verify — a personal job
+    // then fails the VDP-06 boundary (fail closed). Controlled-test
+    // executors legitimately carry null: they run stage2Test jobs only.
+    this.attestationVerifier = typeof attestationVerifier === 'function' ? attestationVerifier : null;
     this.hoursTracker = hoursTracker;
     this.registry = registry;
     this.route = route;
@@ -108,25 +118,30 @@ export class BaseExecutor {
   }
 
   async _start(job) {
-    // 1. VDP-06 data boundary.
-    const safe = checkStage2Safe(job);
+    // 1. VDP-06 data boundary. The personal marker is the signed
+    // server-generated attestation, verified here through the injected
+    // verifier (null verifier = no personal job can verify — fail
+    // closed); stage2Test jobs need no verifier.
+    const safe = checkStage2Safe(job, { attestationVerifier: this.attestationVerifier });
     if (!safe.ok) {
       return this._failed(job, `data-boundary: ${safe.reason}`);
     }
 
-    // 1b. Audience enforcement (Rev 4.8 §5.3/§7, layer 2 — executor).
-    // An executor with a declared audience refuses a job whose declared
-    // audience is present and different. A job with NO audience is a
-    // legacy/controlled-test caller and is not refused here — the API
-    // submit path always sets the audience in production, so a
-    // production job without one cannot reach this executor through the
-    // site path. A mismatch fails the job with `audience-mismatch` and
-    // is logged for the operator by the caller.
+    // 1b. Audience enforcement (Rev 4.8 §5.3/§7, layer 2 — executor;
+    // M2-P round 2, reviewer-prescribed strict check). An executor with
+    // a declared audience accepts ONLY a job whose audience explicitly
+    // matches it. A missing, unknown, or mismatched audience refuses
+    // with `audience-mismatch` — no execution, no reservation. The old
+    // allowance for a job with NO audience (treated as a
+    // legacy/controlled-test caller) is removed: a production job
+    // without an audience cannot reach this executor, and a direct
+    // caller without one is refused here instead of trusted.
     const jobAudience = job?.params?.audience;
-    if (this.audience && jobAudience && jobAudience !== this.audience) {
+
+    if (this.audience && jobAudience !== this.audience) {
       return this._failed(
         job,
-        `audience-mismatch: executor audience is ${this.audience}, job audience is ${jobAudience}`,
+        `audience-mismatch: executor requires ${this.audience}, received ${jobAudience ?? 'missing'}`,
       );
     }
 

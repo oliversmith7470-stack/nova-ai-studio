@@ -197,6 +197,13 @@ export function verifyWorkerAuth(req, method, path, bodyText, auth, opts = {}) {
   const nowSec = Math.floor(Date.now() / 1000);
   if (Math.abs(nowSec - ts) > HMAC_TIMESTAMP_WINDOW_S) return { ok: false, step: 3 };
 
+  // (3a) The timestamp must be a finite, correctly typed integer before
+  // any arithmetic on it (reviewer condition 5(a)): a digit string
+  // longer than the safe-integer range would make ts * 1000 meaningless.
+  // The ±60 s freshness check above already bounds ts in practice, so
+  // this is defence in depth, placed before the multiplication.
+  if (!Number.isSafeInteger(ts)) return { ok: false, step: 3 };
+
   // (3b) Millisecond process-start rule (reviewer correction): the
   // call's whole second at or before the process-start second is
   // rejected — timestampSeconds * 1000 <= processStartMs. A timestamp

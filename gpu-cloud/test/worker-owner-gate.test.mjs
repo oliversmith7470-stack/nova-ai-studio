@@ -8,12 +8,18 @@
 //
 // What is proven here:
 //   - a personal job reaches the personal executor (202, D1 job carries
-//     the Worker-asserted ownerTokenId, the API journal carries the
-//     audience + attestation, the LTX package is built);
+//     the Worker-asserted ownerTokenId and the explicitly selected
+//     purpose, the API journal carries the server-generated SIGNED
+//     attestation — never an incoming boolean — and the LTX package
+//     is built);
 //   - missing / wrong / revoked owner tokens are 401 and create NO job;
+//   - a personal request without an explicitly selected purpose is 400
+//     (no default purpose) and creates NO job;
 //   - a public request cannot become personal (a valid owner token does
 //     not upgrade it; an ownerTokenId field is rejected as unknown);
 //   - an unknown audience fails closed (400);
+//   - failed API authentication never creates a job (401, no journal
+//     entry, no manager job);
 //   - the kill-switch blocks the personal path (503, no job);
 //   - the personal flag off blocks the personal path (503, no job);
 //   - the capacity preflight is verified through the Worker boundary
@@ -211,6 +217,11 @@ function genBody(jobId, overrides = {}) {
     resolution: '1024x576',
     fps: 24,
     audience: 'personal',
+    // Round 2: the purpose is EXPLICITLY selected (the owner's
+    // deliberate non-commercial confirmation) — the Worker no longer
+    // defaults it to "proof", and the API generates its own signed
+    // attestation server-side; no nonCommercialAttested boolean is sent.
+    nonCommercialPurpose: 'proof',
     ...overrides,
   };
 }
@@ -240,20 +251,39 @@ describe('worker owner-token gate + personal path (production, flag on)', () => 
     assert.equal(res.status, 202, `generate: HTTP ${res.status} ${res.text.slice(0, 300)}`);
     assert.equal(res.json.dispatchState, 'slot-claimed');
     // The D1 job record carries the Worker-asserted identity — never a
-    // request field (the request carried no ownerTokenId at all).
+    // request field (the request carried no ownerTokenId at all) — and
+    // the owner's explicitly selected purpose (no default).
     const job = await jobRow(ctx.db, jobId);
     assert.ok(job, 'D1 job record exists');
     assert.equal(job.audience, 'personal');
     assert.equal(job.ownerTokenId, TEST_OWNER_TOKEN_ID);
     assert.equal(job.nonCommercialAttested, true);
     assert.equal(job.nonCommercialPurpose, 'proof');
-    // The API journal entry carries the same audience + attestation.
+    // The API journal entry carries the SERVER-GENERATED signed
+    // attestation (never an incoming boolean).
     const entry = ctx.api.dispatch.journalEntry(`${jobId}:scene-0:attempt-1`);
     assert.ok(entry, 'journal entry exists');
     assert.equal(entry.audience, 'personal');
-    assert.equal(entry.nonCommercialAttested, true);
+    assert.equal(entry.nonCommercialAttested, undefined);
     assert.equal(entry.nonCommercialPurpose, 'proof');
     assert.equal(entry.ownerTokenId, TEST_OWNER_TOKEN_ID);
+    const attestation = entry.personalAttestation;
+    assert.ok(attestation, 'signed attestation exists on the journal entry');
+    assert.equal(attestation.version, 1);
+    assert.equal(attestation.audience, 'personal');
+    assert.equal(attestation.purpose, 'proof');
+    assert.equal(attestation.jobId, jobId);
+    assert.equal(attestation.ownerTokenId, TEST_OWNER_TOKEN_ID);
+    assert.equal(attestation.nonCommercial, true);
+    assert.match(attestation.signature, /^[0-9a-f]{64}$/);
+    // The attestation verifies under the API host's signing secret.
+    const { verifyPersonalAttestation } = await import('../src/api-server/attestation.js');
+    assert.equal(verifyPersonalAttestation(attestation, {
+      ownerTokenId: TEST_OWNER_TOKEN_ID,
+      purpose: ['test', 'proof', 'benchmark', 'experiment', 'own-non-monetised-film'],
+      recordedPurpose: 'proof',
+      jobId,
+    }, [TEST_SIGNING_SECRET]), true);
     // The personal executor built the real LTX package (no transport,
     // no push — the package is built locally and the job waits for a
     // fileReport that never comes). The package dir is keyed by the
@@ -311,7 +341,9 @@ describe('worker owner-token gate + personal path (production, flag on)', () => 
   test('public + valid owner token: 503 — a token never upgrades a public request', async () => {
     const jobId = `nova-job-${randomUUID()}`;
     const res = await callWorker(ctx.mf, 'POST', '/api/generate', {
-      body: genBody(jobId, { audience: 'public' }),
+      // A public request carries no purpose (a purpose is only valid
+      // for a personal audience).
+      body: genBody(jobId, { audience: 'public', nonCommercialPurpose: undefined }),
       headers: genHeaders(),
     });
     assert.equal(res.status, 503);
@@ -349,6 +381,32 @@ describe('worker owner-token gate + personal path (production, flag on)', () => 
     });
     assert.equal(res.status, 400);
     assert.equal(await jobRow(ctx.db, jobId), null);
+  });
+
+  test('personal + missing nonCommercialPurpose: 400, no job record (no default purpose)', async () => {
+    const jobId = `nova-job-${randomUUID()}`;
+    const body = genBody(jobId);
+    delete body.nonCommercialPurpose;
+    const res = await callWorker(ctx.mf, 'POST', '/api/generate', {
+      body,
+      headers: genHeaders(),
+    });
+    assert.equal(res.status, 400);
+    assert.match(res.json.message, /nonCommercialPurpose is required/);
+    assert.equal(await jobRow(ctx.db, jobId), null);
+  });
+
+  test('failed API auth never creates a job (unauthenticated submit is 401, no journal entry)', async () => {
+    const jobId = `nova-job-${randomUUID()}`;
+    const res = await fetch(`http://localhost:${ctx.apiPort}/internal/submit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobId }),
+    });
+    assert.equal(res.status, 401);
+    assert.equal(ctx.api.dispatch.journalEntry(`${jobId}:scene-0:attempt-1`), null);
+    const jobs = ctx.api.manager.store.state.jobs ?? {};
+    assert.equal(Object.values(jobs).some((j) => j.params?.jobId === jobId), false);
   });
 
   test('kill-switch engaged: personal + valid token is 503, no job record', async () => {

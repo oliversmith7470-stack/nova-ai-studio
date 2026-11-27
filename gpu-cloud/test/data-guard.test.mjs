@@ -11,6 +11,8 @@ import {
   assertStage2Safe,
   DataBoundaryError,
 } from '../src/data-guard.js';
+import { signPersonalAttestation, createAttestationVerifier } from '../src/api-server/attestation.js';
+import { NON_COMMERCIAL_PURPOSES } from '../src/api-server/activation.js';
 
 function job(overrides = {}) {
   const { params = {}, ...rest } = overrides;
@@ -100,71 +102,150 @@ test('assertStage2Safe throws DataBoundaryError with the reason', () => {
   );
 });
 
-// -- Personal production marker (Rev 4.8 §12, M2-P) -------------------------
-// A personal-audience job carrying the full non-commercial attestation
-// is the second lawful marker: it passes the boundary, while the
-// credential scan still applies. The attestation facts are verified
-// upstream (Worker binds the ownerTokenId from its environment; the API
-// submit path re-checks purpose + token id), so the guard checks their
-// presence and shape only.
+// -- Personal production marker (Rev 4.8 §12, M2-P round 2) ---------------
+// The ONLY personal marker is a server-generated, signed attestation
+// (params.personalAttestation), verified at this boundary through an
+// injected verifier bound to the API host's signing secrets. An incoming
+// nonCommercialAttested boolean is NEVER a marker. The credential scan
+// still applies to personal jobs, exactly as to stage2Test jobs.
+
+const TEST_SIGNING_SECRET = 'test-attestation-signing-secret';
+const TEST_OWNER_TOKEN_ID = 'owner-token-v1';
+const TEST_JOB_ID = 'nova-job-11111111-2222-3333-4444-555555555555';
+
+function attestationVerifier() {
+  return createAttestationVerifier({ signingSecrets: [TEST_SIGNING_SECRET], apiState: null });
+}
 
 function personalJob(overrides = {}) {
   const { params = {}, ...rest } = overrides;
+  const attestation = signPersonalAttestation({
+    ownerTokenId: TEST_OWNER_TOKEN_ID,
+    purpose: 'proof',
+    jobId: TEST_JOB_ID,
+    attestedAt: Date.now(),
+  }, TEST_SIGNING_SECRET);
   return {
     id: 'job-personal-1',
     modelId: 'ltx-video-2b',
     prompt: 'A dragon rests on a misty mountain ridge at dawn',
     params: {
       audience: 'personal',
-      nonCommercialAttested: true,
+      personalAttestation: attestation,
       nonCommercialPurpose: 'proof',
-      ownerTokenId: 'owner-token-v1',
+      ownerTokenId: TEST_OWNER_TOKEN_ID,
+      jobId: TEST_JOB_ID,
       ...params,
     },
     ...rest,
   };
 }
 
-test('a personal job with the full non-commercial attestation passes', () => {
-  assert.deepEqual(checkStage2Safe(personalJob()), { ok: true });
-  for (const purpose of ['test', 'proof', 'benchmark', 'experiment', 'own-non-monetised-film']) {
+function checkPersonal(j, verifier = attestationVerifier()) {
+  return checkStage2Safe(j, { attestationVerifier: verifier });
+}
+
+test('a personal job with a valid signed attestation passes', () => {
+  assert.deepEqual(checkPersonal(personalJob()), { ok: true });
+  assert.equal(assertStage2Safe(personalJob(), { attestationVerifier: attestationVerifier() }), true);
+  for (const purpose of NON_COMMERCIAL_PURPOSES) {
+    const attestation = signPersonalAttestation({
+      ownerTokenId: TEST_OWNER_TOKEN_ID,
+      purpose,
+      jobId: TEST_JOB_ID,
+      attestedAt: Date.now(),
+    }, TEST_SIGNING_SECRET);
     assert.deepEqual(
-      checkStage2Safe(personalJob({ params: { nonCommercialPurpose: purpose } })),
+      checkPersonal(personalJob({
+        params: { personalAttestation: attestation, nonCommercialPurpose: purpose },
+      })),
       { ok: true },
       `purpose ${purpose} should pass`,
     );
   }
 });
 
+test('a personal job without a verifier is refused (fail closed)', () => {
+  const r = checkStage2Safe(personalJob());
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /VDP-06: lawful execution marker missing/);
+});
+
+test('the old boolean marker is dead: nonCommercialAttested alone never passes', () => {
+  const j = personalJob({ params: { personalAttestation: undefined } });
+  delete j.params.personalAttestation;
+  j.params.nonCommercialAttested = true;
+  const r = checkPersonal(j);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /VDP-06: lawful execution marker missing/);
+});
+
+test('a personal job with a tampered or misbound attestation is refused', () => {
+  const good = signPersonalAttestation({
+    ownerTokenId: TEST_OWNER_TOKEN_ID,
+    purpose: 'proof',
+    jobId: TEST_JOB_ID,
+    attestedAt: Date.now(),
+  }, TEST_SIGNING_SECRET);
+  const cases = [
+    ['wrong job', { ...good, jobId: 'nova-job-99999999-8888-7777-6666-555555555555' }],
+    ['wrong purpose', { ...good, purpose: 'test' }],
+    ['wrong owner', { ...good, ownerTokenId: 'owner-token-v999' }],
+    ['wrong signature', { ...good, signature: '0'.repeat(64) }],
+    ['unsigned', (({ signature, ...rest }) => rest)(good)],
+    ['wrong audience', { ...good, audience: 'public' }],
+  ];
+  for (const [label, attestation] of cases) {
+    const r = checkPersonal(personalJob({ params: { personalAttestation: attestation } }));
+    assert.equal(r.ok, false, label);
+    assert.match(r.reason, /VDP-06: lawful execution marker missing/, label);
+  }
+  // An attestation for another job does not verify even when it is
+  // itself correctly signed.
+  const otherJob = signPersonalAttestation({
+    ownerTokenId: TEST_OWNER_TOKEN_ID,
+    purpose: 'proof',
+    jobId: 'nova-job-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    attestedAt: Date.now(),
+  }, TEST_SIGNING_SECRET);
+  assert.equal(checkPersonal(personalJob({ params: { personalAttestation: otherJob } })).ok, false);
+});
+
 test('a personal job missing any attestation fact is refused', () => {
   const missing = [
     { audience: 'public' },
     { audience: undefined },
-    { nonCommercialAttested: false },
-    { nonCommercialAttested: undefined },
     { nonCommercialPurpose: 'monetised-film' },
     { nonCommercialPurpose: 'learning' },
     { nonCommercialPurpose: undefined },
     { ownerTokenId: '' },
     { ownerTokenId: undefined },
+    { jobId: undefined },
+    { jobId: 'nova-job-00000000-0000-0000-0000-000000000000' },
   ];
   for (const params of missing) {
     const j = personalJob({ params });
     if (params.audience === undefined) delete j.params.audience;
-    if (params.nonCommercialAttested === undefined) delete j.params.nonCommercialAttested;
     if (params.nonCommercialPurpose === undefined) delete j.params.nonCommercialPurpose;
     if (params.ownerTokenId === undefined) delete j.params.ownerTokenId;
-    const r = checkStage2Safe(j);
+    if (params.jobId === undefined) delete j.params.jobId;
+    const r = checkPersonal(j);
     assert.equal(r.ok, false, `${JSON.stringify(params)} should be refused`);
-    assert.match(r.reason, /not marked as a Stage 2 synthetic test job/);
+    assert.match(r.reason, /VDP-06: lawful execution marker missing/);
   }
 });
 
 test('the credential scan still applies to a personal job', () => {
-  const r = checkStage2Safe(personalJob({ prompt: 'api_key: hunter2' }));
+  const r = checkPersonal(personalJob({ prompt: 'api_key: hunter2' }));
   assert.equal(r.ok, false);
   assert.match(r.reason, /credential-like pattern/);
-  const r2 = checkStage2Safe(personalJob({ params: { userImage: 'photo.png' } }));
+  const r2 = checkPersonal(personalJob({ params: { userImage: 'photo.png' } }));
   assert.equal(r2.ok, false);
   assert.match(r2.reason, /forbidden key "userImage"/);
+});
+
+test('the credential scan still applies to a stage2Test job (both markers)', () => {
+  const r = checkStage2Safe(job({ prompt: 'password=letmein' }));
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /credential-like pattern/);
 });

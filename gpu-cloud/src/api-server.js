@@ -46,6 +46,7 @@ import { LtxKaggleExecutor } from './engines/ltx-executor.js';
 import { createStorage } from './storage/index.js';
 import { ApiStateStore } from './api-server/state-store.js';
 import { verifyWorkerAuth } from './api-server/auth.js';
+import { createAttestationVerifier } from './api-server/attestation.js';
 import { SqliteNonceStore } from './api-server/nonce-store.js';
 import { HttpD1Client } from './api-server/d1-client.js';
 import { DispatchManager } from './api-server/dispatch.js';
@@ -271,7 +272,7 @@ export function isKaggleCredentialPresent({ env = process.env, home = os.homedir
 // those flags, and credential presence is the only authenticated signal
 // available at this layer; the five §6 status concepts (S1) remain a
 // separate design change and are NOT claimed here.
-export function createPersonalExecutor({ personalExecutorId = '', kaggleCredentialPresent = null, ownerTokenConfigured = null, hoursTracker = null, registry = null, packageDir = null } = {}) {
+export function createPersonalExecutor({ personalExecutorId = '', kaggleCredentialPresent = null, ownerTokenConfigured = null, hoursTracker = null, registry = null, packageDir = null, attestationVerifier = null } = {}) {
   const id = typeof personalExecutorId === 'string' ? personalExecutorId.trim() : '';
   if (id === '') return null;
   if (id !== KAGGLE_PROVIDER_ID) {
@@ -296,10 +297,14 @@ export function createPersonalExecutor({ personalExecutorId = '', kaggleCredenti
     console.error('[api-server] personal executor unavailable: no packageDir for the Kaggle executor');
     return null;
   }
-  const executor = new LtxKaggleExecutor({ packageDir, hoursTracker, registry });
+  const executor = new LtxKaggleExecutor({ packageDir, hoursTracker, registry, attestationVerifier });
   // The personal executor is the REAL LTX executor (engines/ltx-executor.js):
   // it builds the Run 10 notebook (121f, 1024x576, 24 fps, 8 steps) with
   // the Kaggle Model mounts, NOT the generic KaggleExecutor's Wan default.
+  // The attestation verifier (bound to the API host's signing secrets) is
+  // carried so the executor's VDP-06 boundary can verify the
+  // server-generated personal attestation; without it no personal job
+  // verifies (fail closed).
   // The transport stays null (human channel) until the owner supplies a
   // Kaggle credential AND the proof run is separately authorised — the
   // executor never dispatches without it, and submit() without a
@@ -531,6 +536,14 @@ export function createApiServer(config = {}) {
       hoursTracker,
       registry: manager.registry,
       packageDir: config.packageDir ?? path.join(dataDir, 'packages'),
+      // M2-P round 2: the executor's VDP-06 boundary verifies the
+      // server-generated personal attestation against the API host's
+      // signing secrets (current + previous during rotation) with the
+      // revocation record — the same key separation as request auth.
+      attestationVerifier: createAttestationVerifier({
+        signingSecrets: [signingSecret, signingSecretPrevious],
+        apiState,
+      }),
     });
     if (personal) {
       manager.registerProvider(personal.providerDef);
@@ -551,6 +564,10 @@ export function createApiServer(config = {}) {
     gatewayPolicy,
     mode,
     ownerTokenId: ownerTokenConfigured ? ownerTokenId : null,
+    // M2-P round 2: the dispatcher generates the personal attestation
+    // server-side with the API host's signing secret (current only —
+    // rotation's previous secret verifies, never signs).
+    attestationSigningSecret: signingSecret,
     ackWindowMs: config.ackWindowMs ?? ACK_WINDOW_MS,
     ackPollMs: config.ackPollMs ?? 1000,
     validateOutput: config.validateOutput ?? validateMp4,

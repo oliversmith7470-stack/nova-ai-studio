@@ -128,6 +128,13 @@ export function createGpuCloud({
   manager.registerExecutor('kaggle-t4', kaggle);
   manager.registerExecutor('colab-t4', colab);
 
+  // M2-P round 2: the Kaggle executor serves the personal audience
+  // exclusively (audience 'personal'), so kaggle-t4 IS a personal
+  // provider for dispatcher routing — a personal job routes ONLY to
+  // it, and a public or unaudited job routes NEVER to it. The Colab
+  // executor is audience-agnostic and is NOT a personal provider.
+  manager.personalProviderIds.add('kaggle-t4');
+
   // Reconcile registry status with the stored weekly budgets.
   for (const id of Object.keys(budgets)) {
     syncBudgetStatus(manager.registry, hoursTracker, id);

@@ -229,6 +229,10 @@ test('(u2) authorisation: personal quota floor is a strict boundary (remaining =
   }));
   assert.equal(atFloor.personalProductionAuthorised, false);
   assert.equal(atFloor.personalReason, 'quota-exhausted');
+  // The 5 h floor and the 30 h weekly window are separate concepts:
+  // the floor is the stop line, the window is the budget. 5.5 h
+  // remaining authorises ONLY when every other §4.2 condition also
+  // holds — it is not unconditional authorisation.
   const aboveFloor = computeAuthorisation(baseInputs({
     flags: { publicProductionActivated: false, personalProductionActivated: true },
     personalExecutorRegistered: true,
@@ -238,6 +242,27 @@ test('(u2) authorisation: personal quota floor is a strict boundary (remaining =
     personalDispatchable: true,
   }));
   assert.equal(aboveFloor.personalProductionAuthorised, true);
+  const aboveFloorStorageFull = computeAuthorisation(baseInputs({
+    flags: { publicProductionActivated: false, personalProductionActivated: true },
+    personalExecutorRegistered: true,
+    kaggleCredentialPresent: true,
+    ownerTokenConfigured: true,
+    kaggleQuota: { remaining: 5.5, total: 30, floor: 5 },
+    personalDispatchable: true,
+    storage: { headroomBytes: 0, reservedBytes: 0, ok: false },
+  }));
+  assert.equal(aboveFloorStorageFull.personalProductionAuthorised, false);
+  assert.equal(aboveFloorStorageFull.personalReason, 'storage-full');
+  const aboveFloorFlagOff = computeAuthorisation(baseInputs({
+    flags: { publicProductionActivated: false, personalProductionActivated: false },
+    personalExecutorRegistered: true,
+    kaggleCredentialPresent: true,
+    ownerTokenConfigured: true,
+    kaggleQuota: { remaining: 5.5, total: 30, floor: 5 },
+    personalDispatchable: true,
+  }));
+  assert.equal(aboveFloorFlagOff.personalProductionAuthorised, false);
+  assert.equal(aboveFloorFlagOff.personalReason, 'not-activated');
   // An invalid quota model cannot authorise (fail closed).
   const invalid = computeAuthorisation(baseInputs({
     flags: { publicProductionActivated: false, personalProductionActivated: true },
@@ -713,19 +738,32 @@ function personalBody(label, overrides = {}) {
     ...body,
     deploymentMode: 'production',
     audience: 'personal',
-    nonCommercialAttested: true,
+    // Round 2: no nonCommercialAttested boolean is sent — the API never
+    // trusts one and generates its own signed attestation server-side.
+    // The explicit purpose + the Worker-asserted ownerTokenId are what
+    // the submit carries.
     nonCommercialPurpose: 'proof',
     ownerTokenId: TEST_OWNER_TOKEN_ID,
     ...overrides,
   };
 }
 
-test('(u7) personal submit without the attestation is refused 400; without a purpose or token id too', async (t) => {
+test('(u7) an incoming boolean is not an attestation: purpose and token id are what matter', async (t) => {
   const { api, d1, cleanup } = await personalApi(t);
   try {
-    const noAttest = personalBody('m2p-no-attest', { nonCommercialAttested: false });
-    seedJobForSubmit(d1, noAttest);
-    const r1 = await api.dispatch.submitExecutions(noAttest);
+    // A nonCommercialAttested boolean — true or false — is ignored
+    // outright: with a valid purpose + token id the submit is accepted
+    // (the server generates its own attestation), and without a purpose
+    // it is refused even when the boolean claims attestation.
+    const booleanFalse = personalBody('m2p-bool-false', { nonCommercialAttested: false });
+    seedJobForSubmit(d1, booleanFalse);
+    const r0 = await api.dispatch.submitExecutions(booleanFalse);
+    assert.equal(r0.status, 202);
+
+    const booleanTrueNoPurpose = personalBody('m2p-bool-no-purpose', { nonCommercialAttested: true });
+    delete booleanTrueNoPurpose.nonCommercialPurpose;
+    seedJobForSubmit(d1, booleanTrueNoPurpose);
+    const r1 = await api.dispatch.submitExecutions(booleanTrueNoPurpose);
     assert.equal(r1.status, 400);
     assert.equal(r1.body.error, 'invalid-submit');
 
@@ -762,26 +800,45 @@ test('(u7) personal submit in production mode without an audience is refused 400
   }
 });
 
-test('(u7) personal submit with attestation is accepted (202) and the job + journal carry the audience and attestation', async (t) => {
+test('(u7) personal submit with an explicit purpose is accepted (202) and the job + journal carry the server-generated signed attestation', async (t) => {
   const { api, d1, cleanup } = await personalApi(t);
   try {
     const body = personalBody('m2p-attested');
     seedJobForSubmit(d1, body);
     const r = await api.dispatch.submitExecutions(body);
     assert.equal(r.status, 202);
-    // The manager job carries the audience and attestation in params.
+    // The manager job carries the audience and the SERVER-GENERATED
+    // signed attestation in params — never an incoming boolean.
     const jobs = api.manager.store.state.jobs ?? {};
     const stored = Object.values(jobs).find((j) => j.params?.executionId === `${body.jobId}:scene-0:attempt-1`);
     assert.ok(stored, 'manager job exists');
     assert.equal(stored.params.audience, 'personal');
-    assert.equal(stored.params.nonCommercialAttested, true);
+    assert.equal(stored.params.nonCommercialAttested, undefined);
     assert.equal(stored.params.nonCommercialPurpose, 'proof');
     assert.equal(stored.params.ownerTokenId, TEST_OWNER_TOKEN_ID);
+    const attestation = stored.params.personalAttestation;
+    assert.ok(attestation, 'signed attestation exists on the job');
+    assert.equal(attestation.version, 1);
+    assert.equal(attestation.audience, 'personal');
+    assert.equal(attestation.purpose, 'proof');
+    assert.equal(attestation.jobId, body.jobId);
+    assert.equal(attestation.ownerTokenId, TEST_OWNER_TOKEN_ID);
+    assert.equal(attestation.nonCommercial, true);
+    assert.match(attestation.signature, /^[0-9a-f]{64}$/);
+    // The attestation verifies under the API host's signing secret.
+    const { verifyPersonalAttestation } = await import('../src/api-server/attestation.js');
+    assert.equal(verifyPersonalAttestation(attestation, {
+      ownerTokenId: TEST_OWNER_TOKEN_ID,
+      purpose: ['test', 'proof', 'benchmark', 'experiment', 'own-non-monetised-film'],
+      recordedPurpose: 'proof',
+      jobId: body.jobId,
+    }, [TEST_SIGNING_SECRET]), true);
     // The journal entry records the same attestation (§12 audit record).
     const entry = api.dispatch.journalEntry(`${body.jobId}:scene-0:attempt-1`);
     assert.ok(entry, 'journal entry exists');
     assert.equal(entry.audience, 'personal');
-    assert.equal(entry.nonCommercialAttested, true);
+    assert.equal(entry.nonCommercialAttested, undefined);
+    assert.deepEqual(entry.personalAttestation, attestation);
     assert.equal(entry.nonCommercialPurpose, 'proof');
     assert.equal(entry.ownerTokenId, TEST_OWNER_TOKEN_ID);
   } finally {
@@ -806,7 +863,6 @@ test('(u7) public submit in production mode is refused 503 no-capacity — no pe
   const { api, d1, cleanup } = await personalApi(t);
   try {
     const body = personalBody('m2p-public', { audience: 'public' });
-    delete body.nonCommercialAttested;
     delete body.nonCommercialPurpose;
     delete body.ownerTokenId;
     seedJobForSubmit(d1, body);
