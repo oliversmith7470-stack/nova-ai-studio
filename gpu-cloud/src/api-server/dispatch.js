@@ -59,6 +59,7 @@ import {
 import { normalizeExecutorState, kaggleCancelReason } from './kaggle-status.js';
 import { D1AuthError, D1RetryableError } from './d1-client.js';
 import { checkRunnerHeartbeat } from './runner-heartbeat.js';
+import { NON_COMMERCIAL_PURPOSES } from './activation.js';
 import { requiredVramGb } from '../phase6/resource-profiles.js';
 import {
   buildGatewayPolicy,
@@ -107,6 +108,16 @@ export class DispatchManager {
   // storage-runner heartbeat (Rev 4.9 §6/F-6a) and refuses 503
   // storage-full while the runner is unhealthy; when unset the gate is
   // skipped (direct-construction callers that own no runner).
+  // authorisationCheck (optional, Rev 4.8 §6): async (audience) =>
+  // { authorised, reason } — the §4.2 authorisation calculation against
+  // live state, supplied by the API factory after construction (it closes
+  // over the manager, dispatch, and activation state). When null, the
+  // submit-time activation-flag revalidation is skipped (tests and
+  // direct-construction callers); production servers always set it.
+  // ownerTokenId (optional): the configured owner-token identifier
+  // (NOVA_OWNER_TOKEN_ID). A personal submit's ownerTokenId must match
+  // it when configured; null means the host is unconfigured and no
+  // personal submit can be authorised.
   constructor({
     manager,
     executor,
@@ -123,6 +134,8 @@ export class DispatchManager {
     jobTimeoutMs = JOB_TIMEOUT_MS,
     headroomBytes = MAX_OUTPUT_BYTES,
     validateOutput = null,
+    authorisationCheck = null,
+    ownerTokenId = null,
     now = () => Date.now(),
   } = {}) {
     if (!manager) throw new Error('DispatchManager requires a GpuManager');
@@ -162,6 +175,8 @@ export class DispatchManager {
     this.runnerHealthPath = runnerHealthPath;
     this.d1Client = d1Client;
     this.apiState = apiState;
+    this.authorisationCheck = typeof authorisationCheck === 'function' ? authorisationCheck : null;
+    this.ownerTokenId = typeof ownerTokenId === 'string' && ownerTokenId.length > 0 ? ownerTokenId : null;
     // FreeLLMAPI (A5): the gateway policy for submit-time prompt
     // resolution. Defaults to the production policy (fail closed: no
     // enhancement in production, no authorization store).
@@ -211,6 +226,19 @@ export class DispatchManager {
   // with 503 no-capacity — the correct honest state, not a fake dispatch.
   _hasProductionExecutor() {
     return this.productionExecutorIds.size > 0;
+  }
+
+  // True when at least one personal executor is registered (Rev 4.8 §6).
+  _hasPersonalExecutor() {
+    return this.personalExecutorIds.size > 0;
+  }
+
+  // Set (or replace) the submit-time authorisation callback (Rev 4.8
+  // §6): async (audience) => { authorised, reason }. The API factory
+  // sets it after construction because it closes over the live manager,
+  // dispatch, and activation state. A non-function clears it.
+  setAuthorisationCheck(fn) {
+    this.authorisationCheck = typeof fn === 'function' ? fn : null;
   }
 
   // -- journal ------------------------------------------------------------
@@ -426,21 +454,78 @@ export class DispatchManager {
     const invalid = this._validateSubmitBody(body);
     if (invalid) return { status: 400, body: { error: 'invalid-submit', message: invalid } };
 
+    // Audience validation (Rev 4.8 §5.2/§5.3): in production mode the
+    // audience is mandatory ('public' | 'personal'); a missing or
+    // unknown audience is 400 — its absence is a malformed request, not
+    // a default to public. In controlled-test mode the audience is
+    // optional (legacy callers); when present it must still be valid.
+    const audience = body.audience ?? null;
+    if (this.mode === 'production') {
+      if (audience !== 'public' && audience !== 'personal') {
+        return { status: 400, body: { error: 'invalid-submit', message: 'audience is required: public | personal' } };
+      }
+    } else if (audience !== null && audience !== 'public' && audience !== 'personal') {
+      return { status: 400, body: { error: 'invalid-submit', message: 'audience must be public | personal' } };
+    }
+
     // Mode gate (Rev 3 §C-1.4): the deployment mode is a property of the
     // deployment, never of a request. A controlled-test submission to a
     // production-mode process (or vice versa) is refused as no capacity.
     if (body.deploymentMode && body.deploymentMode !== this.mode) {
       return { status: 503, body: { error: 'no-capacity' } };
     }
-    if (this.mode === 'production' && !this._hasProductionExecutor()) {
-      // Rev 4.9 §4: no production executor is registered (the Rev 4.9
-      // allowlist is empty — no provider has passed the §6 gate), so public
-      // generation is honestly unavailable. This is a registry-aware gate,
-      // not the old unconditional branch: when a production executor IS
-      // registered, the submit proceeds through the provider-routed path
-      // below (the manager reserves the provider; the per-execution
-      // executor handles submit/start, state query, cancel, and report).
-      return { status: 503, body: { error: 'no-capacity' } };
+    if (this.mode === 'production') {
+      // Rev 4.9 §4, audience-aware (Rev 4.8 §5.3): a public submit needs
+      // a registered permitted production executor; a personal submit
+      // needs the registered personal executor. The old unconditional
+      // gate refused personal submits even with a personal executor
+      // registered — that was the personal path closed by construction.
+      // With the empty Rev 4.9 allowlist, public generation is honestly
+      // unavailable; with no personal executor, personal generation is
+      // honestly unavailable. Either way: 503 no-capacity, fail closed.
+      if (audience === 'personal') {
+        if (!this._hasPersonalExecutor()) {
+          return { status: 503, body: { error: 'no-capacity' } };
+        }
+      } else if (!this._hasProductionExecutor()) {
+        return { status: 503, body: { error: 'no-capacity' } };
+      }
+      // Non-commercial attestation (Rev 4.8 §12, option (b)): a personal
+      // submit carries the per-session attestation (nonCommercialAttested,
+      // with the purpose and the token identifier) recorded in the job's
+      // audit record. A personal submit without it is refused 400. The
+      // token identifier must match the host's configured identifier
+      // when one is configured — a submit attested under a different
+      // token generation is not the owner's current attestation.
+      if (audience === 'personal') {
+        if (body.nonCommercialAttested !== true) {
+          return { status: 400, body: { error: 'invalid-submit', message: 'nonCommercialAttested is required for personal submissions' } };
+        }
+        if (!NON_COMMERCIAL_PURPOSES.includes(body.nonCommercialPurpose)) {
+          return { status: 400, body: { error: 'invalid-submit', message: `nonCommercialPurpose must be one of: ${NON_COMMERCIAL_PURPOSES.join(', ')}` } };
+        }
+        if (typeof body.ownerTokenId !== 'string' || body.ownerTokenId.length === 0) {
+          return { status: 400, body: { error: 'invalid-submit', message: 'ownerTokenId is required for personal submissions' } };
+        }
+        if (this.ownerTokenId !== null && body.ownerTokenId !== this.ownerTokenId) {
+          return { status: 400, body: { error: 'invalid-submit', message: 'ownerTokenId does not match the configured token identifier' } };
+        }
+      }
+      // Authorisation revalidation at acceptance (Rev 4.8 §6): the
+      // §4.2 calculation (flag for this audience, kill-switch, quota
+      // above floor, storage health) is re-checked live before any
+      // reservation is made. A refusal holds nothing.
+      if (this.authorisationCheck) {
+        let check;
+        try {
+          check = await this.authorisationCheck(audience);
+        } catch {
+          return { status: 503, body: { error: 'no-capacity' } };
+        }
+        if (!check || check.authorised !== true) {
+          return { status: 503, body: { error: 'no-capacity' } };
+        }
+      }
     }
 
     // Storage-runner heartbeat gate (Rev 4.9 §6, §14 Stage 2): every submit
@@ -539,7 +624,10 @@ export class DispatchManager {
     // Reserve synchronously — no await between this check and the reserve.
     for (const { x } of stillMissing) this._reserveHeadroom(x.executionId);
 
-    // Record the submission in the journal before dispatch.
+    // Record the submission in the journal before dispatch. The audience
+    // and (for personal jobs) the non-commercial attestation, purpose,
+    // and token identifier are recorded here so the job's audit record
+    // carries them from intake (§5.2, §12).
     for (const { x } of stillMissing) {
       this._journalMutate(x.executionId, (entry) => {
         entry.jobId = body.jobId;
@@ -547,6 +635,12 @@ export class DispatchManager {
         entry.attempt = x.attempt;
         entry.state = 'submitted';
         entry.timestamps.submitted = this.now();
+        if (audience !== null) entry.audience = audience;
+        if (audience === 'personal') {
+          entry.nonCommercialAttested = true;
+          entry.nonCommercialPurpose = body.nonCommercialPurpose;
+          entry.ownerTokenId = body.ownerTokenId;
+        }
       });
     }
 
@@ -580,6 +674,16 @@ export class DispatchManager {
             executionId: x.executionId,
             jobId: body.jobId,
             sceneIndex: x.sceneIndex,
+            // Rev 4.8 §5.3/§12: the audience travels with the job so the
+            // dispatcher, executor, and transport each re-check it; a
+            // personal job also carries its attestation, purpose, and
+            // token identifier in the job record.
+            ...(audience !== null ? { audience } : {}),
+            ...(audience === 'personal' ? {
+              nonCommercialAttested: true,
+              nonCommercialPurpose: body.nonCommercialPurpose,
+              ownerTokenId: body.ownerTokenId,
+            } : {}),
           },
         });
         submittedJobs.push({ x, job });

@@ -98,6 +98,7 @@ test('1. production startup rejects NOVA_GATEWAY_ENHANCEMENT=true', async () => 
     () => createApiServer({
       mode: 'production',
       secret: 'test-secret',
+      signingSecret: 'test-signing-secret',
       dataDir: dir,
       d1Client: new MemoryD1Client(),
       gatewayEnhancement: true,

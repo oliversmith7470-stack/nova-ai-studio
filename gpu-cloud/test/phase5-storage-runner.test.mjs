@@ -430,6 +430,7 @@ test('runner: heartbeat gate — missing/stale heartbeat blocks new submits, fre
     return {
       jobId, mode: 'single', model: PROVEN_MODEL, frames: PROVEN_FRAMES,
       resolution: PROVEN_RESOLUTION, fps: PROVEN_FPS, prompt: 'heartbeat gate test',
+      audience: 'public',
       sceneExecutions: [{ sceneIndex: 0, attempt: 1, executionId: execId, idempotencyKey: execId }],
     };
   };

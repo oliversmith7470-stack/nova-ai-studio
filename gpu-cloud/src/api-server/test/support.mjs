@@ -351,6 +351,22 @@ export async function makeApi(overrides = {}) {
     dataDir: dir,
     d1Client: d1,
     executor,
+    // Rev 4.8 §4/§6 (M2-P): activation passthroughs for the capacity and
+    // personal-path tests. Undefined falls back to the server defaults
+    // (flags file absent -> both false; no signing secret; no owner
+    // token id; no Kaggle credential; no personal executor).
+    activationConfigPath: overrides.activationConfigPath,
+    // Rev 4.8 §8: production mode requires a signing secret; the harness
+    // supplies a test-only one by default so production-mode harness
+    // servers construct (tests that exercise the missing-secret startup
+    // failure construct createApiServer directly).
+    signingSecret: overrides.signingSecret
+      ?? ((overrides.mode ?? 'controlled-test') === 'production' ? 'test-signing-secret' : undefined),
+    ownerTokenId: overrides.ownerTokenId,
+    kaggleCredentialPresent: overrides.kaggleCredentialPresent,
+    personalExecutor: overrides.personalExecutor,
+    productionExecutors: overrides.productionExecutors,
+    storage: overrides.storage,
     // FreeLLMAPI (A4/A5): gateway options pass through; undefined falls
     // back to the server defaults (environment production, flags OFF).
     environment: overrides.environment,

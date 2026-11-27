@@ -73,10 +73,18 @@ export class QueueFullError extends Error {
 }
 
 export class GpuManager {
-  constructor({ storePath = DEFAULT_STORE_PATH, now = () => Date.now(), config = {}, mockOptions = {}, enhancement = {} } = {}) {
+  constructor({ storePath = DEFAULT_STORE_PATH, now = () => Date.now(), config = {}, mockOptions = {}, enhancement = {}, personalProviderIds = null } = {}) {
     this.now = now; // injectable clock (tests use a fake clock for timeouts)
     this.store = new JsonStore(storePath);
     this.registry = new ProviderRegistry();
+    // Rev 4.8 §5.3/§7 audience routing: the provider ids that serve
+    // personal (owner-only) jobs. A personal job routes ONLY to these;
+    // a public job routes NEVER to these. The set is shared by
+    // reference with the API factory, which fills it when the personal
+    // executor registers. Empty (the default) means no personal
+    // provider is known and the audience filter changes nothing for
+    // jobs without an audience (legacy/controlled-test callers).
+    this.personalProviderIds = personalProviderIds instanceof Set ? personalProviderIds : new Set();
     this.config = {
       maxQueueDepth: config.maxQueueDepth ?? 100,
     };
@@ -346,6 +354,26 @@ export class GpuManager {
       .filter((p) => this.registry.dispatchable(p.id))
       .filter((p) => providerSupports(p, job).ok)
       .filter((p) => this._activeJobsOn(p.id) < p.maxConcurrentJobs);
+
+    // Rev 4.8 §5.3 audience routing (layer 1 — dispatcher): a personal
+    // job routes ONLY to the personal executors; a public job routes
+    // NEVER to them. A job without an audience (legacy/controlled-test
+    // callers) is unfiltered — the API submit path always sets the
+    // audience in production, so an unaudited job cannot reach a
+    // personal executor through the site path. An unknown audience value
+    // fails closed: no provider is capable.
+    const jobAudience = job?.params?.audience;
+    if (jobAudience === 'personal') {
+      for (let i = capable.length - 1; i >= 0; i--) {
+        if (!this.personalProviderIds.has(capable[i].id)) capable.splice(i, 1);
+      }
+    } else if (jobAudience === 'public') {
+      for (let i = capable.length - 1; i >= 0; i--) {
+        if (this.personalProviderIds.has(capable[i].id)) capable.splice(i, 1);
+      }
+    } else if (jobAudience !== undefined && jobAudience !== null) {
+      capable.length = 0;
+    }
 
     if (capable.length === 0) {
       return { dispatched: false, reason: 'no-provider', jobId: job.id };

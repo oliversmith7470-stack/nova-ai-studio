@@ -29,6 +29,7 @@ const d1 = {
 const api = createApiServer({
   mode: 'production',
   secret: 'phase5-x-test-secret',
+  signingSecret: 'test-signing-secret',
   d1Client: d1,
   host: '127.0.0.1',
   port: 0,

@@ -77,6 +77,12 @@ export class BaseExecutor {
     if (!providerId) throw new Error('executor requires providerId');
     if (!packageDir) throw new Error('executor requires packageDir');
     this.providerId = providerId;
+    // Rev 4.8 §5.3/§7: the audience this executor serves, or null when
+    // the executor is audience-agnostic (controlled-test fakes). The
+    // Kaggle executor sets 'personal'; a subclass that serves public
+    // production sets 'public'. _start() refuses a present, mismatched
+    // job audience.
+    this.audience = null;
     this.hoursTracker = hoursTracker;
     this.registry = registry;
     this.route = route;
@@ -106,6 +112,22 @@ export class BaseExecutor {
     const safe = checkStage2Safe(job);
     if (!safe.ok) {
       return this._failed(job, `data-boundary: ${safe.reason}`);
+    }
+
+    // 1b. Audience enforcement (Rev 4.8 §5.3/§7, layer 2 — executor).
+    // An executor with a declared audience refuses a job whose declared
+    // audience is present and different. A job with NO audience is a
+    // legacy/controlled-test caller and is not refused here — the API
+    // submit path always sets the audience in production, so a
+    // production job without one cannot reach this executor through the
+    // site path. A mismatch fails the job with `audience-mismatch` and
+    // is logged for the operator by the caller.
+    const jobAudience = job?.params?.audience;
+    if (this.audience && jobAudience && jobAudience !== this.audience) {
+      return this._failed(
+        job,
+        `audience-mismatch: executor audience is ${this.audience}, job audience is ${jobAudience}`,
+      );
     }
 
     // 2. Weekly hours budget (second line of defence — the dispatcher's

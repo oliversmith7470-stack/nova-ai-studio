@@ -141,6 +141,7 @@ function makeApi(t, { state = true, d1 = stubD1(), port = 0, extra = {} } = {}) 
   const api = apiServer.createApiServer({
     mode: 'production',
     secret: 'phase5-test-secret',
+    signingSecret: 'test-signing-secret',
     d1Client: d1,
     host: '127.0.0.1',
     port,
@@ -688,7 +689,7 @@ test('(t) start() with NOVA_STARTUP_STATE_DIR unset behaves as Phase 3 shipped',
       async listScenes(){ return []; }, async listExpiredScenes(){ return []; },
       async listPendingJobs(){ return []; }, async listTerminalJobs(){ return []; },
       async listExpiredRateLimits(){ return []; } };
-    const api = createApiServer({ mode: 'production', secret: 's',
+    const api = createApiServer({ mode: 'production', secret: 's', signingSecret: 'test-signing-secret',
       d1Client: d1, host: '127.0.0.1', port: 0, dataDir: '${fs.mkdtempSync(path.join(os.tmpdir(), 'phase5-p3-'))}',
       sweepIntervalMs: 3600000, reconcileIntervalMs: 3600000 });
     const info = await api.start();
@@ -1032,6 +1033,7 @@ test('(aa) factory: empty production list starts in no-capacity state', async (t
   const r = await api.dispatch.submitExecutions({
     jobId, mode: 'single', model: PROVEN_MODEL, frames: PROVEN_FRAMES,
     resolution: PROVEN_RESOLUTION, fps: PROVEN_FPS, prompt: 'test prompt',
+    audience: 'public',
     sceneExecutions: [{ sceneIndex: 0, attempt: 1, executionId: execId, idempotencyKey: execId }],
   });
   assert.deepEqual(r, { status: 503, body: { error: 'no-capacity' } });
@@ -1140,13 +1142,28 @@ test('(aa) personal: empty id / unknown id / missing credential do not stop star
   assert.ok(info3.port > 0);
   assert.equal(api3.dispatch.personalExecutorIds.size, 0);
   await api3.stop();
+  // (iv) Rev 4.8 §6: credential present but NO owner-token identifier
+  // configured: unavailable, startup proceeds. Registration requires
+  // the configured token ID as well as the credential — otherwise the
+  // capacity response would claim a personal path no submit can
+  // authenticate (a submit's ownerTokenId must match the configured
+  // identifier, and with none configured any id would pass the check).
+  setCounter(validCounter({ attempts: 1 }));
+  writeStateDir({ readiness: validReadiness() });
+  const api4 = makeApi(t, { extra: { personalExecutor: 'kaggle-t4', kaggleCredentialPresent: true } });
+  const info4 = await api4.start();
+  assert.ok(info4.port > 0);
+  assert.equal(api4.dispatch.personalExecutorIds.size, 0);
+  await api4.stop();
 });
 
 test('(aa) personal: kaggle-t4 with credentials is registered personally, never publicly', async (t) => {
   saveCounter(t);
   setCounter(validCounter({ attempts: 1 }));
   writeStateDir({ readiness: validReadiness() });
-  const api = makeApi(t, { extra: { personalExecutor: 'kaggle-t4', kaggleCredentialPresent: true } });
+  // Rev 4.8 §6: registration requires the credential AND the configured
+  // owner-token identifier.
+  const api = makeApi(t, { extra: { personalExecutor: 'kaggle-t4', kaggleCredentialPresent: true, ownerTokenId: 'owner-token-v1' } });
   const info = await api.start();
   assert.ok(info.port > 0);
   // The personal executor IS present — in the personal registry only.
@@ -1165,6 +1182,7 @@ test('(aa) personal: kaggle-t4 with credentials is registered personally, never 
   const r = await api.dispatch.submitExecutions({
     jobId, mode: 'single', model: PROVEN_MODEL, frames: PROVEN_FRAMES,
     resolution: PROVEN_RESOLUTION, fps: PROVEN_FPS, prompt: 'test prompt',
+    audience: 'public',
     sceneExecutions: [{ sceneIndex: 0, attempt: 1, executionId: execId, idempotencyKey: execId }],
   });
   assert.deepEqual(r, { status: 503, body: { error: 'no-capacity' } }, 'public submit still fails closed with a personal executor present');
@@ -1518,14 +1536,15 @@ test('(aa) routing: unknown provider id never falls back to the legacy executor'
 });
 
 test('(aa) personal: only the personal executor registered — submit 503s and never touches it', async (t) => {
-  // ChatGPT correction 4B: the factory registers kaggle-t4 on credential
-  // presence alone and the shipped Worker has no NOVA_OWNER_TOKEN gate, so
+  // ChatGPT correction 4B, as amended by Rev 4.8 §6: the factory registers
+  // kaggle-t4 on credential presence AND the configured owner-token
+  // identifier, and the shipped Worker has no NOVA_OWNER_TOKEN gate, so
   // this test proves the honest current state at the API layer — no
   // personal route is exposed — not the Worker gate (a separate future step).
   saveCounter(t);
   setCounter(validCounter({ attempts: 1 }));
   writeStateDir({ readiness: validReadiness() });
-  const api = makeApi(t, { extra: { personalExecutor: 'kaggle-t4', kaggleCredentialPresent: true } });
+  const api = makeApi(t, { extra: { personalExecutor: 'kaggle-t4', kaggleCredentialPresent: true, ownerTokenId: 'owner-token-v1' } });
   const info = await api.start();
   assert.ok(info.port > 0);
   assert.deepEqual([...api.dispatch.personalExecutorIds], ['kaggle-t4']);
@@ -1551,6 +1570,7 @@ test('(aa) personal: only the personal executor registered — submit 503s and n
   const r = await api.dispatch.submitExecutions({
     jobId, mode: 'single', model: PROVEN_MODEL, frames: PROVEN_FRAMES,
     resolution: PROVEN_RESOLUTION, fps: PROVEN_FPS, prompt: 'personal route probe',
+    audience: 'public',
     sceneExecutions: [{ sceneIndex: 0, attempt: 1, executionId: execId, idempotencyKey: execId }],
   });
   assert.deepEqual(r, { status: 503, body: { error: 'no-capacity' } }, 'submit fails closed with only a personal executor');

@@ -86,6 +86,12 @@ export class KaggleExecutor extends BaseExecutor {
     ...rest
   } = {}) {
     super({ providerId: KAGGLE_PROVIDER_ID, ...rest });
+    // Rev 4.8 §5.3/§7: the Kaggle executor serves the personal
+    // (owner-only) audience exclusively. _start() refuses a present,
+    // mismatched job audience; submit() refuses a public job at the
+    // transport boundary too, so no single layer's failure can route a
+    // public prompt to Kaggle.
+    this.audience = 'personal';
     this.transport = transport;
     this.kaggleUsername = kaggleUsername;
     this.notebookBuilder = notebookBuilder;
@@ -95,6 +101,14 @@ export class KaggleExecutor extends BaseExecutor {
   }
 
   async submit(job, manifest) {
+    // Rev 4.8 §5.3/§7, layer 3 — transport: the Kaggle transport refuses
+    // any job whose audience is `public`. _start() already refuses a
+    // present, mismatched audience, so this fires only for a direct
+    // submit() call — defense in depth, not the primary gate. A throw
+    // here becomes a failed report via start()'s catch.
+    if (job?.params?.audience === 'public') {
+      throw new Error('audience-mismatch: kaggle transport refuses public jobs');
+    }
     const dir = this._packageDirFor(job.id);
     // The notebook builder is injectable (see the constructor): the
     // default builds the Wan proof notebook; Part B injects

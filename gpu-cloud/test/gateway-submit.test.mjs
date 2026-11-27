@@ -148,7 +148,7 @@ test('plan mode is unchanged: scene prompts come from body.scenes', async () => 
 test('production + a stored enhanced record is refused 400 (resolver throws)', async () => {
   const { api, d1, cleanup } = await makeApi({ mode: 'production', executor: false });
   try {
-    const body = submitBody('submit-prod-enhanced');
+    const body = { ...submitBody('submit-prod-enhanced'), audience: 'public' };
     seedStoredJob(d1, body, { promptSource: 'enhanced', enhancedPrompt: ENHANCED_PROMPT });
     const res = await submit(api, body);
     assert.equal(res.status, 400);

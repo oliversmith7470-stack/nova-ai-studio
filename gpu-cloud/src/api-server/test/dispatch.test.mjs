@@ -51,7 +51,7 @@ test('production mode refuses every submit with no-capacity', async (t) => {
   t.after(cleanup);
   // FreeLLMAPI (A5): the submit loads the stored record first, so the
   // job must be seeded — the real flow always creates the D1 job first.
-  const body = submitBody('job-prod');
+  const body = { ...submitBody('job-prod'), audience: 'public' };
   seedJobForSubmit(d1, body);
   const res = await api.dispatch.submitExecutions(body);
   assert.equal(res.status, 503);

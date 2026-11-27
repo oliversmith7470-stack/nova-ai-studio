@@ -53,6 +53,20 @@ import { buildGatewayPolicy } from './gateway-policy.js';
 import { createGatewayClient } from './gateway-client.js';
 import { createDirectGeminiAdapter } from './direct-gemini.js';
 import {
+  ACTIVATION_CONFIG_PATH,
+  ACTIVATION_AUDIT_LOG_PATH,
+  readActivationConfig,
+  parseKaggleFloorHours,
+  appendActivationAuditLog,
+  computeAuthorisation,
+  signCapacityResponse,
+  storageHealth,
+} from './api-server/activation.js';
+import { HoursTracker, weekStartMs } from './hours.js';
+import { isEngaged } from './kill-switch.js';
+import { checkRunnerHeartbeat } from './api-server/runner-heartbeat.js';
+import { queueDepth } from './queue.js';
+import {
   API_SERVER_VERSION,
   ACK_WINDOW_MS,
   SWEEP_INTERVAL_MS,
@@ -92,6 +106,7 @@ export function routeInventory() {
     { method: 'GET', pattern: '/internal/status', auth: 'API-secret + HMAC', middleware: 'HMAC verify (empty body), 5 s Worker timeout applies client-side' },
     { method: 'GET', pattern: '/internal/download', auth: 'API-secret + HMAC', middleware: 'HMAC verify (empty body), 30 s idle timeout applies client-side' },
     { method: 'POST', pattern: '/internal/cancel', auth: 'API-secret + HMAC', middleware: 'HMAC verify, 256 KB body limit, 5 s Worker timeout applies client-side' },
+    { method: 'GET', pattern: '/internal/capacity', auth: 'API-secret + HMAC', middleware: 'HMAC verify (empty body), audience + requestNonce query params, signed response, 5 s Worker timeout applies client-side' },
   ];
 }
 
@@ -237,13 +252,21 @@ export function isKaggleCredentialPresent({ env = process.env, home = os.homedir
 // personal-audience request and activation state are verified before
 // personal dispatch by the Worker, not here.
 //
+// Rev 4.8 §6 (M2-P): registration additionally requires the owner-token
+// IDENTIFIER to be configured on this host (ownerTokenConfigured —
+// identifier only, the token value never touches the API host). Without
+// it the personal executor is unavailable: the capacity response would
+// otherwise claim a personal path that no submit can authenticate.
+// The executor is wired to the HoursTracker and the registry when
+// supplied so personal usage is recorded and budgeted.
+//
 // Returns { providerId, providerDef, executor } or null (personal path
 // unavailable). The provider def is registered with connected/available
 // set from credential presence — the registry's dispatchable() gate needs
 // those flags, and credential presence is the only authenticated signal
 // available at this layer; the five §6 status concepts (S1) remain a
 // separate design change and are NOT claimed here.
-export function createPersonalExecutor({ personalExecutorId = '', kaggleCredentialPresent = null, packageDir = null } = {}) {
+export function createPersonalExecutor({ personalExecutorId = '', kaggleCredentialPresent = null, ownerTokenConfigured = null, hoursTracker = null, registry = null, packageDir = null } = {}) {
   const id = typeof personalExecutorId === 'string' ? personalExecutorId.trim() : '';
   if (id === '') return null;
   if (id !== KAGGLE_PROVIDER_ID) {
@@ -255,6 +278,10 @@ export function createPersonalExecutor({ personalExecutorId = '', kaggleCredenti
     console.error('[api-server] personal executor unavailable: kaggle-t4 requested but the Kaggle credential is not present on this host');
     return null;
   }
+  if (ownerTokenConfigured !== true) {
+    console.error('[api-server] personal executor unavailable: kaggle-t4 requested but NOVA_OWNER_TOKEN_ID is not configured on this host');
+    return null;
+  }
   const def = PROVIDER_DEFINITIONS.find((d) => d.id === KAGGLE_PROVIDER_ID);
   if (!def) {
     console.error('[api-server] personal executor unavailable: kaggle-t4 has no provider definition');
@@ -264,7 +291,7 @@ export function createPersonalExecutor({ personalExecutorId = '', kaggleCredenti
     console.error('[api-server] personal executor unavailable: no packageDir for the Kaggle executor');
     return null;
   }
-  const executor = new KaggleExecutor({ packageDir });
+  const executor = new KaggleExecutor({ packageDir, hoursTracker, registry });
   assertExecutorMatchesProvider(executor, KAGGLE_PROVIDER_ID);
   return {
     providerId: KAGGLE_PROVIDER_ID,
@@ -305,6 +332,42 @@ export function createApiServer(config = {}) {
   const secretPrevious = config.secretPrevious ?? process.env.NOVA_API_SECRET_PREVIOUS ?? '';
   const dataDir = config.dataDir ?? process.env.NOVA_API_DATA_DIR ?? DEFAULT_API_DATA_DIR;
   const now = config.now ?? (() => Date.now());
+
+  // -- Rev 4.8 §4/§6/§11: M2-P activation machinery -------------------------
+  // The activation flags are read ONCE at process start from
+  // /etc/nova-api/activation.conf (or config.activationConfigPath in
+  // tests) and live in a SEPARATE structure from the API config object
+  // — the gateway non-interference test asserts they are NOT in
+  // api.config, so they are never merged into it. A missing file means
+  // both flags false; a malformed file or unknown key is a startup
+  // failure (readActivationConfig throws). There is no HTTP endpoint,
+  // no Worker env var, and no request parameter that can read or change
+  // these flags; a flag changes only by the §4.1 operator procedure.
+  const activationConfigPath = config.activationConfigPath ?? ACTIVATION_CONFIG_PATH;
+  const activationFlags = readActivationConfig(activationConfigPath);
+  // Response signing secret (key separation, §8): distinct from the
+  // transport secret NOVA_API_SECRET. A production-mode process without
+  // it cannot serve a signed capacity response and fails at startup;
+  // a controlled-test process may run without it, but its capacity
+  // route then refuses to serve (503) rather than serving unsigned.
+  const signingSecret = config.signingSecret ?? process.env.NOVA_SIGNING_SECRET ?? '';
+  if (mode === 'production' && signingSecret.length === 0) {
+    throw new Error('NOVA_SIGNING_SECRET is required in production mode (Rev 4.8 §8 key separation)');
+  }
+  // Owner-token identifier (the token VALUE never touches this host):
+  // personal executor registration additionally requires it configured.
+  const ownerTokenId = config.ownerTokenId ?? process.env.NOVA_OWNER_TOKEN_ID ?? '';
+  const ownerTokenConfigured = ownerTokenId.length > 0;
+  // Kaggle experimental floor (hours/week, default 5, §11/§12): a
+  // non-numeric or negative value is a startup failure.
+  const kaggleFloorHours = parseKaggleFloorHours(
+    config.kaggleExperimentFloorHours ?? process.env.NOVA_KAGGLE_EXPERIMENT_FLOOR_HOURS,
+  );
+  // Rev 4.8 §5.3: the personal provider ids, shared by reference with
+  // the manager so the dispatcher routes personal jobs only to them
+  // and public jobs never to them. Filled when the personal executor
+  // registers below; empty while no personal executor is registered.
+  const personalProviderIds = new Set();
 
   // FreeLLMAPI gateway prompt enhancement (approved v5 design, A4/A5/§5).
   // Host config only, never in the repo; both flags default OFF. The
@@ -361,6 +424,7 @@ export function createApiServer(config = {}) {
     storePath: config.storePath ?? path.join(dataDir, 'gpu-manager.json'),
     now,
     config: { maxQueueDepth: 100 },
+    personalProviderIds,
     enhancement: {
       enabled: gatewayEnhancement,
       client: gatewayClient,
@@ -374,6 +438,18 @@ export function createApiServer(config = {}) {
     clock: now,
   });
   manager.attachStorage(storage);
+
+  // Rev 4.8 §7: weekly budget tracking per provider (Kaggle 30 h/week
+  // by the provider definition, week starting Saturday 00:00 UTC). The
+  // tracker shares the manager's store; its keys are namespaced
+  // (`hours:usage:<providerId>`) and do not collide with job state.
+  const hoursBudgets = {};
+  for (const def of PROVIDER_DEFINITIONS) {
+    if (typeof def.availabilityWindow?.hoursPerWeek === 'number') {
+      hoursBudgets[def.id] = def.availabilityWindow.hoursPerWeek;
+    }
+  }
+  const hoursTracker = new HoursTracker({ store: manager.store, budgets: hoursBudgets });
 
   // Executor registration factory (Rev 4.9 §4, Rev 4.8 §6): production
   // executor registration is explicit startup configuration, separate from
@@ -420,15 +496,23 @@ export function createApiServer(config = {}) {
     // NOVA_PERSONAL_EXECUTOR, never added to the public allowlist, never
     // satisfies public capacity. Unavailable personal path does not stop
     // startup; the owner-token check stays at the Worker boundary.
+    // Rev 4.8 §6: registration additionally requires the configured
+    // owner-token identifier (the token VALUE never touches this host);
+    // the executor is wired to the HoursTracker and the registry so
+    // personal usage is recorded and budgeted.
     const personal = createPersonalExecutor({
       personalExecutorId: config.personalExecutor ?? process.env.NOVA_PERSONAL_EXECUTOR ?? '',
       kaggleCredentialPresent: config.kaggleCredentialPresent ?? null,
+      ownerTokenConfigured,
+      hoursTracker,
+      registry: manager.registry,
       packageDir: config.packageDir ?? path.join(dataDir, 'packages'),
     });
     if (personal) {
       manager.registerProvider(personal.providerDef);
       manager.registerExecutor(personal.providerId, personal.executor);
       personalExecutors.set(personal.providerId, personal.executor);
+      personalProviderIds.add(personal.providerId);
     }
   }
 
@@ -442,10 +526,137 @@ export function createApiServer(config = {}) {
     apiState,
     gatewayPolicy,
     mode,
+    ownerTokenId: ownerTokenConfigured ? ownerTokenId : null,
     ackWindowMs: config.ackWindowMs ?? ACK_WINDOW_MS,
     ackPollMs: config.ackPollMs ?? 1000,
     validateOutput: config.validateOutput ?? validateMp4,
     now,
+  });
+
+  // -- Rev 4.8 §4.2/§4.3: signed capacity ------------------------------------
+  // computeCapacity(audience, requestNonce) -> the capacity response
+  // body (the §4.2 authorisation calculation over live state). The
+  // route handler signs it with NOVA_SIGNING_SECRET; the dispatcher
+  // reuses it through setAuthorisationCheck at submit time (§6).
+  // A failing capacity read never throws to the route: it surfaces as
+  // an internal-error 500 (the Worker treats it as api-unreachable).
+  const runnerHealthPath = config.runnerHealthPath ?? path.join(dataDir, 'runner-health.json');
+  async function computeCapacity({ audience, requestNonce }) {
+    const capacity = await manager.storageCapacity();
+    const reserved = dispatch._reservedHeadroomBytes();
+    // Storage health (§9 F): the writability check targets the actual
+    // store root (manager.storage.rootDir), not an assumed path — the
+    // root is created by install.sh on the host; if it is missing here
+    // (a fresh data dir), create it, because the store cannot function
+    // without it. A root that cannot be created or written is
+    // unhealthy (fail closed).
+    const storeRoot = manager.storage?.rootDir ?? path.join(dataDir, 'store');
+    let storeWritable = false;
+    try {
+      fs.accessSync(storeRoot, fs.constants.W_OK);
+      storeWritable = true;
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        try {
+          fs.mkdirSync(storeRoot, { recursive: true });
+          fs.accessSync(storeRoot, fs.constants.W_OK);
+          storeWritable = true;
+        } catch {
+          storeWritable = false;
+        }
+      } else {
+        storeWritable = false;
+      }
+    }
+    const heartbeat = checkRunnerHeartbeat(runnerHealthPath, Date.now());
+    const storage = storageHealth({
+      headroomBytes: Math.max(0, (capacity?.freeBytes ?? 0) - reserved),
+      writable: storeWritable,
+      sweepHealthy: heartbeat.healthy === true,
+    });
+    storage.reservedBytes = Math.max(0, reserved);
+    storage.totalBytes = capacity?.totalBytes ?? 0;
+    storage.freeBytes = capacity?.freeBytes ?? 0;
+
+    const kaggleQuota = hoursTracker.usage('kaggle-t4');
+    const providerQuotas = new Map();
+    for (const id of productionExecutors.keys()) {
+      const u = hoursTracker.usage(id);
+      providerQuotas.set(id, u.tracked ? { remaining: u.hoursRemaining, total: u.hoursBudget, floor: 0 } : null);
+    }
+    const productionDispatchableIds = [...productionExecutors.keys()].filter(
+      (id) => manager.registry.dispatchable(id) && manager.executors.has(id),
+    );
+    const personalDispatchable = personalExecutors.size > 0
+      && [...personalExecutors.keys()].every(
+        (id) => manager.registry.dispatchable(id) && manager.executors.has(id),
+      );
+
+    const providerDetails = [];
+    for (const def of manager.registry.list()) {
+      const id = def.id;
+      const quota = id === 'kaggle-t4' ? kaggleQuota : hoursTracker.usage(id);
+      providerDetails.push({
+        id,
+        kind: def.kind,
+        configured: productionExecutors.has(id) || personalExecutors.has(id),
+        // §6 S1: `authenticated` requires a credential check passed
+        // within the last hour; no such check exists yet, so this is
+        // honestly false even when the credential is present. Presence
+        // alone proves nothing.
+        authenticated: false,
+        executorRegistered: manager.executors.has(id),
+        // §6 S1: `executionVerified` requires a proof run through the
+        // registered executor; Run 10 was manual, so this is false.
+        executionVerified: false,
+        currentlyDispatchable: manager.registry.dispatchable(id) && manager.executors.has(id),
+        models: def.models ?? [],
+        maxConcurrentJobs: def.maxConcurrentJobs ?? 0,
+        jobsActive: manager._activeJobsOn(id),
+        jobsQueued: 0, // jobs are not assigned to a provider before dispatch
+        quotaRemaining: quota?.tracked ? quota.hoursRemaining : null,
+        quotaUnit: quota?.tracked ? 'hours' : null,
+        quotaResetAt: quota?.tracked
+          ? new Date(weekStartMs(Date.now()) + 7 * 24 * 3600 * 1000).toISOString()
+          : null,
+        quotaFloor: id === 'kaggle-t4' ? kaggleFloorHours : null,
+      });
+    }
+
+    return computeAuthorisation({
+      mode,
+      flags: activationFlags,
+      killSwitchEngaged: isEngaged(manager.store.state),
+      storage,
+      productionExecutorIds: [...productionExecutors.keys()],
+      personalExecutorRegistered: personalExecutors.size > 0,
+      kaggleCredentialPresent: config.kaggleCredentialPresent ?? isKaggleCredentialPresent(),
+      ownerTokenConfigured,
+      kaggleQuota: kaggleQuota.tracked
+        ? { remaining: kaggleQuota.hoursRemaining, total: kaggleQuota.hoursBudget, floor: kaggleFloorHours }
+        : null,
+      providerQuotas,
+      providerDetails,
+      personalTokenId: ownerTokenConfigured ? ownerTokenId : null,
+      queueDepth: queueDepth(manager.store.state),
+      requestedAudience: audience,
+      requestNonce,
+      productionDispatchableIds,
+      personalDispatchable,
+      ceilingUsd: 0,
+      committedUsd: 0,
+      paidProductionExecutorIds: [],
+    });
+  }
+  // Submit-time authorisation revalidation (§6): the dispatcher asks
+  // the live calculation for the submitted audience and refuses the
+  // submit when it is not authorised. A failing check fails closed.
+  dispatch.setAuthorisationCheck(async (audience) => {
+    const body = await computeCapacity({ audience, requestNonce: '00000000000000000000000000000000' });
+    if (audience === 'personal') {
+      return { authorised: body.personalProductionAuthorised, reason: body.personalReason ?? null };
+    }
+    return { authorised: body.publicProductionAuthorised, reason: body.reason ?? null };
   });
 
   const sweep = new SweepRunner({
@@ -536,6 +747,47 @@ export function createApiServer(config = {}) {
           manager: 'ready',
           mode,
         });
+      }
+
+      // Rev 4.8 §4.3: signed capacity. The caller is the Worker (request
+      // auth is the existing verifyWorkerAuth, unchanged — single
+      // transport secret). The response is signed with NOVA_SIGNING_SECRET
+      // and carries the request nonce back; the Worker verifies the
+      // signature, the ±5 s freshness, the nonce echo, and the audience
+      // binding before routing on it. A request without a valid audience
+      // or nonce is 400; a capacity read failure is 500 (the Worker
+      // treats it as api-unreachable); a process without a signing
+      // secret serves nothing (503) rather than an unsigned response.
+      // The body is the §4.2 authorisation calculation over live state.
+      if (req.method === 'GET' && url.pathname === '/internal/capacity') {
+        const audience = url.searchParams.get('audience');
+        const requestNonce = url.searchParams.get('requestNonce');
+        if (audience !== 'public' && audience !== 'personal') {
+          return send(res, 400, { error: 'invalid-audience' });
+        }
+        if (!/^[0-9a-f]{32}$/i.test(requestNonce ?? '')) {
+          return send(res, 400, { error: 'invalid-request-nonce' });
+        }
+        if (signingSecret.length === 0) {
+          return send(res, 503, { error: 'capacity-unavailable' });
+        }
+        let body;
+        try {
+          body = await computeCapacity({ audience, requestNonce });
+        } catch (err) {
+          console.error(`[api-server] capacity failed requestId=${requestId}:`, err && err.message);
+          return send(res, 500, { error: 'internal-error' });
+        }
+        const bodyText = JSON.stringify(body);
+        const { timestamp, signature } = signCapacityResponse({ signingSecret, requestNonce, bodyText });
+        res.writeHead(200, {
+          ...SECURITY_HEADERS,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(bodyText),
+          'X-NOVA-Capacity-Timestamp': timestamp,
+          'X-NOVA-Capacity-Signature': signature,
+        });
+        return res.end(bodyText);
       }
 
       if (req.method === 'POST' && url.pathname === '/internal/submit') {
@@ -780,6 +1032,22 @@ export function createApiServer(config = {}) {
 
   return {
     config: { mode, host, port, dataDir, gatewayEnvironment, gatewayEnhancement },
+    // Rev 4.8 §4.1: the activation state lives in a SEPARATE structure
+    // from `config` — the gateway non-interference test asserts the
+    // flags are NOT in api.config. Nothing here merges them into it.
+    activation: {
+      flags: { ...activationFlags },
+      configPath: activationConfigPath,
+      personalTokenId: ownerTokenConfigured ? ownerTokenId : null,
+      ownerTokenConfigured,
+      kaggleFloorHours,
+      signingSecretPresent: signingSecret.length > 0,
+      computeCapacity,
+      appendAuditLog: (entry) => appendActivationAuditLog({
+        logPath: config.activationAuditLogPath ?? ACTIVATION_AUDIT_LOG_PATH,
+        ...entry,
+      }),
+    },
     manager,
     executor: legacyExecutor,
     storage,

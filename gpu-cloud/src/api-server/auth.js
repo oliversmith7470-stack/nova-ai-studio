@@ -13,6 +13,11 @@
 //   (2) signature present and well-formed (64 hex), nonce present and
 //       well-formed (32 hex);
 //   (3) timestamp within ±60 s;
+//   (3b) timestamp after process start (Rev 4.8 §15 process-start rule:
+//         a timestamp from a second before the process-start second is
+//         a replay from a previous process era — rejected even within
+//         the window; the comparison is in seconds because timestamps
+//         have second granularity);
 //   (4) signature verifies (constant-time comparison);
 //   (5) nonce unseen — recorded as used ONLY now, after step 4 passes,
 //       so a failed request can never burn a nonce;
@@ -29,6 +34,26 @@
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { HMAC_TIMESTAMP_WINDOW_S } from './constants.js';
+
+// Process-start boundary (Rev 4.8 §15): a nonce issued before this
+// process started can never be replayed into it, even within the ±60 s
+// freshness window. A restart starts a fresh nonce era; a timestamp
+// from a second before the process-start second is rejected as stale.
+// The comparison is in SECONDS, not milliseconds, because request
+// timestamps have second granularity: a timestamp in the same second
+// the process started may have been created after start (the process
+// loaded at N.215, a legitimate request timestamped N was created at
+// N.500), so comparing ts*1000 against the millisecond start would
+// reject legitimate first-second requests. The persisted nonce store
+// (ApiStateStore, shared across restarts) covers the ambiguous same
+// second: a consumed nonce stays consumed. The value is captured at
+// module load (process start) and is injectable for tests via the
+// opts.processStartMs parameter.
+const PROCESS_START_MS = Date.now();
+
+export function processStartMs() {
+  return PROCESS_START_MS;
+}
 
 export function sha256Hex(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex');
@@ -73,7 +98,8 @@ export function signApiCall(secret, method, path, bodyText) {
 // `secrets` is [current, previous?] (empty strings filtered).
 // `apiState` is an ApiStateStore (nonce + revocation persistence).
 // Returns { ok: true } or { ok: false, step }.
-export function verifyWorkerAuth(req, method, path, bodyText, secrets, apiState) {
+export function verifyWorkerAuth(req, method, path, bodyText, secrets, apiState, opts = {}) {
+  const processStartMsBoundary = opts.processStartMs ?? PROCESS_START_MS;
   const configured = (secrets || []).filter((s) => typeof s === 'string' && s.length > 0);
   if (configured.length === 0) return { ok: false, step: 1 };
 
@@ -110,6 +136,14 @@ export function verifyWorkerAuth(req, method, path, bodyText, secrets, apiState)
   const ts = Number(timestamp);
   const nowSec = Math.floor(Date.now() / 1000);
   if (Math.abs(nowSec - ts) > HMAC_TIMESTAMP_WINDOW_S) return { ok: false, step: 3 };
+
+  // (3b) Rev 4.8 §15 process-start rule: a timestamp from a second
+  // before the process-start second is a replay from a previous process
+  // era — rejected even though it is within the freshness window. The
+  // comparison is in seconds (see the module header): the process-start
+  // second itself is allowed, because a request timestamped in that
+  // second may have been created after the process started.
+  if (ts < Math.floor(processStartMsBoundary / 1000)) return { ok: false, step: 3 };
 
   // (4) signature verifies (constant-time).
   const bodyHash = sha256Hex(bodyText);

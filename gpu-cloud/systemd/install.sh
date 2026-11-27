@@ -450,6 +450,15 @@ find "$STAGED_DIR" -type f -exec chmod 0644 {} +
 find "$STAGED_DIR" -type f -name '*.sh' -exec chmod 0755 {} +
 diff -rq "$GPU_CLOUD_DIR/src" "$STAGED_DIR" >/dev/null || fail "staged-tree sync verification failed: $STAGED_DIR differs from $GPU_CLOUD_DIR/src"
 echo "staged tree synced: $STAGED_DIR (diff -rq clean)"
+# Top-level install dirs (Rev 4.8 §4/M2-P): mkdir -p under this VM's
+# umask 0007 creates /opt/nova-ai-studio and /opt/nova-ai-studio/gpu-cloud
+# as 0770 root:root, and the find above chmods only dirs UNDER the staged
+# dir — so the two parents stay untraversable by User=nova-api and the
+# API unit fails with MODULE_NOT_FOUND on files that plainly exist. The
+# same gap applies to the install_file chmod of each file's parent dir
+# (it never reaches the top two). Fix explicitly, before systemd reload.
+chmod 0755 /opt/nova-ai-studio /opt/nova-ai-studio/gpu-cloud
+echo "top install dirs: /opt/nova-ai-studio /opt/nova-ai-studio/gpu-cloud (0755)"
 
 # Dash syntax check on every installed shell script.
 for script in "$BIN_DIR/prepare-startup-id.sh" "$BIN_DIR/retry-startup.sh"; do
