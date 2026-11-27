@@ -57,14 +57,42 @@ export function defaultApiState() {
     retentionIntents: {},
     sweepReports: [],
     operatorLog: [],
+    // NEXORA Kaggle connection (design v4): the NEXORA-facing
+    // attestation registry (§5.3), the mirrored client halt (§5.4),
+    // commissioning permits (§3.5), and licence determinations
+    // (§3.5 P-9). The per-origin hours ledger lives in the manager
+    // store (per-origin-ledger.js), not here.
+    nexoraAttestations: {},
+    nexoraClientHalts: {},
+    commissioningPermits: {},
+    licenceDeterminations: {},
+    // Revisit decisions (Kaggle design v13 §5.4): the operator's
+    // recorded decisions that a halt may be cleared — kinds
+    // 'initial-declaration' | 'kaggle-confirmation' |
+    // 'channels-kept-off-kaggle'. A halt clears only when a decision
+    // was recorded at/after the halt's changed_at. Array of
+    // { kind, detail, recorded_at, recorded_by }.
+    revisitDecisions: [],
+    // Commissioning permit consumed markers (design v13 §3.5): the
+    // file holds the permit; this map holds permit_id ->
+    // { consumed_at, job_id } written in the same serialised section
+    // as manager-job creation, so a permit authorises exactly one job.
+    commissioningPermitMarkers: {},
     // temp file registry (Rev 2 §16.3): path -> { jobId, createdAt }
     tempFiles: {},
   };
 }
 
+export const DEFAULT_API_EVENT_LOG_PATH = '/var/lib/nova-api/api-events.log';
+
 export class ApiStateStore {
-  constructor(filePath) {
+  constructor(filePath, options = {}) {
     this.filePath = filePath;
+    // Kaggle design v13 §5.5: the API's own events go to a separate
+    // append-only log (owned by nova-api, chattr +a in production) —
+    // never into the operator log alone. Best-effort: a failed append
+    // never throws (logEvent swallows).
+    this.eventLogPath = options.eventLogPath ?? DEFAULT_API_EVENT_LOG_PATH;
     this.state = defaultApiState();
     this._mtimeMs = 0;
     this._loadFromDisk();
@@ -134,5 +162,23 @@ export class ApiStateStore {
       if (s.operatorLog.length > 500) s.operatorLog.splice(0, s.operatorLog.length - 500);
     });
     return entry;
+  }
+
+  // Kaggle design v13 §5.5: the API's own event log — one JSON line
+  // per event, appended to api-events.log (owned by nova-api,
+  // append-only `chattr +a` in production; the root-owned activation
+  // log is written only by the root restart procedure and is NOT this
+  // file). Best-effort by design: a failed append (missing directory,
+  // read-only filesystem) is swallowed — event logging must never fail
+  // a request. Returns true when the line was appended.
+  logEvent(event, fields = {}) {
+    const line = JSON.stringify({ at: new Date().toISOString(), event, ...fields }) + '\n';
+    try {
+      fs.mkdirSync(path.dirname(this.eventLogPath), { recursive: true });
+      fs.appendFileSync(this.eventLogPath, line, 'utf8');
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

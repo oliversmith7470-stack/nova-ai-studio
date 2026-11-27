@@ -61,15 +61,48 @@ import { D1AuthError, D1RetryableError } from './d1-client.js';
 import { checkRunnerHeartbeat } from './runner-heartbeat.js';
 import { NON_COMMERCIAL_PURPOSES } from './activation.js';
 import { signPersonalAttestation } from './attestation.js';
-import { requiredVramGb } from '../phase6/resource-profiles.js';
+import { CHECKPOINT_SHA256, requiredVramGb } from '../phase6/resource-profiles.js';
+import {
+  canonicaliseJson,
+  canonicalRequestHash,
+  isNexoraJobId,
+} from './nexora-auth.js';
+import { validateAttestation } from './nexora-attestation.js';
+import { licenceSatisfiedFor } from './licence.js';
+import { isNexoraHalted } from './nexora-halt.js';
+import {
+  commissioningAuthorised,
+  consumeCommissioningPermit,
+  expireCommissioningPermit,
+} from './commissioning.js';
 import {
   buildGatewayPolicy,
   effectivePrompt,
   InvalidJobError,
 } from '../gateway-policy.js';
 import { scanCredentialPatterns } from '../data-guard.js';
+import { nextJob } from '../queue.js';
+import { isEngaged } from '../kill-switch.js';
+import { hasConsumedMarker } from './commissioning.js';
 
 const JOB_ID_RE = /^nova-job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// NEXORA-origin jobId namespacing (Kaggle design v13, §3 D-2.3): the
+// NEXORA jobId is `nexora:<uuidv4>` — a different namespace from the
+// Worker `nova-job-<uuid>`; the two never collide and a NEXORA job has
+// no D1 record, so it never goes through the Worker submit path. The
+// pattern (isNexoraJobId, from nexora-auth.js) is the shared UUIDv4
+// rule (version 4, variant [89ab], lowercase hex only, fullmatch); a
+// key may submit only its own namespace.
+
+// NEXORA storage reservation (design §6.2): 200 MB per accepted job.
+const NEXORA_STORAGE_BYTES = 200 * 1024 * 1024;
+
+// Bounded personal queue slot (Rev 4.8 §14): 2 TOTAL across both
+// personal origins. v13 §6.2 adds the per-origin cap: 1 per origin —
+// a NEXORA submit is refused while its origin already holds its slot.
+const PERSONAL_QUEUE_BOUND = 2;
+const PER_ORIGIN_QUEUE_BOUND = 1;
 
 // Parent-aggregate terminal statuses (Worker list-pending-jobs exclusion
 // set, Rev 3 §C-1.3): the statuses after which the 30-day retention
@@ -91,6 +124,17 @@ const WORKER_STATE_FOR_DISPATCH_STATE = {
   'dispatched': 'dispatched',
   'failed': 'failed',
   'reconciliation-needed': 'submitted',
+  // v13 §6.2/§6.3 terminal + held states: a cancelled job reads as
+  // failed to the Worker; a held job is still waiting (submitted).
+  'cancelled-by-halt': 'failed',
+  'cancelled-held': 'failed',
+  'cancelled-by-human': 'failed',
+  'device-mismatch': 'failed',
+  'held-licence-undetermined': 'submitted',
+  'held-activation-false': 'submitted',
+  'held-activation-config-invalid': 'submitted',
+  'held-activation-config-changed': 'submitted',
+  'held-permit-marker-missing': 'submitted',
 };
 
 export class DispatchManager {
@@ -126,6 +170,20 @@ export class DispatchManager {
   // refused (fail closed) — the API never trusts an incoming
   // nonCommercialAttested boolean, and never accepts a personal submit
   // it cannot attest itself.
+  // nexora (optional, Kaggle design v4): the NEXORA wiring —
+  // { ledger, jobBudgetHours, isActivationValid,
+  //   activationInvalidReason, activationFlags }. Without it,
+  // submitNexora fails closed (503 no-capacity) and commissioning
+  // authorisation is unavailable.
+  //   ledger: a PerOriginLedger (manager store) — the sole authority
+  //     for NEXORA acceptance arithmetic.
+  //   jobBudgetHours: J, the budgeted hours per job (default 0.5).
+  //   isActivationValid: () => boolean — the activation.conf strict
+  //     re-verification latch (commissioning refuses when invalid).
+  // stagingStore (optional, Kaggle design v13 §5.7): the push-model
+  // staging store — keyframes arrive via POST /internal/stage and the
+  // submit re-verifies their hashes from it. Without it, a NEXORA
+  // submit fails closed (503 staging-unavailable).
   constructor({
     manager,
     executor,
@@ -145,6 +203,8 @@ export class DispatchManager {
     authorisationCheck = null,
     ownerTokenId = null,
     attestationSigningSecret = null,
+    nexora = null,
+    stagingStore = null,
     now = () => Date.now(),
   } = {}) {
     if (!manager) throw new Error('DispatchManager requires a GpuManager');
@@ -187,6 +247,13 @@ export class DispatchManager {
     this.authorisationCheck = typeof authorisationCheck === 'function' ? authorisationCheck : null;
     this.ownerTokenId = typeof ownerTokenId === 'string' && ownerTokenId.length > 0 ? ownerTokenId : null;
     this.attestationSigningSecret = typeof attestationSigningSecret === 'string' && attestationSigningSecret.length > 0 ? attestationSigningSecret : null;
+    this.nexora = nexora && typeof nexora === 'object' ? nexora : null;
+    this.stagingStore = stagingStore ?? null;
+    // Kaggle design v13 §6.2: manager job ids whose NEXORA finaliser
+    // is already attached. A queued NEXORA job may be placed later by
+    // another submit's dispatch loop or by reEvaluateHeldJobs — the
+    // finaliser attaches on ANY placement, exactly once.
+    this._nexoraFinalized = new Set();
     // FreeLLMAPI (A5): the gateway policy for submit-time prompt
     // resolution. Defaults to the production policy (fail closed: no
     // enhancement in production, no authorization store).
@@ -374,6 +441,35 @@ export class DispatchManager {
     return null;
   }
 
+  // -- commissioning (Kaggle design v4, §3.5) ---------------------------
+
+  // The commissioning predicate for one Worker-path submit: the permit
+  // binds the canonical hash of the EXACT submit body (canonicalised
+  // JSON — the body carries integers only, so the JS canonicalisation
+  // matches; see nexora-auth.js::canonicaliseJson). A NEXORA-origin
+  // request never reaches this helper (submitNexora does not consult
+  // commissioning); the origin is 'nova' by construction here, and the
+  // key id is the Worker key — 'nexora-v1' is refused by the predicate.
+  _commissioningForRequest(body) {
+    if (!this.nexora) return { ok: false, reason: 'no-permit' };
+    const hash = canonicalRequestHash(canonicaliseJson(body));
+    return commissioningAuthorised(this.apiState, {
+      jobCanonicalHash: hash,
+      origin: 'nova',
+      keyId: 'worker',
+      // The caller only reaches this helper from the not-activated
+      // refusal branch, so the personal flag is false by construction.
+      personalActivated: false,
+      activationValid: typeof this.nexora.isActivationValid === 'function'
+        ? this.nexora.isActivationValid()
+        : true,
+      checkpointSha256: CHECKPOINT_SHA256,
+      // v13 §6.5: max_hours is a ceiling on the job's budgeted hours J.
+      jobHours: this.nexora.jobBudgetHours ?? DEFAULT_JOB_BUDGET_HOURS,
+      nowMs: this.now(),
+    });
+  }
+
   // -- headroom (Rev 2 §6.3) ----------------------------------------------
 
   _reservedHeadroomBytes() {
@@ -383,10 +479,12 @@ export class DispatchManager {
 
   // Synchronous reserve: called inside the serialised submit section,
   // never after an await that another submit could interleave with.
-  _reserveHeadroom(executionId) {
+  // `bytes` defaults to the per-execution headroom (50 MB); the NEXORA
+  // path reserves 200 MB under its jobId instead.
+  _reserveHeadroom(executionId, bytes = this.headroomBytes) {
     this.apiState.mutate((s) => {
       s.headroomReservations[executionId] = {
-        bytes: this.headroomBytes,
+        bytes,
         reservedAt: this.now(),
       };
     });
@@ -416,6 +514,827 @@ export class DispatchManager {
     return run;
   }
 
+  // -- NEXORA submit (Kaggle design v4, §4 step 6, §5.2) ---------------
+  //
+  // POST /internal/submit for a NEXORA-authenticated request. A SEPARATE
+  // method from submitExecutions (Worker path): NEXORA jobs have NO D1
+  // record, so the Worker path's D1-record-first lookup would 404 them;
+  // do not bend the Worker path. Order (brief §4, design §4 step 6):
+  //   1. schema (audience personal, origin nexora, jobId nexora:<uuid>,
+  //      LTX parameters exactly the Run 10 set);
+  //   2. purpose declarations (owner_personal_work, authenticated_owner,
+  //      third_party_work false, channel fields);
+  //   3. attestation valid in the registry — BEFORE the idempotency
+  //      lookup (an expired attestation refuses a duplicate with
+  //      attestation-expired, §5.8);
+  //   3b. licence gate (F-15): no rendering of any kind without a
+  //      licence determination for the LTX checkpoint;
+  //   4. mirrored halt clear + kill-switch/activation via the
+  //      authorisation check (NEXORA jobs NEVER run under commissioning);
+  //   5. quota ledger floor AND cap;
+  //   6. storage: 200 MB reservable;
+  //   7. staging fetch + SHA-256 verify per keyframe;
+  //   8. idempotency (same jobId + same hash → 200 existing;
+  //      different hash → 409);
+  //   9. reserve personal queue slot (bound 2) + 200 MB + budgeted
+  //      hours, create the manager job (jobId as idempotency key),
+  //      dispatch;
+  //   10. audit in the journal (never the prompt text).
+  // Returns { status, body } for the HTTP layer.
+
+  async submitNexora(body, bodyText = '') {
+    const run = this._submitQueue.then(async () => {
+      const out = await this._submitNexoraInner(body, bodyText);
+      // T-V30: every refused NEXORA submit is recorded in the NOVA
+      // audit (the operator log — the journal carries accepted jobs
+      // only), so a refusal is visible on both sides. Audit logging
+      // never fails a submit.
+      if (out.status >= 400) {
+        try {
+          this.apiState.logOperator('nexora-submit-refused', {
+            jobId: body?.jobId ?? null,
+            status: out.status,
+            error: out.body?.error ?? null,
+            reason: out.body?.reason ?? null,
+          });
+        } catch { /* ignore */ }
+      }
+      return out;
+    });
+    this._submitQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  _validateNexoraSubmitBody(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return 'body must be an object';
+    }
+    if (body.audience !== 'personal') return 'audience must be personal';
+    if (body.origin !== 'nexora') return 'origin must be nexora';
+    if (!isNexoraJobId(body.jobId)) return 'invalid jobId';
+    const ltx = body.ltx_parameters;
+    if (!ltx || typeof ltx !== 'object' || Array.isArray(ltx)) {
+      return 'ltx_parameters are required';
+    }
+    const ltxKeys = Object.keys(ltx).sort();
+    const expectedKeys = ['engine', 'frames', 'guidance', 'height', 'seed', 'steps', 'width'];
+    if (JSON.stringify(ltxKeys) !== JSON.stringify(expectedKeys)) {
+      return 'ltx_parameters must be exactly the Run 10 set (engine, frames, width, height, steps, guidance, seed)';
+    }
+    if (ltx.engine !== 'ltx-video-2b') return 'ltx engine must be ltx-video-2b';
+    if (ltx.frames !== 121) return 'ltx frames must be 121';
+    if (ltx.width !== 1024) return 'ltx width must be 1024';
+    if (ltx.height !== 576) return 'ltx height must be 576';
+    if (ltx.steps !== 8) return 'ltx steps must be 8';
+    if (ltx.guidance !== 1) return 'ltx guidance must be 1.0';
+    if (ltx.seed !== 42) return 'ltx seed must be 42';
+    if (typeof body.prompt !== 'string' || body.prompt.length === 0) {
+      return 'prompt is required';
+    }
+    const keyframes = body.keyframe_hashes;
+    if (!keyframes || typeof keyframes !== 'object' || Array.isArray(keyframes)) {
+      return 'keyframe_hashes are required';
+    }
+    if (!/^[0-9a-f]{64}$/i.test(keyframes.first || '')) {
+      return 'keyframe_hashes.first must be a SHA-256 hex digest';
+    }
+    if (!/^[0-9a-f]{64}$/i.test(keyframes.last || '')) {
+      return 'keyframe_hashes.last must be a SHA-256 hex digest';
+    }
+    if (typeof body.attestation_id !== 'string' || body.attestation_id.length === 0) {
+      return 'attestation_id is required';
+    }
+    return null;
+  }
+
+  // -- v13 §6.2/§3.5: held-at-dispatch + origin pause -------------------
+  // A NEXORA job is held at dispatch when its origin has a ledger
+  // orphan (a reservation held past 24 h with a non-terminal job):
+  // the origin is paused until the operator resolves the orphan.
+  // The 'worker' origin maps to 'commissioning'-origin reservations —
+  // the only NOVA-origin jobs that hold ledger reservations.
+  _originPaused(origin) {
+    if (!this.nexora?.ledger) return false;
+    const wanted = origin === 'worker' ? 'commissioning' : origin;
+    return this.nexora.ledger.findOrphans().some((r) => r.origin === wanted);
+  }
+
+  // Public wrapper for the route layer: the staging route refuses an
+  // origin-paused origin after auth, before reading/staging anything.
+  isOriginPaused(origin) {
+    return this._originPaused(origin);
+  }
+
+  // Kaggle design v13 §5.7: sweep unreferenced staged files older than
+  // 1 h — regardless of halt / pause / activation. Called by the
+  // interval sweep in api-server.js; best-effort, returns the sweep
+  // counts (or { deleted: 0, bytesFreed: 0 } with no store).
+  sweepStaging() {
+    if (!this.stagingStore) return { deleted: 0, bytesFreed: 0 };
+    return this.stagingStore.sweepUnreferenced();
+  }
+
+  // The pre-handoff re-check (§6.2 v13): before the dispatcher hands
+  // a personal job to the executor, re-check the licence record +
+  // activation validity (NEXORA jobs: licence + activation validity +
+  // flag; commissioning jobs: consumed marker + licence +
+  // activation validity — the time conditions are NOT re-evaluated
+  // and the permit file may be absent at dispatch). Returns null when
+  // the job may dispatch, or the held reason ('held-...') when it must
+  // wait. Ordinary personal jobs get the licence re-check only.
+  _preHandoffHold(head) {
+    if (head?.params?.audience !== 'personal') return null;
+    const nexora = this.nexora;
+    if (!nexora) return null;
+    // Activation validity (the latch) — shared by every personal job.
+    if (typeof nexora.isActivationValid === 'function' && !nexora.isActivationValid()) {
+      const reason = typeof nexora.activationInvalidReason === 'function'
+        ? nexora.activationInvalidReason()
+        : null;
+      return `held-${reason ?? 'activation-config-invalid'}`;
+    }
+    if (head.params.origin === 'nexora') {
+      // NEXORA job: licence + flag.
+      if (!licenceSatisfiedFor(this.apiState, CHECKPOINT_SHA256)) {
+        return 'held-licence-undetermined';
+      }
+      const flags = typeof nexora.activationFlags === 'function' ? nexora.activationFlags() : null;
+      if (flags && flags.personalProductionActivated !== true) {
+        return 'held-activation-false';
+      }
+      return null;
+    }
+    // Worker-path personal job: find its journal entry to tell a
+    // commissioning job (permit id recorded) from an ordinary one.
+    const entryKey = head.params.executionId ?? head.params.jobId ?? null;
+    const entry = entryKey ? this.journalEntry(entryKey) : null;
+    if (entry?.commissioningPermitId) {
+      // Commissioning job: the consumed marker must exist (it is the
+      // proof this job consumed the permit); the licence must still
+      // hold for the checkpoint; the flag is NOT re-checked (the
+      // permit authorises in place of it) and the time conditions are
+      // NOT re-evaluated (a permit that expires between acceptance
+      // and push does not stop the push — T-V35).
+      if (!hasConsumedMarker(this.apiState, entry.commissioningPermitId)) {
+        return 'held-permit-marker-missing';
+      }
+      if (!licenceSatisfiedFor(this.apiState, CHECKPOINT_SHA256)) {
+        return 'held-licence-undetermined';
+      }
+      return null;
+    }
+    // Ordinary personal job: licence only.
+    if (!licenceSatisfiedFor(this.apiState, CHECKPOINT_SHA256)) {
+      return 'held-licence-undetermined';
+    }
+    return null;
+  }
+
+  // Mark a manager job held in the dispatch journal (the manager job
+  // itself stays 'queued' — the held state lives in the journal, and
+  // the reservation is retained). The loop stops: a held head job
+  // blocks the queue until it clears or is cancelled.
+  _markJobHeld(head, reason) {
+    const entryKey = head.params.origin === 'nexora'
+      ? head.params.jobId
+      : (head.params.executionId ?? head.params.jobId);
+    if (!entryKey) return;
+    this._journalMutate(entryKey, (e) => {
+      e.state = reason;
+      e.heldReason = reason;
+      e.timestamps[reason] = this.now();
+    });
+    this.apiState.logEvent('personal-job-held', {
+      jobId: head.params.jobId ?? head.params.executionId ?? head.id,
+      managerJobId: head.id,
+      origin: head.params.origin ?? 'worker',
+      reason,
+    });
+  }
+
+  // A job whose hold cause cleared returns to the plain queued state
+  // the next time a dispatch loop reaches it — the journal must not
+  // keep saying 'held-*' after the cause is gone (the job is still
+  // queued; it simply waits for the executor now).
+  _clearHeldState(head) {
+    const entryKey = head.params.origin === 'nexora'
+      ? head.params.jobId
+      : (head.params.executionId ?? head.params.jobId);
+    if (!entryKey) return;
+    const entry = this.journalEntry(entryKey);
+    if (!entry || typeof entry.state !== 'string' || !entry.state.startsWith('held-')) return;
+    this._journalMutate(entryKey, (e) => {
+      e.state = 'submitted';
+      delete e.heldReason;
+    });
+  }
+
+  // Dispatch one head-of-line job with the v13 pre-handoff re-check.
+  // Returns the manager's result, except a held job returns
+  // { dispatched: false, reason: 'held-...', jobId } WITHOUT calling
+  // dispatchNext (the job stays queued at the head). On ANY placement
+  // of a NEXORA job, attaches its ledger finaliser (exactly once).
+  _dispatchPersonalNext() {
+    if (isEngaged(this.manager.store.state)) {
+      return { dispatched: false, reason: 'kill-switch-engaged' };
+    }
+    const head = nextJob(this.manager.store.state);
+    if (!head) return { dispatched: false, reason: 'queue-empty' };
+    const hold = this._preHandoffHold(head);
+    if (hold) {
+      this._markJobHeld(head, hold);
+      return { dispatched: false, reason: hold, jobId: head.id };
+    }
+    this._clearHeldState(head);
+    const r = this.manager.dispatchNext();
+    if (r.dispatched) {
+      this._onPersonalPlaced(head, r);
+    }
+    return r;
+  }
+
+  // A NEXORA job placed by ANY dispatch loop gets its ledger finaliser
+  // (exactly once per manager job id) so its reservation settles on
+  // the confirmed terminal state even when another submit placed it.
+  _onPersonalPlaced(head, result) {
+    if (head?.params?.origin !== 'nexora') return;
+    if (!this.nexora?.ledger) return;
+    const managerJobId = result.jobId;
+    if (this._nexoraFinalized.has(managerJobId)) return;
+    this._nexoraFinalized.add(managerJobId);
+    const jobId = head.params.jobId;
+    this._attachNexoraFinalizer(jobId, managerJobId, this.nexora);
+  }
+
+  // Re-evaluate every held personal job (operator + called from the
+  // submit loop path): a held job whose cause cleared dispatches now;
+  // one still held stays held (its reason updated when it changed).
+  // Returns the held jobs' states after re-evaluation.
+  reEvaluateHeldJobs() {
+    const results = [];
+    const journal = this.apiState.state.dispatchJournal || {};
+    for (const [key, entry] of Object.entries(journal)) {
+      if (typeof entry?.state !== 'string' || !entry.state.startsWith('held-')) continue;
+      const jobId = entry.managerJobId ?? null;
+      const job = jobId ? this.manager.getJob(jobId) : null;
+      if (!job || job.status !== 'queued') {
+        results.push({ key, jobId: entry.jobId ?? key, state: entry.state });
+        continue;
+      }
+      // Only the head job can dispatch (head-of-line discipline).
+      const head = nextJob(this.manager.store.state);
+      if (!head || head.id !== job.id) {
+        results.push({ key, jobId: entry.jobId ?? key, state: entry.state });
+        continue;
+      }
+      const r = this._dispatchPersonalNext();
+      const after = this.journalEntry(key);
+      results.push({
+        key,
+        jobId: entry.jobId ?? key,
+        state: after?.state ?? entry.state,
+        dispatched: r.dispatched === true,
+      });
+    }
+    return results;
+  }
+
+  // Operator cancel-held (audit-logged, evidence: the reason the job
+  // was held): the manager job is cancelled, the ledger + headroom
+  // reservations are released, the journal files 'cancelled-held'.
+  // Never blocked by halt / kill-switch / pause — this is the
+  // operator's escape hatch for a held job.
+  cancelHeldJob(jobId, { reason = 'operator-cancel-held' } = {}) {
+    const entry = this.journalEntry(jobId);
+    if (!entry || typeof entry.state !== 'string' || !entry.state.startsWith('held-')) {
+      return { ok: false, reason: 'not-held' };
+    }
+    const heldReason = entry.heldReason ?? entry.state;
+    const managerJobId = entry.managerJobId ?? null;
+    if (managerJobId) {
+      this.manager.cancelJob(managerJobId, 'cancelled-held');
+    }
+    if (this.nexora?.ledger) {
+      this.nexora.ledger.release({ jobId });
+    }
+    this._releaseHeadroom(jobId);
+    // A cancelled-held job never reaches the finaliser, so its staged
+    // references are released here.
+    this.stagingStore?.unreferenceJob(jobId);
+    this._journalMutate(jobId, (e) => {
+      e.state = 'cancelled-held';
+      e.timestamps['cancelled-held'] = this.now();
+    });
+    this.apiState.logOperator('nexora-held-cancelled', {
+      jobId,
+      held_reason: heldReason,
+      reason,
+    });
+    this.apiState.logEvent('nexora-held-cancelled', {
+      jobId,
+      held_reason: heldReason,
+      reason,
+    });
+    return { ok: true, jobId, heldReason };
+  }
+
+  // True when any job of this origin is held at dispatch (journal
+  // state 'held-*'). 'worker' covers every non-NEXORA personal job.
+  hasHeldJob(origin) {
+    const journal = this.apiState.state.dispatchJournal || {};
+    return Object.values(journal).some((e) => {
+      if (typeof e?.state !== 'string' || !e.state.startsWith('held-')) return false;
+      if (origin === 'nexora') return e.origin === 'nexora';
+      if (origin === 'worker') return e.origin !== 'nexora';
+      return true;
+    });
+  }
+
+  async _submitNexoraInner(body, bodyText) {
+    const nexora = this.nexora;
+    // NEXORA acceptance requires the NEXORA wiring (ledger, staging);
+    // without it the path fails closed.
+    if (!nexora || !nexora.ledger) {
+      return { status: 503, body: { error: 'no-capacity' } };
+    }
+    const jobBudgetHours = nexora.jobBudgetHours ?? 0.5;
+
+    // (1) Schema.
+    const schemaError = this._validateNexoraSubmitBody(body);
+    if (schemaError) {
+      // v13 §3 D-2.3: a jobId outside the caller's namespace (wrong
+      // prefix, bad UUIDv4 shape, trailing newline) is 400
+      // invalid-job-id, distinct from other schema failures.
+      if (schemaError === 'invalid jobId') {
+        return { status: 400, body: { error: 'invalid-job-id', message: schemaError } };
+      }
+      return { status: 400, body: { error: 'invalid-submit', message: schemaError } };
+    }
+    // (2) Purpose declarations (§5.4). Any other value → refused and
+    // recorded in the audit (the refusal is journalled below via the
+    // operator log — the journal carries no entry for a refused submit,
+    // so the refusal is logged, not journalled).
+    if (body.purpose !== 'owner_personal_work') {
+      return { status: 400, body: { error: 'invalid-submit', message: 'purpose must be owner_personal_work' } };
+    }
+    if (body.requester !== 'authenticated_owner') {
+      return { status: 400, body: { error: 'invalid-submit', message: 'requester must be authenticated_owner' } };
+    }
+    if (body.third_party_work !== false) {
+      return { status: 400, body: { error: 'invalid-submit', message: 'third_party_work must be false' } };
+    }
+    if (typeof body.target_channel_id !== 'string' || body.target_channel_id.length === 0) {
+      return { status: 400, body: { error: 'invalid-submit', message: 'target_channel_id is required' } };
+    }
+    if (body.target_channel_status !== 'non_monetised') {
+      return { status: 400, body: { error: 'invalid-submit', message: 'target_channel_status must be non_monetised' } };
+    }
+    // (3) Duplicate-jobId lookup — BEFORE attestation (design §4
+    // step 6 v13, §5.8): an identical re-submit returns the existing
+    // state even when the attestation has since expired, and reconcile
+    // via GET /internal/job needs no attestation at all. Same jobId +
+    // same hash → 200 existing state, no new reservation, no new
+    // manager job. Same jobId + different hash → 409
+    // idempotency-conflict. A crash between manager creation and
+    // journal write is repaired from the manager store, never a second
+    // execution. The hash is SHA-256 over the raw request body (the
+    // wire body IS the canonical JSON — see
+    // nexora-auth.js::canonicalRequestHash). NOTE: the hash covers the
+    // FULL submit payload INCLUDING attestation_id (the landed NEXORA
+    // client hashes the full payload — see the v13 implementation
+    // report); a re-submit under a FRESH attestation id therefore
+    // hashes differently and 409s, while an identical re-submit
+    // returns the existing state.
+    const hash = canonicalRequestHash(bodyText);
+    const entry = this.journalEntry(body.jobId);
+    if (entry && entry.managerJobId && entry.state !== 'failed') {
+      if (entry.canonical_request_hash === hash) {
+        return { status: 200, body: this.nexoraJobState(body.jobId) };
+      }
+      return { status: 409, body: { error: 'idempotency-conflict', canonical_request_hash: hash } };
+    }
+    const byKey = this.manager.getJobByKey(body.jobId);
+    if (byKey) {
+      const storedHash = byKey.params?.canonicalRequestHash ?? null;
+      if (storedHash === hash) {
+        this._journalMutate(body.jobId, (e) => {
+          e.jobId = body.jobId;
+          e.managerJobId = byKey.id;
+          e.executorId = byKey.providerId ?? null;
+          e.state = 'slot-claimed';
+          e.canonical_request_hash = hash;
+          e['journal-repaired'] = true;
+          e.timestamps['slot-claimed'] = this.now();
+        });
+        return { status: 200, body: this.nexoraJobState(body.jobId) };
+      }
+      return { status: 409, body: { error: 'idempotency-conflict', canonical_request_hash: hash } };
+    }
+    // (4) Attestation valid in the registry (NEXORA-origin only).
+    const att = validateAttestation(this.apiState, {
+      attestationId: body.attestation_id,
+      clientId: 'nexora-service',
+      nowMs: this.now(),
+    });
+    if (!att.ok) {
+      return { status: 403, body: { error: 'attestation-refused', reason: att.reason } };
+    }
+    // (5) Licence gate (F-15 / §3.4): no rendering of any kind without
+    // a licence determination for the LTX checkpoint — checked before
+    // any resource is committed. The checkpoint is the SHA-256 pinned
+    // in the run-10 template manifest, read server-side; a payload
+    // checkpoint value is ignored.
+    if (!licenceSatisfiedFor(this.apiState, CHECKPOINT_SHA256)) {
+      return { status: 403, body: { error: 'licence-refused', reason: 'licence-undetermined' } };
+    }
+    // (6) Activation (F-6 / §4 step 6 v13): the NEXORA path checks the
+    // flag and the config validity — NEVER commissioning (a live permit
+    // does not authorise a NEXORA job, T-V17b). Flag false → 503
+    // activation-false; config invalid → activation-config-invalid;
+    // value changed since startup → activation-config-changed; no
+    // personal executor → no-capacity.
+    if (this.mode === 'production') {
+      if (typeof nexora.isActivationValid === 'function' && !nexora.isActivationValid()) {
+        const reason = typeof nexora.activationInvalidReason === 'function'
+          ? nexora.activationInvalidReason()
+          : null;
+        return { status: 503, body: { error: reason ?? 'activation-config-invalid' } };
+      }
+      const flags = typeof nexora.activationFlags === 'function' ? nexora.activationFlags() : null;
+      if (flags && flags.personalProductionActivated !== true) {
+        return { status: 503, body: { error: 'activation-false' } };
+      }
+      if (!this._hasPersonalExecutor()) {
+        return { status: 503, body: { error: 'no-capacity' } };
+      }
+    }
+    // (7) Halt: the mirrored NEXORA halt, then the kill-switch. Either
+    // refuses new submits; queued jobs are cancelled by the halt
+    // setter, running kernels complete.
+    if (isNexoraHalted(this.apiState)) {
+      return { status: 503, body: { error: 'client-halted', reason: 'nexora-halted' } };
+    }
+    if (isEngaged(this.manager.store.state)) {
+      return { status: 503, body: { error: 'client-halted', reason: 'kill-switch-engaged' } };
+    }
+    // (8) Origin-paused: a ledger orphan for this origin (a reservation
+    // held past 24 h with a non-terminal job) pauses the origin until
+    // the operator resolves it. Reported before queue-full when both
+    // apply.
+    if (this._originPaused('nexora')) {
+      return { status: 503, body: { error: 'origin-paused', reason: 'origin-paused' } };
+    }
+    // (9) Per-origin slot cap (§6.2 v13): 1 in-flight job per origin.
+    // The total bound (2 across both origins, Rev 4.8 §14) still holds
+    // implicitly — 1 nexora + 1 worker = 2.
+    if (nexora.ledger.personalQueueDepth('nexora') >= PER_ORIGIN_QUEUE_BOUND) {
+      return { status: 503, body: { error: 'queue-full', reason: 'queue-full' } };
+    }
+    // (10) Storage: 200 MB must be reservable (the reservation itself
+    // happens at step 12, together with the queue slot and the hours —
+    // a failure here holds no quota reservation).
+    let capacity;
+    try {
+      capacity = await this.manager.storageCapacity();
+    } catch {
+      return { status: 503, body: { error: 'storage-unavailable' } };
+    }
+    const usage = this.manager.storageUsage();
+    const reserved = this._reservedHeadroomBytes();
+    const totalBytes = capacity && Number.isFinite(capacity.totalBytes)
+      ? capacity.totalBytes
+      : null;
+    if (totalBytes === null) {
+      return { status: 503, body: { error: 'storage-unavailable' } };
+    }
+    const usableHeadroom = totalBytes - (usage.totalBytes || 0) - reserved;
+    if (usableHeadroom < NEXORA_STORAGE_BYTES) {
+      return { status: 503, body: { error: 'storage-unavailable' } };
+    }
+    // (11) Quota ledger: floor AND cap, both must hold — and the
+    // reconciliation must be valid ('quota-unreconciled' otherwise).
+    // The NOVA ledger is the sole authority; the NEXORA local counter
+    // never authorises. The floor is checked before the cap (both
+    // failing reports 'floor-reached').
+    const admission = nexora.ledger.admitNexora({ jobHours: jobBudgetHours });
+    if (!admission.ok) {
+      return { status: 503, body: { error: 'quota-refused', reason: admission.reason } };
+    }
+    // (12) Staging verification (§5.7, push model): the payload's
+    // keyframe hashes must have staged files for THIS jobId — the
+    // client pushed them to POST /internal/stage before submitting.
+    // Missing or wrong-job → 400 staging-failed /
+    // keyframe-hash-mismatch. On acceptance the files leave the
+    // quarantine (releaseForJob) so the sweep never deletes a live
+    // job's keyframes; the reference is released when the job reaches
+    // a terminal state (finaliser) or is cancelled (halt / cancel-held).
+    // Without a staging store the submit fails closed.
+    if (!this.stagingStore) {
+      return { status: 503, body: { error: 'staging-unavailable' } };
+    }
+    const keyframeHashes = [body.keyframe_hashes.first, body.keyframe_hashes.last];
+    const staged = this.stagingStore.verifyStagedForJob(body.jobId, keyframeHashes);
+    if (!staged.ok) {
+      return { status: staged.status, body: { error: staged.error, reason: staged.reason } };
+    }
+    this.stagingStore.releaseForJob(body.jobId, keyframeHashes);
+    // (13) Reserve the 200 MB + the job's budgeted hours, then create
+    // the manager job with the jobId as idempotency key — all inside
+    // the serialised submit section. The per-origin slot was already
+    // checked at step 9 (inside this same serialised section, so no
+    // second job can take it between the check and the reserve).
+    this._reserveHeadroom(body.jobId, NEXORA_STORAGE_BYTES);
+    nexora.ledger.reserve({ jobId: body.jobId, origin: 'nexora', hours: jobBudgetHours });
+    // Minimum VRAM from the measured Run 10 profile with the design's
+    // owner-confirmed 1.50 GiB margin (14.14 GiB → 15.19 GB) — NOT the
+    // repo's default 1.92 GiB margin (the Worker path's figure).
+    const measuredMinVramGb = requiredVramGb({
+      model: 'ltx-video-2b',
+      resolution: '1024x576',
+      frames: 121,
+      steps: 8,
+      decoderMode: 'single-pass',
+      attentionBackend: 'default',
+    }, { safetyMarginGib: 1.5 });
+    const minVramGb = measuredMinVramGb ?? 12;
+    let job;
+    try {
+      ({ job } = this.manager.submit({
+        idempotencyKey: body.jobId,
+        type: 'video',
+        modelId: 'ltx-video-2b',
+        prompt: body.prompt,
+        params: {
+          timeoutMs: this.jobTimeoutMs,
+          minVramGb,
+          estimatedSeconds: 300,
+          executionId: body.jobId,
+          jobId: body.jobId,
+          // The audience + origin travel with the job so the
+          // dispatcher, executor, and transport each re-check them; a
+          // NEXORA job also carries its registry attestation id and
+          // the session id recorded from the registry at submit (never
+          // from the request), its purpose declarations, and its
+          // canonical request hash. It carries NO nonCommercialPurpose,
+          // NO ownerTokenId, and NO round-2 personalAttestation — the
+          // two attestation systems are separate.
+          audience: 'personal',
+          origin: 'nexora',
+          purpose: 'owner_personal_work',
+          nexoraAttestationId: body.attestation_id,
+          nexoraSessionId: att.record.session_id,
+          targetChannelId: body.target_channel_id,
+          targetChannelStatus: body.target_channel_status,
+          keyframeHashes: { ...body.keyframe_hashes },
+          canonicalRequestHash: hash,
+        },
+      }));
+    } catch (err) {
+      this._releaseHeadroom(body.jobId);
+      nexora.ledger.release({ jobId: body.jobId });
+      // The staged references were taken at step 12 — a manager.submit
+      // throw means no job exists to own them, so release them here or
+      // the files stay pinned past the sweep forever.
+      this.stagingStore?.unreferenceJob(body.jobId);
+      this._journalSetState(body.jobId, 'failed', { error: 'no-capacity' });
+      return { status: 503, body: { error: 'no-capacity' } };
+    }
+    // (10) Audit: the journal records jobId, audience, origin,
+    // attestation_id, purpose declarations, canonical request hash,
+    // keyframe hashes, reservation, provider, outcome. Prompt text is
+    // NEVER recorded. The manager job id is recorded HERE (not only
+    // on placement): a queued-but-unplaced job's entry must already
+    // carry it, or held-job operations (re-evaluate, cancel-held)
+    // cannot find the manager job.
+    this._journalMutate(body.jobId, (e) => {
+      e.jobId = body.jobId;
+      e.managerJobId = job.id;
+      e.state = 'submitted';
+      e.timestamps.submitted = this.now();
+      e.audience = 'personal';
+      e.origin = 'nexora';
+      e.attestation_id = body.attestation_id;
+      e.purpose = body.purpose;
+      e.requester = body.requester;
+      e.third_party_work = body.third_party_work;
+      e.target_channel_id = body.target_channel_id;
+      e.target_channel_status = body.target_channel_status;
+      e.canonical_request_hash = hash;
+      e.keyframe_hashes = { ...body.keyframe_hashes };
+      e.reservation = { hours: jobBudgetHours, storageBytes: NEXORA_STORAGE_BYTES };
+      e.provider = 'kaggle-t4';
+    });
+    // Dispatch until this job is placed, or a failure stops us. The
+    // dispatcher takes the head-of-line job, so jobs queued ahead of
+    // ours are dispatched first (one per call); the loop continues
+    // until ours is placed. The pre-handoff re-check runs inside
+    // _dispatchPersonalNext: a job held by a pre-handoff gate (licence
+    // / activation) is marked held and the loop stops.
+    let placed = null;
+    let heldReason = null;
+    for (let guard = 0; guard < 10; guard++) {
+      const r = this._dispatchPersonalNext();
+      if (r.dispatched) {
+        if (r.jobId === job.id) {
+          placed = r;
+          break;
+        }
+        continue;
+      }
+      if (r.reason === 'queue-empty') break;
+      if (typeof r.reason === 'string' && r.reason.startsWith('held-')) {
+        heldReason = r.reason;
+        break;
+      }
+      // Executor busy / no provider / kill-switch / any other
+      // non-placement: stop the loop — the job stays queued (below).
+      break;
+    }
+    if (heldReason) {
+      // Held at dispatch (§6.2 v13): the journal already carries
+      // 'held-<reason>' (written by _markJobHeld); the reservation is
+      // RETAINED — it is released only on a confirmed terminal state
+      // or operator resolve-orphan / cancel-held. 202, not 503: the
+      // job exists and waits for its cause to clear.
+      return {
+        status: 202,
+        body: {
+          jobId: body.jobId,
+          managerJobId: job.id,
+          dispatchState: heldReason,
+          canonical_request_hash: hash,
+        },
+      };
+    }
+    if (!placed) {
+      // Not placed and not held (executor busy / no provider): the job
+      // stays QUEUED with its reservation held (§6.2 v13 — the v4
+      // dispatch-failure compensation violated this: a reservation is
+      // released ONLY on a confirmed terminal state or operator
+      // resolve-orphan. A later dispatch loop — another submit's, or
+      // reEvaluateHeldJobs — places it, and the finaliser attaches on
+      // that placement). 202, not 503: the job exists and waits.
+      return {
+        status: 202,
+        body: {
+          jobId: body.jobId,
+          managerJobId: job.id,
+          dispatchState: 'queued',
+          canonical_request_hash: hash,
+        },
+      };
+    }
+    this._journalMutate(body.jobId, (e) => {
+      e.managerJobId = job.id;
+      e.executorId = placed.providerId;
+      e.state = 'slot-claimed';
+      e.timestamps['spending-reserved'] = this.now();
+      e.timestamps['slot-claimed'] = this.now();
+    });
+    // The ledger finaliser was attached on placement inside
+    // _dispatchPersonalNext (via _onPersonalPlaced) — exactly once
+    // per manager job, even when another submit's loop placed it.
+    return {
+      status: 202,
+      body: {
+        jobId: body.jobId,
+        managerJobId: job.id,
+        dispatchState: 'slot-claimed',
+        canonical_request_hash: hash,
+      },
+    };
+  }
+
+  // Staging fetch (§5.7): read the keyframe files from the NEXORA
+  // loopback endpoint and verify the SHA-256 of each file against the
+  // signed payload. Filenames are the NEXORA staging manifest names
+  // (staging.py): slot "first" → file "first_frame", slot "last" →
+  // file "last_frame". A mismatch fails the submit; no manager job is
+  // created (T-V26). An unconfigured staging base URL (the NEXORA
+  // staging server is unbuilt — P-14 follow-up) fails closed with
+  // staging-unavailable.
+  // The ledger finaliser for a NEXORA job: when the manager job reaches
+  // a terminal state (the executor promise settles), release the 200 MB
+  // headroom and settle the ledger reservation with the ACTUAL GPU
+  // seconds when the provider reported them (else the budgeted hours).
+  _attachNexoraFinalizer(jobId, managerJobId, nexora) {
+    const done = this.manager.inflight.get(managerJobId);
+    if (!done || typeof done.then !== 'function') return;
+    done.then(
+      (finalJob) => { void this._finalizeNexoraJob(jobId, finalJob, nexora); },
+      () => { void this._finalizeNexoraJob(jobId, null, nexora); },
+    );
+  }
+
+  _finalizeNexoraJob(jobId, finalJob, nexora) {
+    this._releaseHeadroom(jobId);
+    // Hours: the provider-reported seconds when the report carries
+    // them, else the budgeted hours (the ledger's settle fallback).
+    // (The executor normalizes a missing secondsUsed to 0, which the
+    // ledger then treats as a reported 0 — a report that says nothing
+    // about GPU time settles at consumed 0, per T-V39; the J fallback
+    // applies when no figure reaches the ledger at all.)
+    nexora.ledger.settle({
+      jobId,
+      secondsUsed: finalJob?.cost?.providerReportedSeconds ?? null,
+    });
+    // Terminal state: the staged files lose this job's reference, so
+    // the sweep may delete them once they age out (design §5.7 — a
+    // staged file is deleted only when no non-terminal job references
+    // its hash).
+    this.stagingStore?.unreferenceJob(jobId);
+    const entry = this.journalEntry(jobId);
+    if (!entry) return;
+    // F-3 (v12 item 14): a terminal executor report files the journal
+    // state for the two operator-filed terminal errors — a kernel
+    // stopped by a human ('cancelled-by-human': the human files a
+    // failed report via fileReport()), and a kernel that exited on an
+    // nvidia-smi device mismatch ('device-mismatch': the operator
+    // files it via fileReport(); the observed device travels in the
+    // report). Neither is auto-retried; a deliberate retry uses a new
+    // jobId. Any other terminal report keeps its state and only
+    // records the outcome.
+    const terminalError = finalJob?.error ?? null;
+    if (terminalError === 'cancelled-by-human' || terminalError === 'device-mismatch') {
+      this._journalMutate(jobId, (e) => {
+        e.state = terminalError;
+        e.outcome = finalJob?.status ?? 'terminal';
+      });
+    } else if (entry.state !== 'failed') {
+      this._journalMutate(jobId, (e) => {
+        e.outcome = finalJob?.status ?? 'terminal';
+      });
+    }
+  }
+
+  // The job state for GET /internal/job?jobId=&hash= and
+  // GET /internal/jobs/<jobId> (§5.8 reconciliation) and for an
+  // idempotent re-submit (200 existing state). Found → the job state +
+  // canonical_request_hash + found: true; not found → null (the route
+  // answers 404 { found: false }). The state is the manager job's
+  // status when one exists, else the journal dispatch state.
+  // `hash` (optional) is the caller's canonical request hash:
+  // hash_match compares it with the stored canonical_request_hash
+  // (null when no hash was passed — the path form never passes one).
+  nexoraJobState(jobId, hash = null) {
+    let entry = this.journalEntry(jobId);
+    if (!entry) {
+      // Worker jobs are journalled under execution ids, not jobIds —
+      // scan for an entry whose jobId matches.
+      for (const e of Object.values(this.apiState.state.dispatchJournal || {})) {
+        if (e.jobId === jobId) {
+          entry = e;
+          break;
+        }
+      }
+    }
+    if (!entry) return null;
+    const job = entry.managerJobId ? this.manager.getJob(entry.managerJobId) : null;
+    const storedHash = entry.canonical_request_hash ?? null;
+    return {
+      found: true,
+      jobId,
+      state: job ? job.status : entry.state,
+      dispatchState: entry.state,
+      managerJobId: entry.managerJobId ?? null,
+      canonical_request_hash: storedHash,
+      hash_match: hash == null ? null : storedHash === hash,
+      attestation_id: entry.attestation_id ?? null,
+      origin: entry.origin ?? null,
+      audience: entry.audience ?? null,
+    };
+  }
+
+  // Cancel queued NEXORA jobs + release their reservations (T-V23,
+  // mirrored halt; F-19 / §6.3 v13). Called by the operator halt
+  // setter. Running kernels complete (no cancel exists); only queued
+  // jobs are cancelled. The journal files 'cancelled-by-halt' (the
+  // terminal state the NEXORA side records) — NOT 'failed' and NOT
+  // 'nexora-halted'. Returns the NEXORA jobIds cancelled.
+  cancelQueuedNexoraJobs() {
+    const cancelled = [];
+    if (!this.nexora?.ledger) return cancelled;
+    for (const job of Object.values(this.manager.store.state.jobs || {})) {
+      if (job?.params?.origin !== 'nexora') continue;
+      if (job.status !== 'queued') continue;
+      const nexoraJobId = job.params.jobId;
+      this.manager.cancelJob(job.id, 'nexora-halt');
+      this.nexora.ledger.release({ jobId: nexoraJobId });
+      this._releaseHeadroom(nexoraJobId);
+      // A halt-cancelled queued job never reaches the finaliser, so
+      // its staged references are released here (its files are not
+      // needed — the job will never dispatch).
+      this.stagingStore?.unreferenceJob(nexoraJobId);
+      this._journalSetState(nexoraJobId, 'cancelled-by-halt', { error: 'cancelled-by-halt' });
+      this.apiState.logEvent('nexora-job-cancelled-by-halt', {
+        jobId: nexoraJobId,
+        managerJobId: job.id,
+      });
+      cancelled.push(nexoraJobId);
+    }
+    return cancelled;
+  }
+
   async _submitExecutionsInner(body) {
     // FreeLLMAPI (A5 contract): the submit loads the stored D1 record by
     // body.jobId through the existing job-by-id lookup BEFORE the body is
@@ -438,6 +1357,13 @@ export class DispatchManager {
     }
     if (typeof body.jobId !== 'string') {
       return { status: 400, body: { error: 'invalid-submit', message: 'invalid jobId' } };
+    }
+    // v13 §3 D-2.3: the jobId FORM is checked before the D1 lookup — a
+    // jobId outside the Worker's namespace (e.g. `nexora:<uuid>` from a
+    // Worker-signed request) is 400 invalid-job-id, never a 404 and
+    // never a D1 read for an id that cannot have a record.
+    if (!JOB_ID_RE.test(body.jobId)) {
+      return { status: 400, body: { error: 'invalid-job-id', message: 'invalid jobId' } };
     }
     let storedRecord;
     try {
@@ -472,7 +1398,12 @@ export class DispatchManager {
     }
 
     const invalid = this._validateSubmitBody(body);
-    if (invalid) return { status: 400, body: { error: 'invalid-submit', message: invalid } };
+    if (invalid) {
+      if (invalid === 'invalid jobId') {
+        return { status: 400, body: { error: 'invalid-job-id', message: invalid } };
+      }
+      return { status: 400, body: { error: 'invalid-submit', message: invalid } };
+    }
 
     // Audience validation (Rev 4.8 §5.2/§5.3): in production mode the
     // audience is mandatory ('public' | 'personal'); a missing or
@@ -498,7 +1429,12 @@ export class DispatchManager {
     // round 2): created below, only for a personal submit that passes
     // the purpose + token-identifier checks, and carried into the
     // journal entry and the manager job. A refused submit discards it.
+    // The commissioning permit for this submit (Kaggle design v4 §3.5):
+    // set below when the authorisation check refuses with not-activated
+    // and a live permit authorises this exact request; consumed only
+    // after the manager jobs exist.
     let personalAttestation = null;
+    let commissioningPermit = null;
     if (this.mode === 'production') {
       // Rev 4.9 §4, audience-aware (Rev 4.8 §5.3): a public submit needs
       // a registered permitted production executor; a personal submit
@@ -563,8 +1499,46 @@ export class DispatchManager {
           return { status: 503, body: { error: 'no-capacity' } };
         }
         if (!check || check.authorised !== true) {
-          return { status: 503, body: { error: 'no-capacity' } };
+          // Commissioning (Kaggle design v4 §3.5): a NOVA-origin
+          // personal submit under a live permit for this EXACT request
+          // may proceed while the personal flag is off — but ONLY when
+          // the refusal is not-activated. Any other refusal reason, any
+          // other audience, and any NEXORA-origin request (this is the
+          // Worker path; NEXORA submits go through submitNexora and
+          // never consult commissioning) refuse here.
+          if (audience === 'personal' && check?.reason === 'not-activated') {
+            const comm = this._commissioningForRequest(body);
+            if (comm.ok) {
+              commissioningPermit = comm.permit;
+            } else if (comm.reason === 'no-permit') {
+              // F-6 / T-V40: the flag is off and NO permit authorises
+              // this job — the refusal is the activation step, not
+              // capacity. (A permit that EXISTS but fails — expired,
+              // consumed, max-hours, licence — keeps 'no-capacity'
+              // with its reason below.)
+              return { status: 503, body: { error: 'activation-false' } };
+            } else {
+              // v13 §3.5/§6.5: surface the permit refusal reason
+              // (e.g. max-hours-exceeded, licence-undetermined) — the
+              // operator needs to know WHY the permit did not
+              // authorise, and the refusal writes no consumed marker.
+              return { status: 503, body: { error: 'no-capacity', reason: comm.reason } };
+            }
+          } else {
+            return { status: 503, body: { error: 'no-capacity' } };
+          }
         }
+      }
+      // Licence gate (v13 §3.4): EVERY personal job is refused
+      // licence-undetermined unless a valid determination covers the
+      // run-10 checkpoint. (Commissioning jobs already passed the
+      // permit's licence check in _commissioningForRequest; this is
+      // the same gate for ordinary personal jobs.) Production mode
+      // only — the authorisation gate it extends is production-only
+      // too.
+      if (this.mode === 'production' && audience === 'personal'
+        && !licenceSatisfiedFor(this.apiState, CHECKPOINT_SHA256)) {
+        return { status: 503, body: { error: 'licence-refused', reason: 'licence-undetermined' } };
       }
     }
 
@@ -669,7 +1643,8 @@ export class DispatchManager {
     // purpose, and token identifier are recorded here so the job's audit
     // record carries them from intake (§5.2, §12). The incoming
     // nonCommercialAttested boolean is never recorded — it is not a
-    // marker and is never trusted.
+    // marker and is never trusted. A commissioning job also records its
+    // permit id and the journal reason `m2p-commissioning`.
     for (const { x } of stillMissing) {
       this._journalMutate(x.executionId, (entry) => {
         entry.jobId = body.jobId;
@@ -682,6 +1657,10 @@ export class DispatchManager {
           entry.personalAttestation = personalAttestation;
           entry.nonCommercialPurpose = body.nonCommercialPurpose;
           entry.ownerTokenId = body.ownerTokenId;
+        }
+        if (commissioningPermit) {
+          entry.commissioningPermitId = commissioningPermit.permit_id;
+          entry.commissioningReason = 'm2p-commissioning';
         }
       });
     }
@@ -740,39 +1719,84 @@ export class DispatchManager {
       return { status: 503, body: { error: reason } };
     }
 
+    // The manager job id is recorded in the journal entry HERE (not
+    // only on placement): a queued-but-unplaced job's entry must
+    // already carry it, or held-job operations (re-evaluate,
+    // cancel-held) cannot find the manager job.
+    for (const { x, job } of submittedJobs) {
+      this._journalMutate(x.executionId, (entry) => {
+        entry.managerJobId = job.id;
+      });
+    }
+
+    // Commissioning (v13 §3.5): the permit is consumed NOW that the
+    // manager jobs exist (the point of no return — a failed submit
+    // above never consumes it), and the job's budgeted hours are
+    // reserved in the commissioning bucket: the permit draws from the
+    // ORDINARY bucket only (v13 A-3); C_C counts in Q but not against
+    // the NEXORA cap. The consumed marker is written in this same
+    // serialised section as the manager-job creation above.
+    if (commissioningPermit && this.nexora?.ledger) {
+      consumeCommissioningPermit(this.apiState, commissioningPermit.permit_id, {
+        jobId: body.jobId,
+        nowMs: this.now(),
+      });
+      this.nexora.ledger.reserve({
+        jobId: body.jobId,
+        origin: 'commissioning',
+        hours: this.nexora.jobBudgetHours ?? 0.5,
+      });
+    }
+
     // Dispatch until every submitted job is placed, or a failure stops us.
     // dispatchNext() places the head-of-line job; loop so each scene gets
-    // its own slot claim in FIFO order.
+    // its own slot claim in FIFO order. The loop runs through
+    // _dispatchPersonalNext (v13 §6.2): the pre-handoff re-check may
+    // HOLD a personal job instead of placing it — a held job is NOT a
+    // failure (its journal state is already 'held-*'; it keeps its
+    // reservation and waits).
     const placed = new Map(); // managerJobId -> { x, providerId }
     let dispatchFailure = null;
+    let heldReason = null;
     for (let guard = 0; guard < submittedJobs.length + 2; guard++) {
       if (placed.size === submittedJobs.length) break;
-      const r = this.manager.dispatchNext();
+      const r = this._dispatchPersonalNext();
       if (r.dispatched) {
         const found = submittedJobs.find(({ job }) => job.id === r.jobId);
         if (found) placed.set(r.jobId, { x: found.x, providerId: r.providerId });
         continue;
       }
       if (r.reason === 'queue-empty') break;
+      if (typeof r.reason === 'string' && r.reason.startsWith('held-')) {
+        heldReason = r.reason;
+        break;
+      }
       dispatchFailure = r;
       break;
     }
 
     if (placed.size !== submittedJobs.length) {
-      const reason = dispatchFailure
-        ? this._dispatchFailureError(dispatchFailure)
-        : 'no-capacity';
+      const reason = heldReason
+        ?? (dispatchFailure ? this._dispatchFailureError(dispatchFailure) : 'no-capacity');
       // Compensation (Rev 2 §10.3): release headroom, fail the unplaced
       // executions in D1, flag reconciliation. Placed executions keep
       // their slot claims (they are dispatched; the Worker is told only
-      // about the failure if NOTHING was placed — see below).
+      // about the failure if NOTHING was placed — see below). HELD
+      // executions are skipped: they are not failures.
       for (const { x, job } of submittedJobs) {
         if (placed.has(job.id)) continue;
+        const entry = this.journalEntry(x.executionId);
+        if (entry?.state?.startsWith('held-')) continue;
         this._releaseHeadroom(x.executionId);
         this._journalSetState(x.executionId, 'failed', { error: reason });
         await this._failSceneInD1(body.jobId, x, reason);
       }
       if (placed.size === 0) {
+        // Held, nothing placed: the job exists and waits — 202 with
+        // the held dispatch state, not a 503.
+        if (heldReason) {
+          return { status: 202, body: { managerJobIds, dispatchState: heldReason } };
+        }
         return { status: 503, body: { error: reason } };
       }
       // Partial placement: report the placed jobs; the failed scenes are
@@ -1171,6 +2195,22 @@ export class DispatchManager {
     const entry = this.journalEntry(x.executionId);
     const job = this.manager.getJob(managerJobId);
     if (!job) return;
+    // Commissioning (v4 §3.5): a commissioning job's permit expires on
+    // terminal state, and its ledger reservation settles with the actual
+    // GPU seconds. The journal entry carries the permit id; ordinary
+    // jobs have none and skip this entirely. (The permit is normally
+    // already 'consumed' from submit — the expiry call is then a
+    // no-op — but the settle must still run: the reservation is held
+    // until this terminal state.)
+    if (entry?.commissioningPermitId) {
+      expireCommissioningPermit(this.apiState, entry.commissioningPermitId, this.now());
+      if (this.nexora?.ledger) {
+        this.nexora.ledger.settle({
+          jobId: entry.jobId,
+          secondsUsed: job.cost?.providerReportedSeconds ?? null,
+        });
+      }
+    }
     if (job.status === 'cancelled') {
       this._releaseHeadroom(x.executionId);
       if (entry && entry.state !== 'failed') {

@@ -27,6 +27,14 @@
 import fs from 'node:fs';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
+import {
+  verifyStrictFile,
+  resolveGroupGid,
+  resolveUserUid,
+} from './strict-file.js';
+
+export { resolveUserUid };
+
 export const ACTIVATION_CONFIG_PATH = '/etc/nova-api/activation.conf';
 export const ACTIVATION_AUDIT_LOG_PATH = '/var/lib/nova-api/activation-audit.log';
 
@@ -111,6 +119,104 @@ export function readActivationConfig(filePath = ACTIVATION_CONFIG_PATH) {
     throw new Error(`activation config ${filePath} unreadable: ${err?.message ?? err}`);
   }
   return parseActivationConfigText(text, filePath);
+}
+
+// Read the activation config file WITH its SHA-256 (Kaggle design v13,
+// §3.3): the startup-loaded config's hash is recorded for
+// observability. The read uses the §3.3 strict-open rule (expected
+// owner/group/mode/parent — production defaults, overridable per call);
+// a missing file means both flags false and a null hash (no baseline
+// to compare); any other strict failure or a malformed file is a
+// startup failure (fail closed).
+export function readActivationConfigWithHash(filePath = ACTIVATION_CONFIG_PATH, expected = {}) {
+  const read = verifyStrictFile(filePath, {
+    expectedOwnerUid: expected.ownerUid ?? 0,
+    expectedGroupGid: expected.groupGid ?? resolveGroupGid('nova-api'),
+    expectedMode: expected.mode ?? 0o440,
+    expectedParentUid: expected.parentUid ?? 0,
+  });
+  if (!read.ok) {
+    if (read.reason === 'missing') {
+      console.error(`[activation] ${filePath} not found — both activation flags default false`);
+      return {
+        flags: { publicProductionActivated: false, personalProductionActivated: false },
+        sha256: null,
+      };
+    }
+    throw new Error(`activation config ${filePath} failed strict verification (${read.reason})`);
+  }
+  return { flags: parseActivationConfigText(read.text, filePath), sha256: read.sha256 };
+}
+
+// resolveUserUid lives in ./strict-file.js (re-exported above for
+// existing importers).
+
+// Strict activation-config verification (Kaggle design v13, §3.3):
+// the file is re-verified at every acceptance, not only at startup, and
+// ANY failure sets activation false until a controlled restart (the
+// caller latches the failure — this function only reports it). The
+// verification uses the shared §3.3 strict-open reader (parent-dir
+// lstat, O_NOFOLLOW|O_CLOEXEC open, fstat on the fd: regular, nlink 1,
+// uid 0, gid `nova-api`, mode 0440 — the owner-confirmed 27 Nov 2026
+// rule, superseding the Rev 4.8 0600/`nova-api` rule). It reads + parses
+// from the same descriptor.
+//   - There is NO SHA-256 comparison against the startup-loaded config:
+//     that comparison breaks legitimate operator edits (a changed file
+//     is re-verified and loaded through the controlled restart, not
+//     refused as tampered). Instead the per-acceptance read verifies
+//     validity and compares the parsed `personalProductionActivated`
+//     with the startup-loaded value (`expectedFlags`); any difference,
+//     in either direction, is `activation-config-changed`.
+//   - A missing file is fine only when there was no startup baseline
+//     (the file never existed — flags false); a deleted-after-start
+//     file is `missing`. A file that appeared after a missing-at-startup
+//     baseline is `appeared-after-start`.
+// Returns { ok: true, flags, sha256 } or { ok: false, reason } where
+// reason is one of 'missing' | 'appeared-after-start' | 'symlink' |
+// 'unreadable' | 'not-regular' | 'hardlink' | 'wrong-owner' |
+// 'wrong-group' | 'wrong-mode' | 'parent-symlink' | 'parent-not-root' |
+// 'parent-writable' | 'malformed' | 'activation-config-changed'.
+// Never throws for file problems (only a programming error throws).
+export function verifyActivationConfigFile(filePath, {
+  expectedFlags = null,
+  expectedOwnerUid = 0,
+  expectedGroupGid = resolveGroupGid('nova-api'),
+  expectedMode = 0o440,
+  expectedParentUid = 0,
+} = {}) {
+  const read = verifyStrictFile(filePath, {
+    expectedOwnerUid,
+    expectedGroupGid,
+    expectedMode,
+    expectedParentUid,
+  });
+  if (!read.ok) {
+    if (read.reason === 'missing') {
+      // Missing now: fine only when there was no startup baseline (the
+      // file never existed); a deleted-after-start file is a failure.
+      return expectedFlags === null
+        ? { ok: true, flags: { publicProductionActivated: false, personalProductionActivated: false }, sha256: null }
+        : { ok: false, reason: 'missing' };
+    }
+    return { ok: false, reason: read.reason };
+  }
+  if (expectedFlags === null) {
+    // A file appeared after a missing-at-startup baseline: the
+    // startup-loaded config (both flags false) is no longer what is
+    // on disk. The flags stay false either way, but the change is
+    // reported so the caller latches it.
+    return { ok: false, reason: 'appeared-after-start' };
+  }
+  let flags;
+  try {
+    flags = parseActivationConfigText(read.text, filePath);
+  } catch {
+    return { ok: false, reason: 'malformed' };
+  }
+  if (flags.personalProductionActivated !== expectedFlags.personalProductionActivated) {
+    return { ok: false, reason: 'activation-config-changed' };
+  }
+  return { ok: true, flags, sha256: read.sha256 };
 }
 
 // Parse the Kaggle experimental floor (hours/week). Default 5 (§11/§12).
@@ -434,6 +540,11 @@ export function computeAuthorisation(inputs = {}) {
     personalProductionAuthorised: personalAuthorised,
     ...(personalAuthorised ? {} : { personalReason }),
     personalProductionActivated: flags.personalProductionActivated === true,
+    // Kaggle design v4 §3.5: the NEXORA client refuses submits while
+    // commissioning is active (T-N23) — the capacity body carries the
+    // live-permit state so the client can see it. False unless a live
+    // commissioning permit exists.
+    commissioning_active: inputs.commissioningActive === true,
     personalTokenId: inputs.personalTokenId ?? null,
     killSwitchEngaged,
     queueDepth,

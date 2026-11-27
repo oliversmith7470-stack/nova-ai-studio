@@ -45,6 +45,7 @@ import {
   seedJobForSubmit,
   canonicalJobId,
 } from '../src/api-server/test/support.mjs';
+import { CHECKPOINT_SHA256 } from '../src/phase6/resource-profiles.js';
 
 const TEST_SIGNING_SECRET = 'test-signing-secret-not-a-real-secret';
 const TEST_OWNER_TOKEN_ID = 'owner-token-v1';
@@ -69,6 +70,10 @@ async function awaitPastStartSecond() {
 function writeActivationConf(dir, text) {
   const p = path.join(dir, 'activation.conf');
   fs.writeFileSync(p, text, 'utf8');
+  // Kaggle design v13 §3.3: the strict re-verification requires mode
+  // 0440 and the expected owner/group — a temp conf left at the 0644
+  // default would latch activation invalid on the first capacity read.
+  fs.chmodSync(p, 0o440);
   return p;
 }
 
@@ -682,6 +687,15 @@ test('(u6) production mode without a signing secret fails at startup', async (t)
     secret: 'test-secret',
     dataDir: dir,
     activationConfigPath: confPath,
+    // v13 §3.3: the conf read precedes the signing-secret check, so
+    // the test-owned file needs its expected values or the wrong error
+    // throws first.
+    fileAccess: {
+      ownerUid: process.getuid(),
+      groupGid: process.getgid(),
+      mode: 0o440,
+      parentUid: process.getuid(),
+    },
     d1Client: { d1Apply: async () => ({}), d1Read: async () => null },
   }), /NOVA_SIGNING_SECRET is required in production mode/);
 });
@@ -694,6 +708,12 @@ test('(u6) malformed activation config fails at startup', async (t) => {
     secret: 'test-secret',
     dataDir: dir,
     activationConfigPath: confPath,
+    fileAccess: {
+      ownerUid: process.getuid(),
+      groupGid: process.getgid(),
+      mode: 0o440,
+      parentUid: process.getuid(),
+    },
     executor: null,
     d1Client: { d1Apply: async () => ({}), d1Read: async () => null },
   }), /must be exactly "true" or "false"/);
@@ -723,12 +743,34 @@ function personalApi(t, { personalFlag = true, seedHeartbeat = true } = {}) {
     mode: 'production',
     executor: false,
     activationConfigPath: confPath,
+    // Kaggle design v13 §3.3: the strict re-verification expects the
+    // conf 0440, owned by the test process's uid/gid, in a parent dir
+    // owned by the test process — the temp conf is written that way.
+    fileAccess: {
+      ownerUid: process.getuid(),
+      groupGid: process.getgid(),
+      mode: 0o440,
+      parentUid: process.getuid(),
+    },
     signingSecret: TEST_SIGNING_SECRET,
     ownerTokenId: TEST_OWNER_TOKEN_ID,
     kaggleCredentialPresent: true,
     personalExecutor: 'kaggle-t4',
     seedHeartbeat,
     storage,
+    // Kaggle design v13 §3.4: EVERY personal job needs a licence
+    // determination for the run-10 checkpoint — the helper writes one
+    // into a temp file so personal submits are not licence-refused.
+    licenceDeterminationPath: path.join(dir, 'licence-determination.json'),
+  }).then((ctx) => {
+    ctx.api.setLicenceDetermination({
+      kind: 'owner-determination',
+      licenceTextSha256: 'a'.repeat(64),
+      checkpointSha256: CHECKPOINT_SHA256,
+      evidenceRef: 'test-evidence',
+      determinedBy: 'test-operator',
+    });
+    return ctx;
   });
 }
 
@@ -846,14 +888,20 @@ test('(u7) personal submit with an explicit purpose is accepted (202) and the jo
   }
 });
 
-test('(u7) personal submit while the personal flag is off is refused 503 no-capacity (flag revalidated at acceptance)', async (t) => {
+test('(u7) personal submit while the personal flag is off is refused 503 activation-false (flag revalidated at acceptance)', async (t) => {
+  // Kaggle design v13 §4 step 6 + F-6 / T-V40: an ordinary personal
+  // submit with the personal flag off is refused `activation-false` at
+  // the activation step — the pre-v13 `no-capacity` was the old
+  // authorisation-check refusal, superseded by the v13 acceptance
+  // order (a live permit authorises a commissioning job in place of
+  // the flag instead; see T-V40).
   const { api, d1, cleanup } = await personalApi(t, { personalFlag: false });
   try {
     const body = personalBody('m2p-flag-off');
     seedJobForSubmit(d1, body);
     const r = await api.dispatch.submitExecutions(body);
     assert.equal(r.status, 503);
-    assert.equal(r.body.error, 'no-capacity');
+    assert.equal(r.body.error, 'activation-false');
   } finally {
     await cleanup();
   }

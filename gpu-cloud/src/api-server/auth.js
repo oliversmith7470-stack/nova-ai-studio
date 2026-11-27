@@ -234,7 +234,7 @@ export function verifyWorkerAuth(req, method, path, bodyText, auth, opts = {}) {
   // request can never burn a nonce; two concurrent consumers of the
   // same nonce admit exactly one.
   const expiryMs = (ts + NONCE_VALIDITY_SECONDS) * 1000;
-  if (!nonceStore.consume(nonce, expiryMs)) return { ok: false, step: 5 };
+  if (!nonceStore.consume('worker', nonce, expiryMs)) return { ok: false, step: 5 };
 
   return { ok: true };
 }

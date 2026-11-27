@@ -12,6 +12,23 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
+// Write the harness default activation conf (both flags false) into the
+// test's temp dir: 0440, owned by the test process, in a 0755 parent the
+// test process owns — exactly what the §3.3 strict reader expects for
+// the default fileAccess bundle below. The parent mode is set
+// explicitly: mkdtemp gives the temp dir 0700, but a plain mkdir under
+// umask 0007 would be 0770 (group-writable) and fail the read as
+// `parent-writable`.
+function writeDefaultActivationConf(dir) {
+  const confDir = path.join(dir, 'conf');
+  fs.mkdirSync(confDir, { recursive: true });
+  fs.chmodSync(confDir, 0o755);
+  const confPath = path.join(confDir, 'activation.conf');
+  fs.writeFileSync(confPath, 'NOVA_PUBLIC_PRODUCTION_ACTIVATED=false\nNOVA_PERSONAL_PRODUCTION_ACTIVATED=false\n');
+  fs.chmodSync(confPath, 0o440);
+  return confPath;
+}
+
 // Deterministic canonical job ID for a test label, in the Worker's
 // `nova-job-<uuid>` shape (the API process rejects anything else).
 export function canonicalJobId(label) {
@@ -355,7 +372,54 @@ export async function makeApi(overrides = {}) {
     // personal-path tests. Undefined falls back to the server defaults
     // (flags file absent -> both false; no signing secret; no owner
     // token id; no Kaggle credential; no personal executor).
-    activationConfigPath: overrides.activationConfigPath,
+    // Kaggle design v13 §3.3: when the caller passes no conf, the
+    // harness writes its OWN temp conf (both flags false, 0440,
+    // test-owned parent) instead of reading the production
+    // /etc/nova-api/activation.conf. The production file is host state:
+    // a missing /etc/nova-api fails the strict read as `unreadable`,
+    // and a rebuilt host's root:nova-api file fails it as `wrong-group`
+    // against the test process's uid/gid — either way every makeApi
+    // caller without an explicit conf throws at construction, and in
+    // gateway-non-interference the throw lands after the e2e stub
+    // server listens but before its try/finally, leaking the server and
+    // stalling the whole suite (603 s observed). Tests that need a
+    // specific conf pass activationConfigPath explicitly, as before.
+    activationConfigPath: overrides.activationConfigPath ?? writeDefaultActivationConf(dir),
+    // Kaggle design v13 §3.3: the strict re-verification overrides
+    // (expected owner uid / mode for the temp conf). The default expects
+    // a test-owned file (the test process's uid/gid, mode 0440, parent
+    // owned by the test process) — which is what
+    // writeDefaultActivationConf writes, and what callers that pass an
+    // explicit activationConfigPath write themselves.
+    activationConfigOwnerUid: overrides.activationConfigOwnerUid,
+    activationConfigMode: overrides.activationConfigMode,
+    activationConfigGroupGid: overrides.activationConfigGroupGid,
+    activationConfigParentUid: overrides.activationConfigParentUid,
+    fileAccess: overrides.fileAccess ?? {
+      ownerUid: process.getuid(),
+      groupGid: process.getgid(),
+      mode: 0o440,
+      parentUid: process.getuid(),
+    },
+    // Kaggle design v13: file-based permit (§3.5) + licence record
+    // (§3.4) paths and the API event log (§5.5). Undefined falls back
+    // to the production paths.
+    commissioningPermitPath: overrides.commissioningPermitPath,
+    licenceDeterminationPath: overrides.licenceDeterminationPath,
+    apiEventLogPath: overrides.apiEventLogPath,
+    stagingDir: overrides.stagingDir,
+    // Kaggle design v4: NEXORA per-client credentials + ledger +
+    // staging passthroughs. Undefined falls back to the server
+    // defaults (no NEXORA secrets -> NEXORA routes fail closed;
+    // cap 5 h; budget 0.5 h; no staging URL -> staging-unavailable).
+    novaApiSecretNexora: overrides.novaApiSecretNexora,
+    novaApiSecretNexoraPrevious: overrides.novaApiSecretNexoraPrevious,
+    novaSigningSecretNexora: overrides.novaSigningSecretNexora,
+    novaSigningSecretNexoraPrevious: overrides.novaSigningSecretNexoraPrevious,
+    nexoraWeeklyCapHours: overrides.nexoraWeeklyCapHours,
+    nexoraJobBudgetHours: overrides.nexoraJobBudgetHours,
+    nexoraStagingBaseUrl: overrides.nexoraStagingBaseUrl,
+    stagingFetch: overrides.stagingFetch,
     // Rev 4.8 §8: production mode requires a signing secret; the harness
     // supplies a test-only one by default so production-mode harness
     // servers construct (tests that exercise the missing-secret startup

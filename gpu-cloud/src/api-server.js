@@ -34,7 +34,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 
 import { GpuManager } from './gpu-manager.js';
 import { PROVIDER_DEFINITIONS } from './providers.js';
@@ -61,13 +61,50 @@ import { createDirectGeminiAdapter } from './direct-gemini.js';
 import {
   ACTIVATION_CONFIG_PATH,
   ACTIVATION_AUDIT_LOG_PATH,
-  readActivationConfig,
+  readActivationConfigWithHash,
+  verifyActivationConfigFile,
   parseKaggleFloorHours,
   appendActivationAuditLog,
   computeAuthorisation,
   signCapacityResponse,
   storageHealth,
 } from './api-server/activation.js';
+import { resolveGroupGid } from './api-server/strict-file.js';
+// Kaggle design v4 (NEXORA side): per-client NEXORA auth + signed
+// responses, the NEXORA attestation registry, the per-origin hours
+// ledger, commissioning permits, licence determinations, and the
+// mirrored halt. The NEXORA attestation registry is a DIFFERENT thing
+// from the round-2 Worker-side attestation.js (server-generated,
+// binds ownerTokenId/purpose/jobId) — do not conflate them.
+import {
+  verifyNexoraAuth,
+  nexoraSigningHeaders,
+  signNexoraResponse,
+  freshNexoraNonce,
+  nowIso,
+  NEXORA_CLIENT_ID,
+  NEXORA_KEY_ID,
+  isNexoraJobId,
+  isWorkerJobId,
+} from './api-server/nexora-auth.js';
+import {
+  issueAttestation,
+  revokeAttestation,
+  createNexoraAttestationVerifier,
+} from './api-server/nexora-attestation.js';
+import {
+  PerOriginLedger,
+  DEFAULT_NEXORA_CAP_HOURS,
+  DEFAULT_JOB_BUDGET_HOURS,
+} from './api-server/per-origin-ledger.js';
+import {
+  createCommissioningPermit,
+  hasLiveCommissioningPermit,
+  DEFAULT_PERMIT_PATH,
+} from './api-server/commissioning.js';
+import { setLicenceDetermination, DEFAULT_LICENCE_PATH } from './api-server/licence.js';
+import { setNexoraHalt, recordRevisitDecision, isNexoraHalted } from './api-server/nexora-halt.js';
+import { StagingStore, DEFAULT_STAGING_DIR, MAX_STAGE_FILE_BYTES } from './api-server/staging-store.js';
 import { HoursTracker, weekStartMs } from './hours.js';
 import { isEngaged } from './kill-switch.js';
 import { checkRunnerHeartbeat } from './api-server/runner-heartbeat.js';
@@ -108,11 +145,16 @@ export function routeInventory() {
   // shipped code (this table is built from the route table below).
   return [
     { method: 'GET', pattern: '/internal/health', auth: 'API-secret + HMAC', middleware: 'HMAC verify, 5 s Worker timeout applies client-side' },
-    { method: 'POST', pattern: '/internal/submit', auth: 'API-secret + HMAC', middleware: 'HMAC verify, 256 KB body limit, 10 s Worker timeout applies client-side' },
+    { method: 'POST', pattern: '/internal/submit', auth: 'API-secret + HMAC, or NEXORA auth (X-NEXORA-Key-Id: nexora-v1) for a NEXORA-origin submit', middleware: 'HMAC verify, 256 KB body limit, 10 s Worker timeout applies client-side' },
     { method: 'GET', pattern: '/internal/status', auth: 'API-secret + HMAC', middleware: 'HMAC verify (empty body), 5 s Worker timeout applies client-side' },
     { method: 'GET', pattern: '/internal/download', auth: 'API-secret + HMAC', middleware: 'HMAC verify (empty body), 30 s idle timeout applies client-side' },
     { method: 'POST', pattern: '/internal/cancel', auth: 'API-secret + HMAC', middleware: 'HMAC verify, 256 KB body limit, 5 s Worker timeout applies client-side' },
-    { method: 'GET', pattern: '/internal/capacity', auth: 'API-secret + HMAC', middleware: 'HMAC verify (empty body), audience + requestNonce query params, signed response, 5 s Worker timeout applies client-side' },
+    { method: 'GET', pattern: '/internal/capacity', auth: 'API-secret + HMAC, or NEXORA auth (X-NEXORA-Key-Id: nexora-v1) for a NEXORA-form signed response', middleware: 'HMAC verify (empty body), audience + requestNonce query params (Worker form) or NEXORA request nonce header (NEXORA form), signed response, 5 s Worker timeout applies client-side' },
+    { method: 'POST', pattern: '/internal/attest', auth: 'NEXORA auth (X-NEXORA-Key-Id: nexora-v1) only', middleware: 'NEXORA HMAC verify, 256 KB body limit; issues a per-session attestation (§5.3)' },
+    { method: 'POST', pattern: '/internal/revoke', auth: 'NEXORA auth (X-NEXORA-Key-Id: nexora-v1) only', middleware: 'NEXORA HMAC verify, 256 KB body limit; revokes one attestation (§5.3)' },
+    { method: 'GET', pattern: '/internal/jobs/<jobId>', auth: 'NEXORA auth (X-NEXORA-Key-Id: nexora-v1) only', middleware: 'NEXORA HMAC verify (empty body); 404 { found: false } when the job was never submitted (§5.8)' },
+    { method: 'GET', pattern: '/internal/job?jobId=&hash=', auth: 'API-secret + HMAC, or NEXORA auth (X-NEXORA-Key-Id: nexora-v1)', middleware: 'HMAC verify (empty body); needs no attestation; outside the caller\'s namespace → 404 { found: false }; found → 200 { found, state, hash_match } (§5.8)' },
+    { method: 'POST', pattern: '/internal/stage?jobId=', auth: 'API-secret + HMAC, or NEXORA auth (X-NEXORA-Key-Id: nexora-v1)', middleware: 'HMAC verify over the raw file bytes (signed path includes the query string); Content-Length checked before reading, 10 MB cap, X-Sha256 + X-Size verified; refused for a halted client, an origin-paused origin, or (nexora-v1) activation false, and for the worker key without a live permit (§5.7)' },
   ];
 }
 
@@ -272,7 +314,7 @@ export function isKaggleCredentialPresent({ env = process.env, home = os.homedir
 // those flags, and credential presence is the only authenticated signal
 // available at this layer; the five §6 status concepts (S1) remain a
 // separate design change and are NOT claimed here.
-export function createPersonalExecutor({ personalExecutorId = '', kaggleCredentialPresent = null, ownerTokenConfigured = null, hoursTracker = null, registry = null, packageDir = null, attestationVerifier = null } = {}) {
+export function createPersonalExecutor({ personalExecutorId = '', kaggleCredentialPresent = null, ownerTokenConfigured = null, hoursTracker = null, registry = null, packageDir = null, attestationVerifier = null, nexoraAttestationVerifier = null } = {}) {
   const id = typeof personalExecutorId === 'string' ? personalExecutorId.trim() : '';
   if (id === '') return null;
   if (id !== KAGGLE_PROVIDER_ID) {
@@ -297,7 +339,7 @@ export function createPersonalExecutor({ personalExecutorId = '', kaggleCredenti
     console.error('[api-server] personal executor unavailable: no packageDir for the Kaggle executor');
     return null;
   }
-  const executor = new LtxKaggleExecutor({ packageDir, hoursTracker, registry, attestationVerifier });
+  const executor = new LtxKaggleExecutor({ packageDir, hoursTracker, registry, attestationVerifier, nexoraAttestationVerifier });
   // The personal executor is the REAL LTX executor (engines/ltx-executor.js):
   // it builds the Run 10 notebook (121f, 1024x576, 24 fps, 8 steps) with
   // the Kaggle Model mounts, NOT the generic KaggleExecutor's Wan default.
@@ -361,7 +403,66 @@ export function createApiServer(config = {}) {
   // no Worker env var, and no request parameter that can read or change
   // these flags; a flag changes only by the §4.1 operator procedure.
   const activationConfigPath = config.activationConfigPath ?? ACTIVATION_CONFIG_PATH;
-  const activationFlags = readActivationConfig(activationConfigPath);
+  // Kaggle design v13 §3.3: the §3.3 files are `root:nova-api` 0440.
+  // Expected values for the strict-open reader (production defaults);
+  // tests override them via config.fileAccess (or the individual
+  // activationConfig* keys) to match the temp files they own.
+  const fileAccess = {
+    ownerUid: config.fileAccess?.ownerUid ?? config.activationConfigOwnerUid ?? 0,
+    groupGid: config.fileAccess?.groupGid ?? config.activationConfigGroupGid ?? resolveGroupGid('nova-api'),
+    mode: config.fileAccess?.mode ?? config.activationConfigMode ?? 0o440,
+    parentUid: config.fileAccess?.parentUid ?? config.activationConfigParentUid ?? 0,
+  };
+  // The startup-loaded flags (Kaggle design v13 §3.3): the per-acceptance
+  // re-verification compares the parsed `personalProductionActivated`
+  // against THESE values — there is no SHA-256 comparison against the
+  // startup-loaded config. readActivationConfigWithHash verifies the
+  // strict rule at startup too (a wrong-mode / wrong-owner file is a
+  // startup failure, not a silent default).
+  const { flags: activationFlags, sha256: startupActivationSha256 } = readActivationConfigWithHash(
+    activationConfigPath,
+    fileAccess,
+  );
+  void startupActivationSha256;
+  let activationInvalid = false;
+  let activationInvalidReason = null;
+  function isActivationValid() {
+    if (activationInvalid) return false;
+    const check = verifyActivationConfigFile(activationConfigPath, {
+      expectedFlags: activationFlags,
+      expectedOwnerUid: fileAccess.ownerUid,
+      expectedGroupGid: fileAccess.groupGid,
+      expectedMode: fileAccess.mode,
+      expectedParentUid: fileAccess.parentUid,
+    });
+    if (!check.ok) {
+      activationInvalid = true;
+      // The capacity reason vocabulary (§3.3): a value change is
+      // `activation-config-changed`; every other verification failure
+      // is `activation-config-invalid`.
+      activationInvalidReason = check.reason === 'activation-config-changed'
+        ? 'activation-config-changed'
+        : 'activation-config-invalid';
+      console.error(`[activation] activation config re-verification failed (${check.reason}) — activation latched invalid until restart`);
+      return false;
+    }
+    return true;
+  }
+  // -- Kaggle design v4: NEXORA per-client credentials ------------------
+  // The NEXORA client authenticates with its OWN transport + signing
+  // secrets (NOVA_API_SECRET_NEXORA / NOVA_SIGNING_SECRET_NEXORA),
+  // separate from the Worker secrets. A process without them
+  // authenticates no NEXORA request (verifyNexoraAuth step 1) — the
+  // NEXORA routes fail closed, never open. Rotation overlap via the
+  // _PREVIOUS variants, same rule as the Worker secrets.
+  const novaApiSecretNexora = config.novaApiSecretNexora ?? process.env.NOVA_API_SECRET_NEXORA ?? '';
+  const novaApiSecretNexoraPrevious = config.novaApiSecretNexoraPrevious ?? process.env.NOVA_API_SECRET_NEXORA_PREVIOUS ?? '';
+  const novaSigningSecretNexora = config.novaSigningSecretNexora ?? process.env.NOVA_SIGNING_SECRET_NEXORA ?? '';
+  const novaSigningSecretNexoraPrevious = config.novaSigningSecretNexoraPrevious ?? process.env.NOVA_SIGNING_SECRET_NEXORA_PREVIOUS ?? '';
+  // NEXORA weekly cap (K_X, §6.2, default 5 h) and per-job budget (J,
+  // default 0.5 h).
+  const nexoraWeeklyCapHours = Number(config.nexoraWeeklyCapHours ?? process.env.NOVA_NEXORA_WEEKLY_CAP_HOURS ?? DEFAULT_NEXORA_CAP_HOURS);
+  const nexoraJobBudgetHours = Number(config.nexoraJobBudgetHours ?? process.env.NOVA_NEXORA_JOB_BUDGET_HOURS ?? DEFAULT_JOB_BUDGET_HOURS);
   // Response signing secret (key separation, §8): distinct from the
   // transport secret NOVA_API_SECRET. A production-mode process without
   // it cannot serve a signed capacity response and fails at startup;
@@ -430,7 +531,21 @@ export function createApiServer(config = {}) {
     ? createDirectGeminiAdapter({ apiKey: config.geminiApiKey ?? process.env.GEMINI_API_KEY ?? '' })
     : null;
 
-  const apiState = new ApiStateStore(path.join(dataDir, 'api-state.json'));
+  const apiState = new ApiStateStore(path.join(dataDir, 'api-state.json'), {
+    // Kaggle design v13 §5.5: the API's own event log (default
+    // /var/lib/nova-api/api-events.log; injectable for tests).
+    eventLogPath: config.apiEventLogPath,
+  });
+  // Kaggle design v13 §3.4/§3.5: the file-based licence record +
+  // commissioning permit live outside the state JSON. The licence and
+  // permit modules read their paths + the strict-file expectations
+  // off the store instance (not the JSON document — these are
+  // process configuration, not persisted state).
+  apiState.fileAccess = fileAccess;
+  apiState.licenceDeterminationPath = config.licenceDeterminationPath
+    ?? DEFAULT_LICENCE_PATH;
+  apiState.commissioningPermitPath = config.commissioningPermitPath
+    ?? DEFAULT_PERMIT_PATH;
 
   // Rev 4.8 §8 nonce store (reviewer correction): the API process's own
   // local SQLite nonce store at <dataDir>/nonces.db — /var/lib/nova-api/
@@ -479,6 +594,35 @@ export function createApiServer(config = {}) {
     }
   }
   const hoursTracker = new HoursTracker({ store: manager.store, budgets: hoursBudgets });
+
+  // Kaggle design v4 §6.2: the per-origin hours ledger — the sole
+  // authority for NEXORA acceptance arithmetic. C_N is read live from
+  // the HoursTracker (the tracker's kaggle-t4 weekly usage IS the
+  // NOVA-origin consumed hours); R_N is structurally 0 in v4 (the
+  // Worker path creates no hour reservations — the floor check's R_N
+  // term is implemented and tested via direct seeding, but stays 0 in
+  // production until the Worker path writes reservations). The ledger
+  // lives in the manager store under the namespaced key `nexoraLedger`.
+  const nexoraLedger = new PerOriginLedger({
+    store: manager.store,
+    novaConsumedHours: () => {
+      const u = hoursTracker.usage('kaggle-t4');
+      return u.tracked ? u.hoursUsed : 0;
+    },
+    capHours: nexoraWeeklyCapHours,
+    jobBudgetHours: nexoraJobBudgetHours,
+    now,
+  });
+
+  // Staging store (Kaggle design v13 §5.7): the PUSH model replaces
+  // the v4 loopback fetch — the NEXORA client pushes each keyframe to
+  // POST /internal/stage BEFORE submitting, and the submit re-verifies
+  // the staged hashes. Files are stored by content hash, never by
+  // client name; unreferenced files are swept after 1 h by the
+  // interval sweep below. Injectable via config.stagingDir for tests.
+  const stagingStore = new StagingStore({
+    dir: config.stagingDir ?? process.env.NOVA_STAGING_DIR ?? DEFAULT_STAGING_DIR,
+  });
 
   // Executor registration factory (Rev 4.9 §4, Rev 4.8 §6): production
   // executor registration is explicit startup configuration, separate from
@@ -544,6 +688,12 @@ export function createApiServer(config = {}) {
         signingSecrets: [signingSecret, signingSecretPrevious],
         apiState,
       }),
+      // Kaggle design v4: the executor's third lawful marker — a
+      // NEXORA-origin personal job verifies through the NEXORA
+      // attestation registry (existence + client/session binding +
+      // not-revoked + current version; NOT the 4 h expiry — acceptance
+      // is the freshness gate). Null = fail closed.
+      nexoraAttestationVerifier: createNexoraAttestationVerifier(apiState),
     });
     if (personal) {
       manager.registerProvider(personal.providerDef);
@@ -568,6 +718,24 @@ export function createApiServer(config = {}) {
     // server-side with the API host's signing secret (current only —
     // rotation's previous secret verifies, never signs).
     attestationSigningSecret: signingSecret,
+    // Kaggle design v4: the NEXORA wiring — the ledger (acceptance
+    // arithmetic), the per-job hour budget, and the activation
+    // re-verification latch (the commissioning predicate refuses when
+    // the config is invalid). v13: the activation step needs the latch
+    // reason as well (activation-false vs activation-config-invalid vs
+    // activation-config-changed, §4 step 6 / F-6) and the
+    // startup-loaded flags. v13 §5.7: the staging store (push model —
+    // the v4 loopback fetch is gone); the submit re-verifies staged
+    // hashes from it before BEGIN IMMEDIATE.
+    nexora: {
+      ledger: nexoraLedger,
+      jobBudgetHours: nexoraJobBudgetHours,
+      isActivationValid: () => !activationInvalid && isActivationValid(),
+      activationInvalidReason: () => activationInvalidReason,
+      activationFlags: () => ({ ...activationFlags }),
+    },
+    // Kaggle design v13 §5.7: the staging store (push model).
+    stagingStore,
     ackWindowMs: config.ackWindowMs ?? ACK_WINDOW_MS,
     ackPollMs: config.ackPollMs ?? 1000,
     validateOutput: config.validateOutput ?? validateMp4,
@@ -583,6 +751,17 @@ export function createApiServer(config = {}) {
   // an internal-error 500 (the Worker treats it as api-unreachable).
   const runnerHealthPath = config.runnerHealthPath ?? path.join(dataDir, 'runner-health.json');
   async function computeCapacity({ audience, requestNonce }) {
+    // Kaggle design v4 §3 D-2.6: the activation config is re-verified
+    // on EVERY capacity read (capacity route AND submit authorisation
+    // check) — symlink, wrong owner, wrong mode, changed content, or a
+    // file deleted after start latches activationInvalid permanently
+    // until restart, and the flags read here are forced false. A
+    // process whose config never existed (no startup baseline) verifies
+    // clean while the file stays missing.
+    const activationValid = isActivationValid();
+    const effectiveFlags = activationValid
+      ? activationFlags
+      : { publicProductionActivated: false, personalProductionActivated: false };
     const capacity = await manager.storageCapacity();
     const reserved = dispatch._reservedHeadroomBytes();
     // Storage health (§9 F): the writability check targets the actual
@@ -666,7 +845,7 @@ export function createApiServer(config = {}) {
 
     return computeAuthorisation({
       mode,
-      flags: activationFlags,
+      flags: effectiveFlags,
       killSwitchEngaged: isEngaged(manager.store.state),
       storage,
       productionExecutorIds: [...productionExecutors.keys()],
@@ -687,6 +866,10 @@ export function createApiServer(config = {}) {
       ceilingUsd: 0,
       committedUsd: 0,
       paidProductionExecutorIds: [],
+      // Kaggle design v4 §3.5: the NEXORA client refuses submits while
+      // commissioning is active — the capacity body carries the flag so
+      // the client can see it (T-N23 on the NEXORA side).
+      commissioningActive: hasLiveCommissioningPermit(apiState),
     });
   }
   // Submit-time authorisation revalidation (§6): the dispatcher asks
@@ -746,6 +929,28 @@ export function createApiServer(config = {}) {
     return Buffer.concat(chunks).toString('utf8');
   }
 
+  // Kaggle design v13 §5.7: the staging-route body reader. Streams the
+  // raw file bytes, hashing WHILE receiving, and aborts at 10 MB
+  // (STAGE_TOO_LARGE → 413). Returns { bytes, sha256 }. The route
+  // checks Content-Length before calling this, so a client that
+  // declares > 10 MB is refused without reading anything.
+  async function readStageBody(req) {
+    const chunks = [];
+    let total = 0;
+    const hash = createHash('sha256');
+    for await (const chunk of req) {
+      total += chunk.length;
+      if (total > MAX_STAGE_FILE_BYTES) {
+        const err = new Error('staged file too large');
+        err.code = 'STAGE_TOO_LARGE';
+        throw err;
+      }
+      hash.update(chunk);
+      chunks.push(chunk);
+    }
+    return { bytes: Buffer.concat(chunks), sha256: hash.digest('hex') };
+  }
+
   function send(res, status, obj) {
     const text = JSON.stringify(obj);
     res.writeHead(status, {
@@ -763,25 +968,164 @@ export function createApiServer(config = {}) {
     try {
       // No unauthenticated route exists on this process — every route,
       // including health-check, requires the secret + HMAC (Rev 2 §3.4).
+      // Auth branches on the request (Kaggle design v4, brief §1): a
+      // request carrying X-NEXORA-Key-Id authenticates as NEXORA
+      // (per-client secrets, canonical-request-v1, ±60 s ISO timestamp,
+      // 32-hex nonce in the shared SQLite store); every other request
+      // authenticates as the Worker (two-secret verifyWorkerAuth). A
+      // request with a NEXORA key id that fails NEXORA auth never falls
+      // through to Worker auth — it 401s here. Either failure answers
+      // 401 { error: 'unauthorised' } with no detail.
       const isGet = req.method === 'GET';
-      const bodyText = isGet ? '' : await readBody(req);
-      const auth = verifyWorkerAuth(req, req.method, pathWithQuery, bodyText, {
-        transportSecrets: [secret, secretPrevious],
-        signingSecrets: [signingSecret, signingSecretPrevious],
-        apiState,
-        nonceStore,
-      });
+      // Kaggle design v13 §5.7: the staging route carries a raw file
+      // body (up to 10 MB), not JSON. Content-Length is checked BEFORE
+      // reading — a client declaring > 10 MB is refused without the
+      // body ever being read. The bytes are then streamed with the
+      // hash computed while receiving (abort at 10 MB), and auth runs
+      // over the RAW bytes: the canonical request signs sha256Hex(body),
+      // so the design's "refused after auth before reading body" is
+      // only literally achievable if auth used the X-Sha256 header as
+      // the body hash — it does not. The observable contract is kept
+      // exactly: a halted / paused / unactivated client never gets a
+      // file staged (the refusal happens before any store write), and
+      // a body over 10 MB is never fully read.
+      const isStageRoute = req.method === 'POST' && url.pathname === '/internal/stage';
+      let bodyText = '';
+      let stageBody = null;
+      if (isStageRoute) {
+        const declared = Number(req.headers['content-length']);
+        // A declared length over 10 MB is refused without reading
+        // anything. A MISSING Content-Length (chunked upload) is
+        // allowed through to the streaming read, which aborts at
+        // 10 MB — the abort, not the pre-check, is the cap for it.
+        if (Number.isFinite(declared) && declared > MAX_STAGE_FILE_BYTES) {
+          return send(res, 413, { error: 'staging-failed', reason: 'file-too-large' });
+        }
+        if (Number.isFinite(declared) && declared < 0) {
+          return send(res, 400, { error: 'staging-failed', reason: 'missing-content-length' });
+        }
+        stageBody = await readStageBody(req);
+        bodyText = stageBody.bytes;
+      } else if (!isGet) {
+        bodyText = await readBody(req);
+      }
+      const nexoraKeyIdHeader = req.headers['x-nexora-key-id'];
+      const authBranch = typeof nexoraKeyIdHeader === 'string' && nexoraKeyIdHeader.length > 0
+        ? 'nexora'
+        : 'worker';
+      let auth;
+      if (authBranch === 'nexora') {
+        auth = verifyNexoraAuth(req, req.method, pathWithQuery, bodyText, {
+          apiSecrets: [novaApiSecretNexora, novaApiSecretNexoraPrevious],
+          signingSecrets: [novaSigningSecretNexora, novaSigningSecretNexoraPrevious],
+          apiState,
+          nonceStore,
+        });
+      } else {
+        auth = verifyWorkerAuth(req, req.method, pathWithQuery, bodyText, {
+          transportSecrets: [secret, secretPrevious],
+          signingSecrets: [signingSecret, signingSecretPrevious],
+          apiState,
+          nonceStore,
+        });
+      }
       if (!auth.ok) {
         console.error(`[api-server] auth rejected step ${auth.step} requestId=${requestId} ${req.method} ${url.pathname}`);
+        // v13 §3 D-2.3: a stale timestamp on the NEXORA branch is 401
+        // `stale-timestamp` (step 3 of verifyNexoraAuth); every other
+        // auth failure stays 401 `unauthorised` with no detail. The
+        // Worker branch keeps its own mapping.
+        if (authBranch === 'nexora' && auth.step === 3) {
+          return send(res, 401, { error: 'stale-timestamp' });
+        }
         return send(res, 401, { error: 'unauthorised' });
       }
       let body = null;
-      if (!isGet && bodyText.length > 0) {
+      if (!isStageRoute && !isGet && bodyText.length > 0) {
         try {
           body = JSON.parse(bodyText);
         } catch {
           return send(res, 400, { error: 'invalid-json' });
         }
+      }
+
+      // Kaggle design v13 §5.7: the staging push endpoint. Signed
+      // (NEXORA auth AND worker auth — both keys; the signed path is
+      // the full request-target including the query string). Refused
+      // after auth and before any store write for a halted client or
+      // an origin-paused origin; refused for nexora-v1 when activation
+      // is false; accepted for the worker key only under a live permit.
+      // X-Sha256 + X-Size headers are verified against the received
+      // bytes (hash mismatch → staging-hash-mismatch); the store then
+      // enforces image validity and the 2-file / 20 MB per-job and
+      // 100 MB per-client unreferenced bounds.
+      if (isStageRoute) {
+        const jobId = url.searchParams.get('jobId');
+        const inNamespace = authBranch === 'nexora' ? isNexoraJobId(jobId) : isWorkerJobId(jobId);
+        if (!inNamespace) {
+          return send(res, 400, { error: 'invalid-job-id' });
+        }
+        if (authBranch === 'nexora') {
+          if (isNexoraHalted(apiState)) {
+            return send(res, 503, { error: 'client-halted', reason: 'nexora-halted' });
+          }
+          if (dispatch.isOriginPaused('nexora')) {
+            return send(res, 503, { error: 'origin-paused' });
+          }
+          if (!isActivationValid()) {
+            return send(res, 503, { error: activationInvalidReason ?? 'activation-config-invalid' });
+          }
+          if (!activationFlags.personalProductionActivated) {
+            return send(res, 503, { error: 'activation-false' });
+          }
+        } else {
+          if (isEngaged(manager.store.state)) {
+            return send(res, 503, { error: 'client-halted', reason: 'kill-switch-engaged' });
+          }
+          if (dispatch.isOriginPaused('worker')) {
+            return send(res, 503, { error: 'origin-paused' });
+          }
+          if (!hasLiveCommissioningPermit(apiState)) {
+            return send(res, 503, { error: 'activation-false' });
+          }
+        }
+        const claimedSha = req.headers['x-sha256'];
+        const claimedSize = Number(req.headers['x-size']);
+        if (typeof claimedSha !== 'string' || !/^[0-9a-f]{64}$/i.test(claimedSha)) {
+          return send(res, 400, { error: 'staging-failed', reason: 'missing-sha256' });
+        }
+        if (!Number.isFinite(claimedSize) || claimedSize < 0) {
+          return send(res, 400, { error: 'staging-failed', reason: 'missing-size' });
+        }
+        if (claimedSize !== stageBody.bytes.length) {
+          return send(res, 400, { error: 'staging-failed', reason: 'size-mismatch' });
+        }
+        if (claimedSha.toLowerCase() !== stageBody.sha256) {
+          return send(res, 400, { error: 'staging-failed', reason: 'staging-hash-mismatch' });
+        }
+        const staged = stagingStore.stage({
+          jobId,
+          // The nonce-store key ids: 'nexora-v1' for the NEXORA key,
+          // 'worker' for the Worker key (auth.js consumes with 'worker').
+          keyId: authBranch === 'nexora' ? NEXORA_KEY_ID : 'worker',
+          bytes: stageBody.bytes,
+          sha256: claimedSha.toLowerCase(),
+          size: claimedSize,
+        });
+        if (!staged.ok) {
+          if (staged.reason === 'storage-unavailable') {
+            return send(res, 503, { error: 'storage-unavailable' });
+          }
+          return send(res, 400, { error: 'staging-failed', reason: staged.reason });
+        }
+        return send(res, 200, {
+          jobId,
+          sha256: staged.hash,
+          size: staged.size,
+          format: staged.format,
+          staged: true,
+          alreadyStaged: staged.alreadyStaged,
+        });
       }
 
       if (req.method === 'GET' && url.pathname === '/internal/health') {
@@ -811,10 +1155,49 @@ export function createApiServer(config = {}) {
       // The body is the §4.2 authorisation calculation over live state.
       if (req.method === 'GET' && url.pathname === '/internal/capacity') {
         const audience = url.searchParams.get('audience');
-        const requestNonce = url.searchParams.get('requestNonce');
         if (audience !== 'public' && audience !== 'personal') {
           return send(res, 400, { error: 'invalid-audience' });
         }
+        // NEXORA form (Kaggle design v4 §5.6 / brief §1): the NEXORA
+        // client sends NO requestNonce query param — the response
+        // carries the REQUEST's nonce (X-NEXORA-Nonce, already verified
+        // by verifyNexoraAuth) and an ISO timestamp, signed with the
+        // NEXORA signing secret over sha256Hex(body) + timestamp +
+        // nonce. Headers are X-NOVA-Signature / X-NOVA-Timestamp /
+        // X-NOVA-Nonce (NOT the X-NOVA-Capacity-* Worker form). The
+        // client verifies the signature, the ±5 s freshness, and the
+        // nonce echo, and refuses submits while commissioning_active.
+        if (authBranch === 'nexora') {
+          if (novaSigningSecretNexora.length === 0) {
+            return send(res, 503, { error: 'capacity-unavailable' });
+          }
+          const requestNonce = req.headers['x-nexora-nonce'] ?? '';
+          let body;
+          try {
+            body = await computeCapacity({ audience, requestNonce });
+          } catch (err) {
+            console.error(`[api-server] capacity failed requestId=${requestId}:`, err && err.message);
+            return send(res, 500, { error: 'internal-error' });
+          }
+          const capacityBodyText = JSON.stringify(body);
+          const timestamp = nowIso();
+          const signature = signNexoraResponse({
+            signingSecret: novaSigningSecretNexora,
+            bodyText: capacityBodyText,
+            timestamp,
+            nonce: requestNonce,
+          });
+          res.writeHead(200, {
+            ...SECURITY_HEADERS,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(capacityBodyText),
+            'X-NOVA-Signature': signature,
+            'X-NOVA-Timestamp': timestamp,
+            'X-NOVA-Nonce': requestNonce,
+          });
+          return res.end(capacityBodyText);
+        }
+        const requestNonce = url.searchParams.get('requestNonce');
         if (!/^[0-9a-f]{32}$/i.test(requestNonce ?? '')) {
           return send(res, 400, { error: 'invalid-request-nonce' });
         }
@@ -841,8 +1224,116 @@ export function createApiServer(config = {}) {
       }
 
       if (req.method === 'POST' && url.pathname === '/internal/submit') {
+        // NEXORA-origin submits go through submitNexora (no D1 record
+        // exists for them — the Worker path would 404); Worker submits
+        // go through submitExecutions. The branch is the auth branch,
+        // never a request field (T-V15: a NEXORA-signed request
+        // claiming origin=worker is refused by submitNexora's own
+        // origin check, and a Worker-signed request never reaches it).
+        if (authBranch === 'nexora') {
+          const out = await dispatch.submitNexora(body ?? {}, bodyText);
+          return send(res, out.status, out.body);
+        }
         const out = await dispatch.submitExecutions(body ?? {});
         return send(res, out.status, out.body);
+      }
+
+      // POST /internal/attest (Kaggle design v4 §5.3): issue a
+      // per-session NEXORA attestation. NEXORA-authenticated ONLY — a
+      // Worker-authenticated request (T-V22) or an unauthenticated one
+      // is refused 401. The client sends exactly { client_id,
+      // session_id, restriction_text_version }; any client-supplied
+      // timestamps are ignored — confirmed_at_api / expires_at_api are
+      // assigned by the API on its clock (T-V20). The response carries
+      // all six fields.
+      if (req.method === 'POST' && url.pathname === '/internal/attest') {
+        if (authBranch !== 'nexora') {
+          return send(res, 401, { error: 'unauthorised' });
+        }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          return send(res, 400, { error: 'invalid-attestation-request', reason: 'invalid-body' });
+        }
+        const issued = issueAttestation(apiState, {
+          clientId: body.client_id,
+          sessionId: body.session_id,
+          restrictionTextVersion: body.restriction_text_version,
+          nowMs: Date.now(),
+        });
+        if (!issued.ok) {
+          return send(res, 400, { error: 'invalid-attestation-request', reason: issued.reason });
+        }
+        const a = issued.attestation;
+        return send(res, 200, {
+          attestation_id: a.attestation_id,
+          client_id: a.client_id,
+          session_id: a.session_id,
+          restriction_text_version: a.restriction_text_version,
+          confirmed_at_api: a.confirmed_at_api,
+          expires_at_api: a.expires_at_api,
+        });
+      }
+
+      // POST /internal/revoke (Kaggle design v4 §5.3): revoke one
+      // attestation by id. NEXORA-authenticated ONLY. Unknown id →
+      // 404 unknown-attestation; revoking an already-revoked id is a
+      // no-op success (idempotent).
+      if (req.method === 'POST' && url.pathname === '/internal/revoke') {
+        if (authBranch !== 'nexora') {
+          return send(res, 401, { error: 'unauthorised' });
+        }
+        if (!body || typeof body.attestation_id !== 'string' || body.attestation_id.length === 0) {
+          return send(res, 400, { error: 'invalid-revoke-request', reason: 'attestation_id is required' });
+        }
+        const revoked = revokeAttestation(apiState, body.attestation_id);
+        if (!revoked.ok) {
+          return send(res, 404, { error: 'unknown-attestation' });
+        }
+        return send(res, 200, { attestation_id: body.attestation_id, revoked: true });
+      }
+
+      // GET /internal/job?jobId=&hash= (Kaggle design v13 §5.8): the
+      // reconciliation read — the form the NEXORA client uses
+      // (client.py job_state). Signed (NEXORA auth AND worker auth);
+      // needs NO attestation. Outside the caller's namespace the job
+      // is simply not found (404 { found: false }) — the caller learns
+      // nothing about the other namespace's jobs. Found → 200
+      // { found, state, hash_match }; never submitted → 404
+      // { found: false } (the client maps that to found: False).
+      // The path form /internal/jobs/<jobId> below stays working
+      // (backwards-compatible; costs nothing).
+      if (req.method === 'GET' && url.pathname === '/internal/job') {
+        const jobId = url.searchParams.get('jobId');
+        if (!jobId) {
+          return send(res, 400, { error: 'jobId is required' });
+        }
+        const inNamespace = authBranch === 'nexora' ? isNexoraJobId(jobId) : isWorkerJobId(jobId);
+        if (!inNamespace) {
+          return send(res, 404, { found: false });
+        }
+        const hash = url.searchParams.get('hash');
+        const state = dispatch.nexoraJobState(jobId, hash);
+        if (!state) {
+          return send(res, 404, { found: false });
+        }
+        return send(res, 200, state);
+      }
+
+      // GET /internal/jobs/<jobId> (Kaggle design v4 §5.8): the
+      // reconciliation read — the NEXORA client asks for a job's state
+      // after a lost submit response instead of re-submitting blindly.
+      // NEXORA-authenticated ONLY. Found → 200 with the job state +
+      // canonical_request_hash + found: true; never submitted → 404
+      // { found: false } (T-V28).
+      if (req.method === 'GET' && url.pathname.startsWith('/internal/jobs/')) {
+        if (authBranch !== 'nexora') {
+          return send(res, 401, { error: 'unauthorised' });
+        }
+        const jobId = decodeURIComponent(url.pathname.slice('/internal/jobs/'.length));
+        const state = dispatch.nexoraJobState(jobId);
+        if (!state) {
+          return send(res, 404, { found: false });
+        }
+        return send(res, 200, state);
       }
 
       if (req.method === 'GET' && url.pathname === '/internal/status') {
@@ -880,6 +1371,9 @@ export function createApiServer(config = {}) {
     } catch (err) {
       if (err && err.code === 'BODY_TOO_LARGE') {
         return send(res, 413, { error: 'body-too-large' });
+      }
+      if (err && err.code === 'STAGE_TOO_LARGE') {
+        return send(res, 413, { error: 'staging-failed', reason: 'file-too-large' });
       }
       console.error(`[api-server] ${req.method} ${url.pathname} failed requestId=${requestId}:`, err && err.message);
       if (!res.headersSent) return send(res, 500, { error: 'internal-error' });
@@ -1059,6 +1553,15 @@ export function createApiServer(config = {}) {
       sweep.runSweep({ reason: 'interval' }).catch((err) => {
         console.error('[api-server] sweep failed:', formatRejectionValue(err));
       });
+      // Kaggle design v13 §5.7: sweep unreferenced staged files after
+      // 1 h — regardless of halt / pause / activation. Best-effort,
+      // never throws (the store is synchronous and its failures are
+      // filesystem errors, not API errors).
+      try {
+        dispatch.sweepStaging();
+      } catch (err) {
+        console.error('[api-server] staging sweep failed:', formatRejectionValue(err));
+      }
     }, sweepIntervalMs);
     reconcileTimer = setInterval(() => {
       reconcile.runReconciliation({ source: 'timer' }).catch((err) => {
@@ -1098,6 +1601,10 @@ export function createApiServer(config = {}) {
       kaggleFloorHours,
       signingSecretPresent: signingSecret.length > 0,
       computeCapacity,
+      // Kaggle design v4 §3 D-2.6: whether the strict re-verification
+      // latch has tripped (activation is invalid until a controlled
+      // restart once it has).
+      isInvalid: () => activationInvalid,
       appendAuditLog: (entry) => appendActivationAuditLog({
         logPath: config.activationAuditLogPath ?? ACTIVATION_AUDIT_LOG_PATH,
         ...entry,
@@ -1112,6 +1619,10 @@ export function createApiServer(config = {}) {
     apiState,
     nonceStore,
     d1Client,
+    // Kaggle design v4 §6.2: the per-origin ledger, exposed for the
+    // operator view (T-V18/T-V24 — the ledger governs acceptance; the
+    // operator reads it, never the NEXORA local counter).
+    nexoraLedger,
     gatewayPolicy,
     authorizationStore,
     gatewayClient,
@@ -1130,6 +1641,92 @@ export function createApiServer(config = {}) {
     repairSceneSet: (jobId, args) => reconcile.repairSceneSet(jobId, args),
     runSweep: (args) => sweep.runSweep(args),
     runReconciliation: (args) => reconcile.runReconciliation(args),
+    // Kaggle design v4 operator surface (CLI-only, never HTTP): the
+    // commissioning permit (§3.5 — created by the operator, never an
+    // HTTP endpoint), the licence determination (P-9 — the licence
+    // reply permits the intended use before any rendering), the
+    // mirrored halt (T-V23 — setting halted=true also cancels queued
+    // NEXORA jobs and releases their reservations), and the orphan
+    // operations (C-1 — a reservation held past 24 h is released ONLY
+    // on confirmed terminal state or this operator confirmation).
+    createCommissioningPermit: (args) => {
+      // P-15 (§3.5): the permit-issue tool refuses while any
+      // NOVA-origin job is in orphan-check (a commissioning-origin
+      // reservation held past 24 h) — the held-at-dispatch half of
+      // the rule is enforced by the dispatcher (Phase 6: held jobs
+      // are journal states 'held-*'; dispatch.hasHeldJob('worker')
+      // covers it — see the note there).
+      const orphans = nexoraLedger.findOrphans();
+      if (orphans.some((o) => o.origin === 'commissioning')) {
+        return { ok: false, reason: 'nova-origin-orphan' };
+      }
+      if (dispatch.hasHeldJob && dispatch.hasHeldJob('worker')) {
+        return { ok: false, reason: 'nova-origin-held' };
+      }
+      return createCommissioningPermit(apiState, {
+        ...args,
+        fileAccess,
+        nowMs: now(),
+      });
+    },
+    setLicenceDetermination: (args) => setLicenceDetermination(apiState, {
+      ...args,
+      fileAccess,
+      nowMs: now(),
+    }),
+    setNexoraHalt: ({ halted, reason }) => {
+      const record = setNexoraHalt(apiState, { halted, reason, nowMs: now() });
+      if (halted) dispatch.cancelQueuedNexoraJobs();
+      // v13 §5.5: halt set/clear events go to the API event log as well
+      // as the operator log.
+      apiState.logEvent(halted ? 'nexora-halt-set' : 'nexora-halt-cleared', {
+        client_id: 'nexora-service',
+        reason: record.reason,
+      });
+      return record;
+    },
+    // Kaggle design v13 §5.4: record a revisit decision so a live halt
+    // may be cleared (T-V36). Clearing without one throws.
+    recordRevisitDecision: ({ kind, detail, recordedBy }) => recordRevisitDecision(apiState, {
+      kind,
+      detail,
+      recordedBy,
+      nowMs: now(),
+    }),
+    resolveNexoraOrphan: (jobId) => nexoraLedger.resolveOrphan(jobId),
+    // Kaggle design v13 §6.2: re-evaluate held-at-dispatch jobs
+    // (dispatch when the cause cleared) and cancel a held job
+    // (operator escape hatch — never blocked by halt/kill-switch/
+    // pause; the hold reason is the audit evidence).
+    reEvaluateHeldJobs: () => dispatch.reEvaluateHeldJobs(),
+    cancelHeldJob: (jobId, opts) => dispatch.cancelHeldJob(jobId, opts),
+    // Kaggle design v13 §6.2: operator reconciliation — record the
+    // Kaggle-side remaining hours (from `kaggle quota`) so admission
+    // can compute Q. Without a valid reconciliation every NEXORA
+    // submit is refused 'quota-unreconciled'.
+    reconcileQuota: ({ kaggleRemainingHours }) => nexoraLedger.reconcile({
+      kaggleRemainingHours,
+      nowMs: now(),
+    }),
+    // Push-step check (§6.2 v13): the dispatcher re-reads `kaggle
+    // quota` before pushing a queued job; refuses when the fresh
+    // Kaggle headroom minus the reserved hours falls below the floor.
+    checkPush: ({ kaggleRemainingHours }) => nexoraLedger.checkPush({
+      kaggleRemainingHours,
+      nowMs: now(),
+    }),
+    checkNexoraOrphans: () => {
+      const orphans = nexoraLedger.findOrphans();
+      for (const orphan of orphans) {
+        nexoraLedger.escalateOrphan(orphan.jobId);
+        apiState.logOperator('nexora-orphan-escalated', {
+          jobId: orphan.jobId,
+          heldMs: Date.now() - orphan.createdAtMs,
+          origin: orphan.origin,
+        });
+      }
+      return orphans;
+    },
   };
 }
 

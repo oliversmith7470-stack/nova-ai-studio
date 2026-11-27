@@ -74,6 +74,7 @@ export class BaseExecutor {
     stagingRootDir = null,
     packageDir,
     attestationVerifier = null,
+    nexoraAttestationVerifier = null,
   } = {}) {
     if (!providerId) throw new Error('executor requires providerId');
     if (!packageDir) throw new Error('executor requires packageDir');
@@ -93,6 +94,15 @@ export class BaseExecutor {
     // then fails the VDP-06 boundary (fail closed). Controlled-test
     // executors legitimately carry null: they run stage2Test jobs only.
     this.attestationVerifier = typeof attestationVerifier === 'function' ? attestationVerifier : null;
+    // Kaggle design v4 §5.3: the verifier for the NEXORA attestation
+    // registry, bound to the API host's attestation registry by the API
+    // factory. Null means no NEXORA job can verify — fail closed. The
+    // two verifiers are separate: the round-2 verifier checks the
+    // HMAC-signed Worker-side attestation; this one checks the registry
+    // record (existence + client/session binding + not-revoked +
+    // current version). A NEXORA job carries no round-2 attestation
+    // and must never be given one.
+    this.nexoraAttestationVerifier = typeof nexoraAttestationVerifier === 'function' ? nexoraAttestationVerifier : null;
     this.hoursTracker = hoursTracker;
     this.registry = registry;
     this.route = route;
@@ -121,8 +131,13 @@ export class BaseExecutor {
     // 1. VDP-06 data boundary. The personal marker is the signed
     // server-generated attestation, verified here through the injected
     // verifier (null verifier = no personal job can verify — fail
-    // closed); stage2Test jobs need no verifier.
-    const safe = checkStage2Safe(job, { attestationVerifier: this.attestationVerifier });
+    // closed); stage2Test jobs need no verifier. A NEXORA-origin
+    // personal job verifies through the injected NEXORA registry
+    // verifier instead (null = no NEXORA job can verify — fail closed).
+    const safe = checkStage2Safe(job, {
+      attestationVerifier: this.attestationVerifier,
+      nexoraAttestationVerifier: this.nexoraAttestationVerifier,
+    });
     if (!safe.ok) {
       return this._failed(job, `data-boundary: ${safe.reason}`);
     }

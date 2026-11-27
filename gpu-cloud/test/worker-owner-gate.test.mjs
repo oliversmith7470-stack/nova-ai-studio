@@ -47,6 +47,7 @@ const { Miniflare } = requireA2('miniflare');
 import { createApiServer } from '../src/api-server.js';
 import { HttpD1Client } from '../src/api-server/d1-client.js';
 import { createStorage } from '../src/storage/index.js';
+import { CHECKPOINT_SHA256 } from '../src/phase6/resource-profiles.js';
 import { verifyWorkerAuth } from '../src/api-server/auth.js';
 import { ApiStateStore } from '../src/api-server/state-store.js';
 import { SqliteNonceStore } from '../src/api-server/nonce-store.js';
@@ -103,6 +104,10 @@ async function waitFor(fn, { timeoutMs = 15000, intervalMs = 100, label = 'condi
 function writeActivationConf(dir, personalFlag) {
   const p = path.join(dir, 'activation.conf');
   fs.writeFileSync(p, `NOVA_PUBLIC_PRODUCTION_ACTIVATED=false\nNOVA_PERSONAL_PRODUCTION_ACTIVATED=${personalFlag}\n`, 'utf8');
+  // Kaggle design v13 §3.3: the strict re-verification requires mode
+  // 0440 and the expected owner/group — a temp conf left at the 0644
+  // default would latch activation invalid on the first capacity read.
+  fs.chmodSync(p, 0o440);
   return p;
 }
 
@@ -148,7 +153,20 @@ async function bootProduction({ personalFlag = true, apiOriginOverride = null } 
     kaggleCredentialPresent: true,
     personalExecutor: 'kaggle-t4',
     activationConfigPath: confPath,
+    // Kaggle design v13 §3.3: the strict re-verification expects the
+    // conf 0440, owned by the test process's uid/gid, in a parent dir
+    // owned by the test process — the temp conf is written that way.
+    fileAccess: {
+      ownerUid: process.getuid(),
+      groupGid: process.getgid(),
+      mode: 0o440,
+      parentUid: process.getuid(),
+    },
     storage,
+    // Kaggle design v13 §3.4: EVERY personal job needs a licence
+    // determination for the run-10 checkpoint — the helper writes one
+    // into a temp file so personal submits are not licence-refused.
+    licenceDeterminationPath: path.join(dir, 'licence-determination.json'),
     d1Client: new HttpD1Client({
       workerOrigin: 'http://127.0.0.1:1',
       secret: TEST_SECRET,
@@ -158,6 +176,15 @@ async function bootProduction({ personalFlag = true, apiOriginOverride = null } 
     usageSource: async () => ({ readable: true, usageFraction: 0.1 }),
   });
   const { port: apiPort } = await api.start();
+  // Kaggle design v13 §3.4: the licence record for the run-10
+  // checkpoint, so the personal-path tests are not licence-refused.
+  api.setLicenceDetermination({
+    kind: 'owner-determination',
+    licenceTextSha256: 'a'.repeat(64),
+    checkpointSha256: CHECKPOINT_SHA256,
+    evidenceRef: 'test-evidence',
+    determinedBy: 'test-operator',
+  });
   const apiOrigin = apiOriginOverride ?? `http://localhost:${apiPort}`;
   let mf;
   let db;

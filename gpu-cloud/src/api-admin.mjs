@@ -11,6 +11,12 @@
 //
 // Usage:
 //   node gpu-cloud/src/api-admin.mjs --data-dir <dir> <command> [args]
+//   node gpu-cloud/src/api-admin.mjs --data-dir <dir> --activation-config-path <path> <command> [args]
+//     --activation-config-path overrides the activation.conf location
+//     (default /etc/nova-api/activation.conf); useful on a host whose
+//     conf lives elsewhere, or for verifying the commands against a
+//     staging conf. The file must still pass the §3.3 strict
+//     verification (0440, root-owned parent, expected owner/group).
 //
 // Commands:
 //   status
@@ -34,9 +40,34 @@
 //     Deliver a completed executor output for an execution (operator
 //     channel; the executor normally reports via fileReport itself).
 //     The file must pass the §18 MP4 validation before it is stored.
+//
+// Kaggle design v13 (NEXORA connection) operator commands — the API
+// process must be STOPPED before any of these runs, like every other
+// mutating command above:
+//   reconcile-quota --kaggle-remaining-hours <h>
+//     Operator reconciliation (§6.2): record the Kaggle-side remaining
+//     hours (from `kaggle quota`) so admission can compute Q. Without
+//     a valid reconciliation every NEXORA submit is refused
+//     'quota-unreconciled'.
+//   issue-permit --job-hash <sha256> --max-hours <h>
+//                --licence-ref <determination-id>
+//                --authorisation-ref <ref> [--expires-at-ms <ms>]
+//     Issue a commissioning permit (§3.5, file-based). Refuses while
+//     any NOVA-origin job is in orphan-check or held at dispatch
+//     (P-15). The permit authorises ONE commissioning job (the
+//     canonical hash of its submit body) for at most max-hours.
+//   cancel-held --job-id <id> --reason <text>
+//     Cancel a job held at dispatch (§6.2). Never blocked by halt /
+//     kill-switch / pause; the hold reason is the audit evidence.
+//     Releases the hours, slot, and storage reservations.
+//   record-revisit-decision --kind <kind> [--detail <text>]
+//     Record a revisit decision (§5.4) so a live NEXORA halt may be
+//     cleared. Kinds: initial-declaration | kaggle-confirmation |
+//     channels-kept-off-kaggle. Clearing a halt without one throws.
 
 import { createApiServer } from './api-server.js';
 import { DEFAULT_API_DATA_DIR } from './api-server.js';
+import { FakeControlledExecutor } from './api-server/fake-executor.js';
 import { readFile } from 'node:fs/promises';
 
 function parseArgs(argv) {
@@ -59,6 +90,7 @@ function usage() {
   console.error(`Usage: node gpu-cloud/src/api-admin.mjs [--data-dir <dir>] <command> [args]
 
 Commands: status | revoke-secret | resolve | repair-scene-set | sweep-now | file-report
+  | reconcile-quota | issue-permit | cancel-held | record-revisit-decision
 Stop the API process before any command except status. See the header of this file.`);
 }
 
@@ -83,6 +115,13 @@ async function main() {
     mode,
     secret: secret || 'status-only-placeholder',
     dataDir,
+    activationConfigPath: args['activation-config-path'] ?? undefined,
+    // Controlled-test mode requires an explicitly supplied
+    // controlled-test executor (Rev 3 §C-1.4) — the fake executor is
+    // registered so the manager can resolve in-flight jobs. Production
+    // mode takes none (production executors are registered by the
+    // service's own startup configuration).
+    ...(mode === 'controlled-test' ? { executor: new FakeControlledExecutor() } : {}),
     d1Client: {
       async d1Apply() { throw new Error('api-admin: no Worker origin configured — D1 mutations are unavailable'); },
       async d1Read() { throw new Error('api-admin: no Worker origin configured — D1 reads are unavailable'); },
@@ -156,6 +195,65 @@ async function main() {
       const buf = await readFile(args.output);
       const out = await api.fileReport(args['execution-id'], {
         status: 'complete', output: buf, outputName: args.output.split('/').pop(),
+      });
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    // Kaggle design v13 (§6.2): operator reconciliation — record the
+    // Kaggle-side remaining hours (from `kaggle quota`).
+    if (command === 'reconcile-quota') {
+      const hours = Number(args['kaggle-remaining-hours']);
+      if (!Number.isFinite(hours) || hours < 0) {
+        console.error('--kaggle-remaining-hours <h> is required (a non-negative number)'); process.exit(2);
+      }
+      const out = api.reconcileQuota({ kaggleRemainingHours: hours });
+      console.log(JSON.stringify(out, null, 2));
+      return;
+    }
+    // Kaggle design v13 (§3.5): issue a commissioning permit.
+    if (command === 'issue-permit') {
+      if (!args['job-hash'] || !args['max-hours'] || !args['licence-ref'] || !args['authorisation-ref']) {
+        console.error('--job-hash, --max-hours, --licence-ref and --authorisation-ref are required'); process.exit(2);
+      }
+      const maxHours = Number(args['max-hours']);
+      if (!Number.isFinite(maxHours) || maxHours <= 0) {
+        console.error('--max-hours must be a positive number'); process.exit(2);
+      }
+      const out = api.createCommissioningPermit({
+        jobCanonicalHash: args['job-hash'],
+        maxHours,
+        licenceDeterminationRef: args['licence-ref'],
+        authorisationRef: args['authorisation-ref'],
+        authorisedBy: args['authorised-by'] ?? 'operator',
+        expiresAtMs: args['expires-at-ms'] !== undefined ? Number(args['expires-at-ms']) : undefined,
+      });
+      console.log(JSON.stringify(out, null, 2));
+      if (!out.ok) process.exit(1);
+      return;
+    }
+    // Kaggle design v13 (§6.2): cancel a job held at dispatch.
+    if (command === 'cancel-held') {
+      if (!args['job-id'] || !args.reason) {
+        console.error('--job-id and --reason are required'); process.exit(2);
+      }
+      const out = api.cancelHeldJob(args['job-id'], {
+        reason: args.reason,
+        operator: args.operator ?? 'operator',
+      });
+      console.log(JSON.stringify(out, null, 2));
+      if (!out.ok) process.exit(1);
+      return;
+    }
+    // Kaggle design v13 (§5.4): record a revisit decision so a live
+    // halt may be cleared.
+    if (command === 'record-revisit-decision') {
+      if (!args.kind) {
+        console.error('--kind is required (initial-declaration | kaggle-confirmation | channels-kept-off-kaggle)'); process.exit(2);
+      }
+      const out = api.recordRevisitDecision({
+        kind: args.kind,
+        detail: args.detail ?? '',
+        recordedBy: args['recorded-by'] ?? 'operator',
       });
       console.log(JSON.stringify(out, null, 2));
       return;

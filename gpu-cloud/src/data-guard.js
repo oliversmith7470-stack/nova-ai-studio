@@ -10,7 +10,7 @@ import { NON_COMMERCIAL_PURPOSES } from './api-server/activation.js';
 // failed report — it never merely warns):
 //
 //   1. THE MARKER (primary, enforceable): a job must carry one of the
-//      two lawful markers:
+//      three lawful markers:
 //        (a) Stage 2: params.stage2Test === true — the submitter's
 //            explicit assertion that this is a synthetic Stage 2 test
 //            job. An unmarked job is refused. The guard cannot tell a
@@ -34,6 +34,17 @@ import { NON_COMMERCIAL_PURPOSES } from './api-server/activation.js';
 //            Stage 2 job. The verifier is injected by the executor
 //            (opts.attestationVerifier); without one, no personal job
 //            can verify — fail closed.
+//        (c) NEXORA-origin personal production (Kaggle design v4 §5.3):
+//            a personal-audience, nexora-origin job carrying a registry
+//            attestation (params.nexoraAttestationId) that verifies at
+//            this boundary through the injected NEXORA registry
+//            verifier (opts.nexoraAttestationVerifier): the record must
+//            exist, bind client_id nexora-service and the session id
+//            recorded at submit, be unrevoked, and carry the current
+//            restriction version. The 4 h expiry is NOT checked here —
+//            acceptance is the freshness gate. A NEXORA job carries no
+//            round-2 attestation and must never be given one; the two
+//            markers are separate.
 //   2. THE SCAN (second line, heuristic): the prompt and params are
 //      scanned for credential-like patterns and for keys that carry user
 //      or private media. A match is refused. The scan is a heuristic —
@@ -124,8 +135,7 @@ export function checkStage2Safe(job, opts = {}) {
   const verifyAttestation = typeof opts?.attestationVerifier === 'function'
     ? opts.attestationVerifier
     : null;
-  const lawfulMarker = stage2Marked || (
-    params.audience === 'personal'
+  const workerMarker = params.audience === 'personal'
     && verifyAttestation !== null
     && verifyAttestation(params.personalAttestation, {
       audience: 'personal',
@@ -133,8 +143,24 @@ export function checkStage2Safe(job, opts = {}) {
       purpose: NON_COMMERCIAL_PURPOSES,
       recordedPurpose: params.nonCommercialPurpose,
       jobId: params.jobId,
-    }, { nowMs: opts?.nowMs })
-  );
+    }, { nowMs: opts?.nowMs });
+  // NEXORA-origin personal jobs (Kaggle design v4 §5.3): the third
+  // lawful marker is the NEXORA registry attestation — verified
+  // through the injected NEXORA verifier (existence + client/session
+  // binding + not-revoked + current version; NOT the 4 h expiry —
+  // acceptance is the freshness gate). A NEXORA job carries no
+  // round-2 attestation and must never be given one.
+  const verifyNexoraAttestation = typeof opts?.nexoraAttestationVerifier === 'function'
+    ? opts.nexoraAttestationVerifier
+    : null;
+  const nexoraMarker = params.audience === 'personal'
+    && params.origin === 'nexora'
+    && verifyNexoraAttestation !== null
+    && verifyNexoraAttestation(params.nexoraAttestationId, {
+      clientId: 'nexora-service',
+      sessionId: params.nexoraSessionId,
+    });
+  const lawfulMarker = stage2Marked || workerMarker || nexoraMarker;
   if (!lawfulMarker) {
     return {
       ok: false,

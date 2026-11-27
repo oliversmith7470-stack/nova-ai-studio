@@ -83,6 +83,11 @@ export class KaggleExecutor extends BaseExecutor {
     enableInternet = null,
     pollIntervalMs = 60_000,
     pollTimeoutMs = 12 * 3600 * 1000,
+    // Kaggle design v4 §5.5 / T-V16: kernel privacy. The default (null)
+    // is private; an explicit `isPrivate: false` is refused at the
+    // metadata boundary — a public kernel is never built, so prompts and
+    // keyframes can never be pushed public by a caller option.
+    isPrivate = null,
     ...rest
   } = {}) {
     super({ providerId: KAGGLE_PROVIDER_ID, ...rest });
@@ -98,6 +103,7 @@ export class KaggleExecutor extends BaseExecutor {
     this.enableInternet = enableInternet;
     this.pollIntervalMs = pollIntervalMs;
     this.pollTimeoutMs = pollTimeoutMs;
+    this.isPrivate = isPrivate;
   }
 
   async submit(job, manifest) {
@@ -218,6 +224,13 @@ export class KaggleExecutor extends BaseExecutor {
   }
 
   _kernelMetadata(job, manifest) {
+    // T-V16: a public kernel is refused outright — the metadata is the
+    // enforcement point, so no push path can ever carry is_private:false.
+    if (this.isPrivate === false) {
+      throw new Error(
+        'kaggle kernel must be private: is_private:false is refused (prompts and keyframes must not be public)',
+      );
+    }
     const owner = this.kaggleUsername ?? '<kaggle-username>';
     const meta = {
       id: `${owner}/nova-gpu-cloud-${job.id}`,
