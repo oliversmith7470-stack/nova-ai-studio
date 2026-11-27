@@ -26,6 +26,20 @@
 //     a queued personal job must still verify when the executor picks it
 //     up hours later, but a stale attestation never revives).
 //
+// The jobId binding rests on a server-verified uniqueness chain (M2-P
+// round 3, reviewer re-review verdict §1): the client supplies only
+// the FORM of the Worker job id (`nova-job-<uuid>`); uniqueness is
+// verified server-side — the Worker enforces one job per id through
+// the D1 jobs PRIMARY KEY, the conditional creation batch, and the 409
+// on a different request under the same id, and the API re-checks the
+// id's form and loads its D1 record before signing (a jobId with no D1
+// record is refused 404, so an attestation can never bind an id the
+// Worker never issued). The manager's internal job.id is a different,
+// idempotency-derived value and is NEVER an alternate key in this
+// verification path: verifyPersonalAttestation consults only the
+// expected jobId (the Worker job id in params.jobId), and no caller
+// may substitute job.id for it.
+//
 // The purpose itself is NOT proof of non-commercial use: the attestation
 // is the owner's explicit confirmation, authenticated by the Worker-side
 // owner-token verification and bound here by the token identifier. A job

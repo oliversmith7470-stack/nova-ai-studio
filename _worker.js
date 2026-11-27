@@ -47,6 +47,15 @@
 
 // ---------------------------------------------------------------- CORS
 
+// Round 3 (reviewer re-review verdict, 27 Nov 2026 §2): the five
+// non-commercial purposes are imported from the single shared module
+// gpu-cloud/src/api-server/non-commercial-purposes.js — the same list
+// the API-side activation.js imports. The Worker previously held its
+// own Set literal of the same five strings; two identical copies can
+// drift. There is now one literal in the repo. The shared module has
+// no dependencies, so it loads in the Workers runtime.
+import { NON_COMMERCIAL_PURPOSES } from "./gpu-cloud/src/api-server/non-commercial-purposes.js";
+
 const ALLOWED_ORIGINS = [
   "https://nova-ai-studio-5r8o.netlify.app",
   "https://nova-ai-studio-cp5.pages.dev"
@@ -698,12 +707,13 @@ const GENERATE_ALLOWED_PLAN = new Set([
 // The five non-commercial purposes a personal (owner-only) job may
 // attest (Rev 4.8 §12, item D, option (b) — Kaggle commercial-use
 // decision 26 Nov 2026: personal Kaggle = demonstrably non-commercial
-// work only). This MUST match the API-side NON_COMMERCIAL_PURPOSES in
-// gpu-cloud/src/api-server/activation.js — a purpose outside the shared
-// five is refused by one gate or the other.
-const NON_COMMERCIAL_PURPOSES = new Set([
-  "test", "proof", "benchmark", "experiment", "own-non-monetised-film"
-]);
+// work only) are the imported NON_COMMERCIAL_PURPOSES array — the
+// single shared module gpu-cloud/src/api-server/non-commercial-
+// purposes.js, also imported by the API-side activation.js. There is
+// one literal in the repo; a purpose outside the shared five is
+// refused by one gate or the other. (Round 3: the Worker's own Set
+// literal of the same five strings was removed — two identical copies
+// can drift.) Use .includes() on the array at the check sites below.
 
 function buildCanonicalRequest(normalized) {
   let obj;
@@ -750,6 +760,19 @@ function validateGenerateBody(parsed) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return bad("Invalid production request.");
   }
+  // Job-ID identity (M2-P round 3, reviewer re-review verdict §1): the
+  // client supplies only the FORM of the id — `nova-job-<uuid>` — and
+  // the server verifies its uniqueness. validJobId checks the form
+  // here; uniqueness is enforced by the D1 jobs table (id TEXT PRIMARY
+  // KEY) plus the conditional creation batch, and by the 409 below: a
+  // second, different request under an already-used jobId is refused,
+  // so at most ONE canonical request — one job — ever exists per
+  // Worker jobId. That is what makes the signed personal attestation's
+  // jobId binding meaningful: the API signs an attestation only for a
+  // jobId with a D1 record (dispatch.js loads it before signing), so
+  // an attestation can never bind an ID the Worker never issued, and
+  // can never be reused for a different job, because no second job
+  // with that id can exist.
   if (!validJobId(body.jobId)) {
     return bad("A valid NOVA job ID is required.");
   }
@@ -800,11 +823,11 @@ function validateGenerateBody(parsed) {
   let nonCommercialPurpose = null;
   if (audience === "personal") {
     if (body.nonCommercialPurpose === undefined || body.nonCommercialPurpose === null) {
-      return bad("nonCommercialPurpose is required for a personal audience — select one of: " + [...NON_COMMERCIAL_PURPOSES].join(", ") + ".");
+      return bad("nonCommercialPurpose is required for a personal audience — select one of: " + NON_COMMERCIAL_PURPOSES.join(", ") + ".");
     }
     nonCommercialPurpose = body.nonCommercialPurpose;
-    if (!NON_COMMERCIAL_PURPOSES.has(nonCommercialPurpose)) {
-      return bad("nonCommercialPurpose must be one of: " + [...NON_COMMERCIAL_PURPOSES].join(", ") + ".");
+    if (!NON_COMMERCIAL_PURPOSES.includes(nonCommercialPurpose)) {
+      return bad("nonCommercialPurpose must be one of: " + NON_COMMERCIAL_PURPOSES.join(", ") + ".");
     }
   } else if (body.nonCommercialPurpose !== undefined) {
     return bad("nonCommercialPurpose is only valid for a personal audience.");
@@ -2364,19 +2387,27 @@ async function handleGenerate(request, env) {
   };
   // Personal binding: the verified identity (Worker-asserted, never a
   // request field), the audience, and the owner's explicitly selected
-  // purpose are stored on the job record. nonCommercialAttested here is
-  // the WORKER-side audit record of the verified deliberate act (owner
-  // token verified against the actual secret + purpose explicitly
-  // selected in the same authenticated session) — it is NOT sent to the
-  // API and the API never trusts it; the API generates its own signed
-  // attestation. No purpose default: normalized.nonCommercialPurpose is
-  // always set for personal jobs (validateGenerateBody refuses the
-  // request without one). The API-side ownerTokenId check is a
-  // secondary consistency check on this value.
+  // purpose are stored on the job record. ownerDeliberateActVerified
+  // here is the WORKER-side audit record that the Worker verified the
+  // owner's deliberate act (owner token verified against the actual
+  // secret + purpose explicitly selected in the same authenticated
+  // session) — it records the Worker's verification of the owner token
+  // and purpose selection, NOT any statement about the content, and it
+  // is NOT sent to the API and the API never trusts it; the API
+  // generates its own signed attestation. (Round 3: renamed from
+  // nonCommercialAttested — a field named `nonCommercialAttested: true`
+  // in the audit record reads as an assertion, which is exactly the
+  // failure the signed attestation was meant to remove. The old name
+  // survives only as the name of the incoming request boolean, which
+  // the API ignores outright.) No purpose default:
+  // normalized.nonCommercialPurpose is always set for personal jobs
+  // (validateGenerateBody refuses the request without one). The
+  // API-side ownerTokenId check is a secondary consistency check on
+  // this value.
   if (isPersonal) {
     jobData.audience = "personal";
     jobData.ownerTokenId = verifiedOwnerTokenId;
-    jobData.nonCommercialAttested = true;
+    jobData.ownerDeliberateActVerified = true;
     jobData.nonCommercialPurpose = normalized.nonCommercialPurpose;
   }
   if (normalized.mode === "single") {
@@ -2475,6 +2506,13 @@ async function handleGenerate(request, env) {
         message: "A valid NOVA job access token is required."
       });
     }
+    // Worker job-ID uniqueness, enforced (M2-P round 3, reviewer
+    // re-review verdict §1): a jobId already used by a DIFFERENT
+    // canonical request is refused here — the attestation bound to that
+    // jobId can never be reused for another job, because the other job
+    // cannot be created under the same id. An identical retry is not a
+    // reuse: it returns the existing job (or its recovery path) with
+    // the identical idempotency keys, never a second job.
     if (existing.requestIdentityHash !== requestIdentityHash) {
       return respond(409, {
         jobId,

@@ -47,13 +47,13 @@ export const CAPACITY_REASONS = [
 export const STORAGE_SAFETY_MARGIN_BYTES = 500 * 1024 * 1024; // 500 MB (§9/§14)
 export const CAPACITY_FRESHNESS_SECONDS = 5; // §4.3: |now - timestamp| <= 5 s
 
-export const NON_COMMERCIAL_PURPOSES = [
-  'test',
-  'proof',
-  'benchmark',
-  'experiment',
-  'own-non-monetised-film',
-];
+// The five non-commercial purposes live in the single shared module
+// ./non-commercial-purposes.js (re-exported here so existing importers
+// are unchanged). Round 3 (reviewer re-review verdict, 27 Nov 2026
+// §2): the Cloudflare Worker previously held its own Set literal of
+// the same five strings; two identical copies can drift. There is now
+// one literal in the repo.
+export { NON_COMMERCIAL_PURPOSES } from './non-commercial-purposes.js';
 
 const TRUE_VALUES = new Set(['true']);
 const FALSE_VALUES = new Set(['false']);

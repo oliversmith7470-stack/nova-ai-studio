@@ -25,7 +25,9 @@ import { NON_COMMERCIAL_PURPOSES } from './api-server/activation.js';
 //            secret, and the attestation must bind the verified
 //            owner-token identifier, an explicitly selected purpose from
 //            the five NON_COMMERCIAL_PURPOSES, and this specific job
-//            (the Worker job id in params.jobId). An incoming
+//            (the Worker job id in params.jobId). One job exists per Worker
+//            jobId (server-verified uniqueness, M2-P round 3), so the
+//            binding cannot be reused for a different job. An incoming
 //            nonCommercialAttested boolean is NEVER a marker — it is
 //            ignored outright. A personal job without a valid signed
 //            attestation is refused here, exactly like an unmarked
@@ -110,7 +112,13 @@ export function checkStage2Safe(job, opts = {}) {
   // owner-token identifier, an explicitly selected purpose from the
   // five, and this specific job (the Worker job id, params.jobId — the
   // manager's internal job.id is a different, idempotency-derived
-  // value and is NOT what the attestation binds). The credential scan
+  // value and is NOT what the attestation binds, and is never
+  // consulted here: the expected jobId is params.jobId only).
+  // Uniqueness of that id is server-verified (M2-P round 3): one job
+  // per Worker jobId — D1 PRIMARY KEY + conditional creation + the 409
+  // on a different request under the same id at the Worker, and the
+  // API's D1-record lookup before signing — so a signed attestation
+  // cannot be reused for a different job. The credential scan
   // below still runs for both markers.
   const stage2Marked = params.stage2Test === true;
   const verifyAttestation = typeof opts?.attestationVerifier === 'function'

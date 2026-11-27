@@ -423,6 +423,16 @@ export class DispatchManager {
     // prompt that dispatches. A body that is not an object, or carries no
     // string jobId, has no job identity to look up and is refused 400
     // first; everything else is resolved from the stored record.
+    // M2-P round 3 (reviewer re-review verdict §1): this lookup is also
+    // the issuance check for the personal attestation's jobId binding.
+    // A jobId with no D1 record — an id the Worker never issued — is
+    // refused 404 below BEFORE any attestation is signed, so the API
+    // can never sign an attestation for an unissued id. The Worker
+    // enforces one job per id (D1 PRIMARY KEY + conditional creation +
+    // the 409 on a different request under the same id), the API
+    // re-checks the id's form (_validateSubmitBody) and its D1 record
+    // here, and the attestation binds that same id — so a signed
+    // attestation cannot be reused for a different job.
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
       return { status: 400, body: { error: 'invalid-submit', message: 'body must be an object' } };
     }
@@ -513,7 +523,9 @@ export class DispatchManager {
       // Worker-authenticated submit passes the checks below: it binds
       // the verified owner-token identifier, the explicitly selected
       // purpose (one of the five — no default), and this job id, signed
-      // with the API host's server-held signing secret. Without a
+      // with the API host's server-held signing secret. This jobId is the
+      // D1-verified id loaded above, never a raw request value: the 404
+      // above already refused an id with no D1 record. Without a
       // signing secret configured the API cannot generate one, so a
       // personal submit is refused (503, fail closed). The token
       // identifier must match the host's configured identifier when one

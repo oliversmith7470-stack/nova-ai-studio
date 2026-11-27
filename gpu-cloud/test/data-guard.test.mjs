@@ -211,6 +211,48 @@ test('a personal job with a tampered or misbound attestation is refused', () => 
   assert.equal(checkPersonal(personalJob({ params: { personalAttestation: otherJob } })).ok, false);
 });
 
+test('the manager internal job.id is never an alternate key in verification (round 3)', () => {
+  // personalJob() carries id 'job-personal-1' (the manager's internal,
+  // idempotency-derived value) and params.jobId TEST_JOB_ID. The
+  // attestation must bind params.jobId only: an attestation correctly
+  // signed for the internal id must NOT verify, and a job whose id
+  // equals the attestation's jobId but whose params.jobId differs must
+  // NOT verify either — verification consults params.jobId and nothing
+  // else (reviewer re-review verdict §1).
+  const forWorkerId = signPersonalAttestation({
+    ownerTokenId: TEST_OWNER_TOKEN_ID,
+    purpose: 'proof',
+    jobId: TEST_JOB_ID,
+    attestedAt: Date.now(),
+  }, TEST_SIGNING_SECRET);
+  assert.deepEqual(
+    checkPersonal(personalJob({ params: { personalAttestation: forWorkerId } })),
+    { ok: true },
+  );
+  const forInternalId = signPersonalAttestation({
+    ownerTokenId: TEST_OWNER_TOKEN_ID,
+    purpose: 'proof',
+    jobId: 'job-personal-1',
+    attestedAt: Date.now(),
+  }, TEST_SIGNING_SECRET);
+  assert.equal(
+    checkPersonal(personalJob({ params: { personalAttestation: forInternalId } })).ok,
+    false,
+    'an attestation bound to the manager internal id must not verify',
+  );
+  const swapped = personalJob({
+    id: TEST_JOB_ID,
+    params: {
+      personalAttestation: forWorkerId,
+      jobId: 'nova-job-99999999-8888-7777-6666-555555555555',
+    },
+  });
+  assert.equal(
+    checkPersonal(swapped).ok, false,
+    'job.id equalling the attestation jobId must not substitute for params.jobId',
+  );
+});
+
 test('a personal job missing any attestation fact is refused', () => {
   const missing = [
     { audience: 'public' },

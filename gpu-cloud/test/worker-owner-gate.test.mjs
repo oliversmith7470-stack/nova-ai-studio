@@ -252,12 +252,17 @@ describe('worker owner-token gate + personal path (production, flag on)', () => 
     assert.equal(res.json.dispatchState, 'slot-claimed');
     // The D1 job record carries the Worker-asserted identity — never a
     // request field (the request carried no ownerTokenId at all) — and
-    // the owner's explicitly selected purpose (no default).
+    // the owner's explicitly selected purpose (no default). The audit
+    // field is ownerDeliberateActVerified (round 3 rename from
+    // nonCommercialAttested): it records the Worker's verification of
+    // the deliberate act, not an assertion; the old name is written
+    // nowhere on the record.
     const job = await jobRow(ctx.db, jobId);
     assert.ok(job, 'D1 job record exists');
     assert.equal(job.audience, 'personal');
     assert.equal(job.ownerTokenId, TEST_OWNER_TOKEN_ID);
-    assert.equal(job.nonCommercialAttested, true);
+    assert.equal(job.ownerDeliberateActVerified, true);
+    assert.equal(job.nonCommercialAttested, undefined);
     assert.equal(job.nonCommercialPurpose, 'proof');
     // The API journal entry carries the SERVER-GENERATED signed
     // attestation (never an incoming boolean).
@@ -424,6 +429,66 @@ describe('worker owner-token gate + personal path (production, flag on)', () => 
     } finally {
       disengageKillSwitch(ctx.api.manager.store.state, 'test', Date.now());
     }
+  });
+});
+
+// Worker job-ID uniqueness (M2-P round 3, reviewer re-review verdict
+// §1): the signed attestation binds the Worker jobId, and that binding
+// is meaningful only because one job exists per id. This describe gets
+// its own boot: the main describe's first job still occupies the
+// personal executor (it waits for a fileReport that never comes), so a
+// second dispatch in the same context would 503 on capacity instead of
+// exercising the 409 path.
+describe('Worker jobId uniqueness: same jobId, different request is 409', () => {
+  let ctx;
+  before(async () => { ctx = await bootProduction({ personalFlag: true }); });
+  after(async () => { if (ctx) await ctx.cleanup(); });
+
+  test('same jobId, different request: 409 — a Worker jobId cannot be reused for another job', async () => {
+    // The client supplies only the id's form; the server verifies
+    // uniqueness (D1 PRIMARY KEY + conditional creation + this 409). A
+    // second, different request under an already-used id is refused,
+    // so the first job's attestation can never ride on a different job.
+    // The same token header is reused for both calls: the duplicate
+    // path checks ownership first, so a different token would 401
+    // instead of 409.
+    const jobId = `nova-job-${randomUUID()}`;
+    const headers = genHeaders();
+    const first = await callWorker(ctx.mf, 'POST', '/api/generate', {
+      body: genBody(jobId),
+      headers,
+    });
+    assert.equal(first.status, 202, `first generate: HTTP ${first.status} ${first.text.slice(0, 300)}`);
+    const second = await callWorker(ctx.mf, 'POST', '/api/generate', {
+      body: genBody(jobId, { prompt: 'A completely different dragon prompt' }),
+      headers,
+    });
+    assert.equal(second.status, 409);
+    assert.equal(second.json.error, 'conflict');
+    assert.match(second.json.message, /jobId already used with a different request/);
+    // The D1 record is still the FIRST job — the second request changed
+    // nothing, and no second manager job or attestation exists for it.
+    const job = await jobRow(ctx.db, jobId);
+    assert.ok(job, 'D1 job record exists');
+    assert.equal(job.prompt, 'A dragon rests on a misty mountain ridge at dawn');
+    const entry = ctx.api.dispatch.journalEntry(`${jobId}:scene-0:attempt-1`);
+    assert.ok(entry, 'journal entry exists');
+    assert.equal(entry.personalAttestation.jobId, jobId);
+    assert.equal(entry.personalAttestation.purpose, 'proof');
+    const jobs = ctx.api.manager.store.state.jobs ?? {};
+    assert.equal(
+      Object.values(jobs).filter((j) => j.params?.jobId === jobId).length, 1,
+      'exactly one manager job exists for the jobId',
+    );
+    // Let this job's LTX package finish building before the suite
+    // moves on, so disposal never races an in-flight executor build
+    // (same pattern as the first test in the main describe).
+    const packagesRoot = path.join(ctx.dir, 'packages');
+    await waitFor(async () => {
+      try {
+        return fs.readdirSync(packagesRoot).length >= 1 ? true : null;
+      } catch { return null; }
+    }, { timeoutMs: 60000, label: 'LTX package' });
   });
 });
 
