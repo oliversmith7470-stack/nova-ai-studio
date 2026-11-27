@@ -59,6 +59,7 @@ import {
 import { normalizeExecutorState, kaggleCancelReason } from './kaggle-status.js';
 import { D1AuthError, D1RetryableError } from './d1-client.js';
 import { checkRunnerHeartbeat } from './runner-heartbeat.js';
+import { requiredVramGb } from '../phase6/resource-profiles.js';
 
 const JOB_ID_RE = /^nova-job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -493,6 +494,20 @@ export class DispatchManager {
     }
 
     // Manager submit (idempotent on the execution ID) + dispatch loop.
+    // Phase 6 Workstream G: the minimum VRAM comes from the measured
+    // resource profile for the submitted config, not the old hardcoded
+    // 12 GB. No measured profile covers the config (unreachable today —
+    // validation pins the covered 121-frame config): keep 12 rather
+    // than refuse a previously-accepted submit on this path.
+    const measuredMinVramGb = requiredVramGb({
+      model: body.model,
+      resolution: body.resolution,
+      frames: body.frames,
+      steps: 8,
+      decoderMode: 'single-pass',
+      attentionBackend: 'default',
+    });
+    const minVramGb = measuredMinVramGb ?? 12;
     const submittedJobs = [];
     try {
       for (const { x } of stillMissing) {
@@ -503,7 +518,7 @@ export class DispatchManager {
           prompt: prompts.get(x.executionId) ?? '',
           params: {
             timeoutMs: this.jobTimeoutMs,
-            minVramGb: 12,
+            minVramGb,
             estimatedSeconds: 300,
             executionId: x.executionId,
             jobId: body.jobId,
