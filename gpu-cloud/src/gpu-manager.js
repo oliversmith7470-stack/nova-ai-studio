@@ -48,6 +48,13 @@ import {
 } from './kill-switch.js';
 import { reconcileReports, findUnreportedJobs } from './reconcile.js';
 import { DEFAULT_SWEEP_INTERVAL_MS } from './storage/index.js';
+import {
+  buildGatewayPolicy,
+  effectivePrompt,
+  InvalidJobError,
+} from './gateway-policy.js';
+import { scanCredentialPatterns } from './data-guard.js';
+import { GATEWAY_DEFAULT_TIMEOUT_MS } from './gateway-client.js';
 
 const DEFAULT_STORE_PATH = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -66,7 +73,7 @@ export class QueueFullError extends Error {
 }
 
 export class GpuManager {
-  constructor({ storePath = DEFAULT_STORE_PATH, now = () => Date.now(), config = {}, mockOptions = {} } = {}) {
+  constructor({ storePath = DEFAULT_STORE_PATH, now = () => Date.now(), config = {}, mockOptions = {}, enhancement = {} } = {}) {
     this.now = now; // injectable clock (tests use a fake clock for timeouts)
     this.store = new JsonStore(storePath);
     this.registry = new ProviderRegistry();
@@ -86,6 +93,29 @@ export class GpuManager {
     // attachStorage() is called. createGpuCloud() attaches it; a bare
     // GpuManager has no storage and its storage methods throw.
     this.storage = null;
+    // FreeLLMAPI gateway prompt enhancement (approved v5 design, A4/A5).
+    // Disabled by default: no gateway client, no background task, no
+    // behaviour change. When enabled, submit() registers a bounded
+    // background enhancement task (never awaited) and dispatchNext()
+    // resolves the effective prompt server-side. The policy defaults to
+    // the production policy (fail closed: production jobs always use
+    // the original prompt).
+    this.enhancement = {
+      enabled: enhancement.enabled ?? false,
+      client: enhancement.client ?? null,
+      directGemini: enhancement.directGemini ?? null,
+      policy: enhancement.policy ?? null,
+      authorizationStore: enhancement.authorizationStore ?? null,
+      timeoutMs: enhancement.timeoutMs ?? GATEWAY_DEFAULT_TIMEOUT_MS,
+    };
+    this._defaultGatewayPolicy = buildGatewayPolicy({});
+    // In-flight enhancement tasks, keyed by job id (test observability;
+    // the tasks never hold a reservation or delay dispatch).
+    this._enhancementTasks = new Map();
+  }
+
+  _gatewayPolicy() {
+    return this.enhancement.policy ?? this._defaultGatewayPolicy;
   }
 
   // -- submission ---------------------------------------------------------
@@ -118,11 +148,165 @@ export class GpuManager {
         seq: s.seq,
         now: this.now(),
       });
+      // FreeLLMAPI (A5 contract): the server — and only the server —
+      // attaches the sandbox-authorization reference at intake, from a
+      // trusted scope lookup on the job's D1 parent-job id. The caller
+      // can never supply it.
+      if (this.enhancement.enabled && this.enhancement.policy && typeof params?.jobId === 'string') {
+        const auth = this.enhancement.policy.findAuthorizationForJob(params.jobId);
+        if (auth) job.sandboxAuthorizationId = auth.authorizationId;
+      }
       s.jobs[job.id] = job;
       s.idempotency[idempotencyKey] = job.id;
     });
+    // FreeLLMAPI (A4 execution model): (1) the job is persisted above
+    // with promptSource "user"; (2) the bounded background enhancement
+    // task is registered WITHOUT awaiting it; (3) job-queued is emitted
+    // exactly once; (4) submit returns under the existing lifecycle.
+    // A duplicate submission (above) registers no task and emits no
+    // second event.
+    if (this.enhancement.enabled) this._registerEnhancementTask(job);
     this._event('job-queued', job.id);
     return { job, created: true };
+  }
+
+  // -- FreeLLMAPI enhancement (approved v5 design, A4/A5) -----------------
+  //
+  // Bounded best-effort background task. Never holds a reservation, never
+  // delays dispatch, never creates a queue, never delays the submit
+  // response. Failure or timeout leaves the job on its original prompt
+  // (promptSource stays "user"). The 30 s timeout is the cancellation
+  // mechanism (enforced by the gateway client / direct-Gemini adapter).
+
+  _registerEnhancementTask(job) {
+    // Deferred to a microtask: the task body (including its
+    // enhancement-started event) runs only after submit() has returned,
+    // so job-queued is emitted exactly once, before any enhancement
+    // event, per the A4 execution model.
+    const task = Promise.resolve()
+      .then(() => this._runEnhancement(job))
+      .catch(() => false);
+    this._enhancementTasks.set(job.id, task);
+    task.finally(() => {
+      if (this._enhancementTasks.get(job.id) === task) this._enhancementTasks.delete(job.id);
+    });
+  }
+
+  // The in-flight enhancement promise for a job, or null. Test helper.
+  pendingEnhancement(jobId) {
+    return this._enhancementTasks.get(jobId) ?? null;
+  }
+
+  // Wait for a job's enhancement task to settle (test helper). Resolves
+  // immediately when no task is registered.
+  async waitForEnhancement(jobId, timeoutMs = 5000) {
+    const task = this._enhancementTasks.get(jobId);
+    if (!task) return false;
+    const deadline = Date.now() + timeoutMs;
+    await task;
+    if (Date.now() > deadline) throw new Error(`waitForEnhancement timed out for ${jobId}`);
+    return true;
+  }
+
+  // Enhancement validation boundary (A4): non-empty string, at most 4,000
+  // characters, no credential-like pattern. Returns { ok, reason }.
+  _checkEnhancementText(text) {
+    if (typeof text !== 'string' || text.length === 0) return { ok: false, reason: 'empty' };
+    if (text.length > 4000) return { ok: false, reason: 'too-long' };
+    if (scanCredentialPatterns(text)) return { ok: false, reason: 'data-guard' };
+    return { ok: true };
+  }
+
+  async _runEnhancement(job) {
+    const enh = this.enhancement;
+    const jobId = job.id;
+    const current = () => this.store.state.jobs[jobId] ?? null;
+    const discard = (reason) => {
+      this._event('enhancement-discarded', jobId, { reason });
+      return false;
+    };
+    // Never enhance in production (defense in depth — production startup
+    // already rejects the flag).
+    if (enh.policy?.environment === 'production') return discard('production');
+    // Revalidate immediately before enhancement begins (sandbox): the
+    // check reads current authoritative state, never a cached result.
+    if (enh.policy?.environment === 'sandbox') {
+      const live = current();
+      if (!live || !enh.policy.hasValidOwnerAuthorization(live)) return discard('unauthorized');
+    }
+    this._event('enhancement-started', jobId, {});
+    const original = job.prompt;
+    let attempt = null;
+    let lastFailure = null; // the most specific reason no enhancement was accepted
+    // Fallback order (A4): gateway → direct Gemini (if configured) → raw
+    // prompt. Each step is independent; a failure falls through without
+    // raising. No retries inside the client.
+    if (enh.client) {
+      try {
+        const result = await enh.client.enhance(original);
+        const check = this._checkEnhancementText(result.content);
+        if (check.ok) {
+          attempt = {
+            content: result.content,
+            source: 'gateway',
+            model: result.routedVia,
+            requestedModel: enh.client.model,
+            reportedModel: result.reportedModel,
+          };
+        } else {
+          lastFailure = check.reason;
+          this._event('enhancement-failed', jobId, { reason: check.reason });
+        }
+      } catch {
+        this._event('enhancement-failed', jobId, { reason: 'gateway-failed' });
+      }
+    }
+    if (!attempt && enh.directGemini) {
+      try {
+        const result = await enh.directGemini.enhance(original);
+        const check = this._checkEnhancementText(result.content);
+        if (check.ok) {
+          attempt = {
+            content: result.content,
+            source: 'direct-gemini',
+            model: enh.directGemini.modelIdentity,
+            requestedModel: null,
+            reportedModel: result.reportedModel ?? null,
+          };
+        } else {
+          lastFailure = check.reason;
+          this._event('enhancement-failed', jobId, { reason: check.reason });
+        }
+      } catch {
+        this._event('enhancement-failed', jobId, { reason: 'direct-gemini-failed' });
+      }
+    }
+    if (!attempt) return discard(lastFailure ?? 'unavailable');
+    // Revalidate immediately before an enhanced prompt is accepted for
+    // dispatch (sandbox): the second validation reads current
+    // authoritative revocation state.
+    if (enh.policy?.environment === 'sandbox') {
+      const live = current();
+      if (!live || !enh.policy.hasValidOwnerAuthorization(live)) return discard('unauthorized');
+    }
+    // Atomic conditional update: succeeds only while the job remains
+    // queued and dispatch has not begun. A late result is discarded.
+    let committed = false;
+    this.store.mutate((s) => {
+      const j = s.jobs[jobId];
+      if (!j || j.status !== 'queued') return;
+      j.enhancedPrompt = attempt.content;
+      j.promptSource = 'enhanced';
+      j.enhancementSource = attempt.source;
+      j.enhancementModel = attempt.model;
+      j.enhancementRequestedModel = attempt.requestedModel;
+      j.enhancementReportedModel = attempt.reportedModel;
+      j.updatedAt = this.now();
+      committed = true;
+    });
+    if (!committed) return discard('late');
+    this._event('enhancement-accepted', jobId, { source: attempt.source });
+    return true;
   }
 
   getJob(jobId) {
@@ -217,8 +401,38 @@ export class GpuManager {
       };
     }
 
+    // FreeLLMAPI (A5): the prompt the engine sees is the EFFECTIVE prompt,
+    // resolved server-side from the stored record. A direct read of
+    // job.prompt for dispatch is prohibited. The stored record keeps its
+    // original prompt; the executor receives a copy carrying the
+    // effective prompt. An enhanced prompt matching a credential-like
+    // pattern is rejected for this dispatch (the original stands); a
+    // pattern on the original is left to the executor's own boundary,
+    // as today. A resolver refusal fails the job closed — it never
+    // dispatches with a wrong prompt.
+    let dispatchJob = job;
     try {
-      const promise = executor.start(job);
+      const effective = effectivePrompt(job, this._gatewayPolicy());
+      const pattern = scanCredentialPatterns(effective);
+      if (pattern && job.promptSource === 'enhanced') {
+        this._event('enhancement-discarded', job.id, { reason: 'data-guard' });
+      } else if (!pattern && effective !== job.prompt) {
+        dispatchJob = { ...job, prompt: effective };
+      }
+    } catch (err) {
+      if (err instanceof InvalidJobError) {
+        this._failJob(job.id, err.message);
+        return {
+          dispatched: false,
+          reason: 'invalid-job',
+          jobId: job.id,
+        };
+      }
+      throw err;
+    }
+
+    try {
+      const promise = executor.start(dispatchJob);
       this.store.mutate((s) => {
         const j = s.jobs[job.id];
         j.providerId = provider.id;

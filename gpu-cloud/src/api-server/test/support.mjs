@@ -351,6 +351,17 @@ export async function makeApi(overrides = {}) {
     dataDir: dir,
     d1Client: d1,
     executor,
+    // FreeLLMAPI (A4/A5): gateway options pass through; undefined falls
+    // back to the server defaults (environment production, flags OFF).
+    environment: overrides.environment,
+    environmentId: overrides.environmentId,
+    projectId: overrides.projectId,
+    ownerId: overrides.ownerId,
+    gatewayEnhancement: overrides.gatewayEnhancement,
+    gatewayApiKey: overrides.gatewayApiKey,
+    gatewayBaseUrl: overrides.gatewayBaseUrl,
+    gatewayTextModel: overrides.gatewayTextModel,
+    geminiApiKey: overrides.geminiApiKey,
     usageSource: overrides.usageSource ?? (async () => ({ readable: true, usageFraction: 0.1 })),
     retentionEnabled: overrides.retentionEnabled,
     retentionDays: overrides.retentionDays,

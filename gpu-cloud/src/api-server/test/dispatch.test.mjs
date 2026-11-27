@@ -47,9 +47,13 @@ test('duplicate submit is idempotent (same manager job, no second dispatch)', as
 });
 
 test('production mode refuses every submit with no-capacity', async (t) => {
-  const { api, cleanup } = await makeApi({ mode: 'production', executor: false });
+  const { api, d1, cleanup } = await makeApi({ mode: 'production', executor: false });
   t.after(cleanup);
-  const res = await api.dispatch.submitExecutions(submitBody('job-prod'));
+  // FreeLLMAPI (A5): the submit loads the stored record first, so the
+  // job must be seeded — the real flow always creates the D1 job first.
+  const body = submitBody('job-prod');
+  seedJobForSubmit(d1, body);
+  const res = await api.dispatch.submitExecutions(body);
   assert.equal(res.status, 503);
   assert.equal(res.body.error, 'no-capacity');
   assert.equal(api.manager.listJobs().length, 0);

@@ -114,7 +114,20 @@ function stubD1() {
     calls: [],
     async d1Apply(mutations, requestId) { this.calls.push(['d1Apply', requestId]); return { requestId, results: [] }; },
     async d1Read() { return {}; },
-    async getJob() { return null; },
+    // FreeLLMAPI (A5): the submit handler loads the stored record by
+    // jobId before validating the body, so the stub returns a record for
+    // any requested id — the real flow always creates the D1 job first
+    // (the Worker). No test in this file depends on a null getJob.
+    async getJob(jobId) {
+      if (typeof jobId !== 'string' || jobId.length === 0) return null;
+      return {
+        id: jobId,
+        data: JSON.stringify({
+          id: jobId, mode: 'single', status: 'queued',
+          prompt: 'stub prompt', sceneExecutions: [],
+        }),
+      };
+    },
     async listScenes() { return []; },
     async listExpiredScenes() { return []; },
     async listPendingJobs() { this.calls.push(['listPendingJobs']); return []; },

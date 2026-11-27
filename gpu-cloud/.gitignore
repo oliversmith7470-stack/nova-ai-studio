@@ -7,6 +7,10 @@
 # A future commit must never sweep media bytes into GitHub.
 data/
 
+# Benchmark scratch (FreeLLMAPI, approved v5 design §4b/B3): per-run
+# manifests and probe outputs. Never commit this.
+benchmark-scratch/
+
 # Storage test temp roots (removed after each test run anyway).
 test/storage/.tmp/
 

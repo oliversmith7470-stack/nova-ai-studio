@@ -144,3 +144,17 @@ export function assertStage2Safe(job) {
   if (!result.ok) throw new DataBoundaryError(result.reason);
   return true;
 }
+
+// Credential-pattern scan only (no Stage 2 marker, no param-key or image
+// rules). Used by the FreeLLMAPI enhancement validation boundary (A4) and
+// the submit-path effective-prompt scan (A5): an enhanced prompt that
+// matches a credential-like pattern is rejected, and an effective prompt
+// that matches one is refused at submit. Returns the matching pattern
+// name, or null. Fixed names only — never the matched text.
+export function scanCredentialPatterns(text) {
+  if (typeof text !== 'string') return null;
+  for (const { name, pattern } of CREDENTIAL_PATTERNS) {
+    if (pattern.test(text)) return name;
+  }
+  return null;
+}

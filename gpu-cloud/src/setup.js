@@ -75,6 +75,7 @@ export function createGpuCloud({
   now,
   config,
   mockOptions,
+  enhancement,
   storageRootDir = DEFAULT_STORAGE_ROOT_DIR,
   storage = null,
   startSweepTimer = false,
@@ -85,6 +86,10 @@ export function createGpuCloud({
     ...(now !== undefined ? { now } : {}),
     ...(config !== undefined ? { config } : {}),
     ...(mockOptions !== undefined ? { mockOptions } : {}),
+    // FreeLLMAPI (A4/A5): enhancement options pass through; absent means
+    // disabled (the GpuManager default), so existing callers are
+    // unaffected.
+    ...(enhancement !== undefined ? { enhancement } : {}),
   });
 
   // Weekly budgets come from the provider definitions (the single source

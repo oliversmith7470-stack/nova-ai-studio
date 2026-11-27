@@ -60,6 +60,12 @@ import { normalizeExecutorState, kaggleCancelReason } from './kaggle-status.js';
 import { D1AuthError, D1RetryableError } from './d1-client.js';
 import { checkRunnerHeartbeat } from './runner-heartbeat.js';
 import { requiredVramGb } from '../phase6/resource-profiles.js';
+import {
+  buildGatewayPolicy,
+  effectivePrompt,
+  InvalidJobError,
+} from '../gateway-policy.js';
+import { scanCredentialPatterns } from '../data-guard.js';
 
 const JOB_ID_RE = /^nova-job-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -110,6 +116,7 @@ export class DispatchManager {
     runnerHealthPath = null,
     d1Client,
     apiState,
+    gatewayPolicy = null,
     mode = 'controlled-test',
     ackWindowMs = ACK_WINDOW_MS,
     ackPollMs = 1000,
@@ -155,6 +162,10 @@ export class DispatchManager {
     this.runnerHealthPath = runnerHealthPath;
     this.d1Client = d1Client;
     this.apiState = apiState;
+    // FreeLLMAPI (A5): the gateway policy for submit-time prompt
+    // resolution. Defaults to the production policy (fail closed: no
+    // enhancement in production, no authorization store).
+    this.gatewayPolicy = gatewayPolicy ?? buildGatewayPolicy({});
     this.mode = mode;
     this.ackWindowMs = ackWindowMs;
     this.ackPollMs = ackPollMs;
@@ -368,6 +379,50 @@ export class DispatchManager {
   }
 
   async _submitExecutionsInner(body) {
+    // FreeLLMAPI (A5 contract): the submit loads the stored D1 record by
+    // body.jobId through the existing job-by-id lookup BEFORE the body is
+    // validated, and the stored record — never the body prompt — is the
+    // prompt that dispatches. A body that is not an object, or carries no
+    // string jobId, has no job identity to look up and is refused 400
+    // first; everything else is resolved from the stored record.
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return { status: 400, body: { error: 'invalid-submit', message: 'body must be an object' } };
+    }
+    if (typeof body.jobId !== 'string') {
+      return { status: 400, body: { error: 'invalid-submit', message: 'invalid jobId' } };
+    }
+    let storedRecord;
+    try {
+      storedRecord = await this.d1Client.getJob(body.jobId);
+    } catch {
+      // The existing parentStatus shape: a D1 lookup failure is 502
+      // d1-unavailable, never a blind retry and never a dispatch.
+      return { status: 502, body: { error: 'd1-unavailable' } };
+    }
+    const storedData = this._parseStoredJobData(storedRecord);
+    if (!storedRecord || !storedData || storedRecord.id !== body.jobId || storedData.id !== body.jobId) {
+      // Missing, unloadable, or mismatched stored record: the body prompt
+      // never substitutes for it — the existing not-found response.
+      return { status: 404, body: { error: 'not-found' } };
+    }
+    let resolvedPrompt = null; // single mode: the resolved effective prompt
+    if (body.mode === 'single') {
+      if (typeof storedData.prompt !== 'string') {
+        return { status: 404, body: { error: 'not-found' } };
+      }
+      try {
+        resolvedPrompt = effectivePrompt(storedData, this.gatewayPolicy);
+      } catch (err) {
+        if (err instanceof InvalidJobError) {
+          return { status: 400, body: { error: 'invalid-submit', message: err.message } };
+        }
+        throw err;
+      }
+      if (scanCredentialPatterns(resolvedPrompt)) {
+        return { status: 400, body: { error: 'invalid-submit', message: 'prompt failed the data guard' } };
+      }
+    }
+
     const invalid = this._validateSubmitBody(body);
     if (invalid) return { status: 400, body: { error: 'invalid-submit', message: invalid } };
 
@@ -404,7 +459,9 @@ export class DispatchManager {
     const executions = body.sceneExecutions;
     const prompts = new Map();
     if (body.mode === 'single') {
-      for (const x of executions) prompts.set(x.executionId, body.prompt);
+      // A5: single-mode manager jobs get the resolved prompt from the
+      // stored record. The body prompt is never used for dispatch.
+      for (const x of executions) prompts.set(x.executionId, resolvedPrompt);
     } else {
       const byIndex = new Map((body.scenes || []).map((s) => [s.index, s.prompt]));
       for (const x of executions) prompts.set(x.executionId, byIndex.get(x.sceneIndex) ?? '');
@@ -660,11 +717,28 @@ export class DispatchManager {
         return 'no-executor';
       case 'ceiling-exceeded':
         return 'ceiling';
+      case 'invalid-job':
+        // FreeLLMAPI (A5): the resolver refused the job at dispatch
+        // (production + enhanced, or sandbox without authorization).
+        // The job is already failed; the submit reports the refusal.
+        return 'invalid-job';
       case 'kill-switch-engaged':
       case 'no-provider':
       case 'queue-empty':
       default:
         return 'no-capacity';
+    }
+  }
+
+  // Parse a stored D1 job record's data payload. Returns the parsed
+  // object, or null when the record is missing or unloadable (A5).
+  _parseStoredJobData(record) {
+    if (!record || typeof record.data !== 'string') return null;
+    try {
+      const data = JSON.parse(record.data);
+      return data && typeof data === 'object' && !Array.isArray(data) ? data : null;
+    } catch {
+      return null;
     }
   }
 

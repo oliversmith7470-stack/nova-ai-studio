@@ -5,8 +5,10 @@
 // the ONLY process that touches the manager store, the storage engine,
 // and the sweep/reconciliation timers. It exposes exactly the internal
 // endpoints in Rev 2 §3.4, all requiring the API secret + HMAC signing
-// (§11, Rev 3 §C-1.10). It never serves browsers directly. It never
-// holds the Gemini key, a job token, or any Cloudflare secret. It never
+// (§11, Rev 3 §C-1.10). It never serves browsers directly. It holds no
+// Cloudflare secret and no job token; it holds a Gemini key ONLY as host
+// configuration for the opt-in direct-Gemini enhancement fallback
+// (approved v5 design, A4), never in the repo and never logged. It never
 // touches D1 directly — every D1 need goes through the Worker's signed
 // /internal/d1-apply + /internal/d1-read endpoints (Rev 3 §C-1.1).
 //
@@ -46,6 +48,10 @@ import { SweepRunner } from './api-server/sweep.js';
 import { ReconciliationRunner } from './api-server/reconcile.js';
 import { validateMp4 } from './api-server/validation.js';
 import { revokeSecret as doRevokeSecret } from './api-server/revocation.js';
+import { AuthorizationStore } from './gateway-authorization.js';
+import { buildGatewayPolicy } from './gateway-policy.js';
+import { createGatewayClient } from './gateway-client.js';
+import { createDirectGeminiAdapter } from './direct-gemini.js';
 import {
   API_SERVER_VERSION,
   ACK_WINDOW_MS,
@@ -127,6 +133,14 @@ export function parseExecutorList(value) {
     seen.add(id);
   }
   return ids;
+}
+
+// Parse a boolean env flag for the FreeLLMAPI gateway options (approved
+// v5 design, §5): "true"/"1" is on, anything else (including unset) is
+// off. Flags default OFF — the design authorizes no activation.
+function parseEnvFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  return value === 'true' || value === '1';
 }
 
 // Controlled-test mode requires an explicitly supplied controlled-test
@@ -292,6 +306,46 @@ export function createApiServer(config = {}) {
   const dataDir = config.dataDir ?? process.env.NOVA_API_DATA_DIR ?? DEFAULT_API_DATA_DIR;
   const now = config.now ?? (() => Date.now());
 
+  // FreeLLMAPI gateway prompt enhancement (approved v5 design, A4/A5/§5).
+  // Host config only, never in the repo; both flags default OFF. The
+  // environment defaults to production (fail closed). Production startup
+  // rejects NOVA_GATEWAY_ENHANCEMENT=true — enhancement is never a
+  // production capability in this revision. The gateway client is created
+  // only when the flag is on (no key → client disabled, chain shortens
+  // to the raw prompt); the direct-Gemini fallback adapter exists only
+  // when a Gemini key is present in host config (verified absent — the
+  // fallback stays dormant until the owner supplies one).
+  const gatewayEnvironment = config.environment ?? process.env.NOVA_ENVIRONMENT ?? 'production';
+  const gatewayEnvironmentId = config.environmentId ?? process.env.NOVA_ENVIRONMENT_ID ?? 'nova-api';
+  const gatewayProjectId = config.projectId ?? process.env.NOVA_PROJECT_ID ?? 'nova-ai-studio';
+  const gatewayOwnerId = config.ownerId ?? process.env.NOVA_OWNER_ID ?? 'nova-owner';
+  const gatewayEnhancement = config.gatewayEnhancement ?? parseEnvFlag(process.env.NOVA_GATEWAY_ENHANCEMENT, false);
+  if ((gatewayEnvironment === 'production' || mode === 'production') && gatewayEnhancement) {
+    throw new Error('gateway enhancement cannot be enabled in production');
+  }
+  const authorizationStore = new AuthorizationStore({
+    filePath: path.join(dataDir, 'gateway-authorizations.json'),
+    auditPath: path.join(dataDir, 'gateway-authorization-audit.log'),
+  });
+  const gatewayPolicy = buildGatewayPolicy({
+    environment: gatewayEnvironment,
+    environmentId: gatewayEnvironmentId,
+    projectId: gatewayProjectId,
+    ownerId: gatewayOwnerId,
+    authorizationStore,
+    component: 'api-server',
+  });
+  const gatewayClient = gatewayEnhancement
+    ? createGatewayClient({
+        baseUrl: config.gatewayBaseUrl ?? process.env.NOVA_GATEWAY_BASE_URL ?? 'http://127.0.0.1:3001',
+        apiKey: config.gatewayApiKey ?? process.env.NOVA_GATEWAY_API_KEY ?? '',
+        model: config.gatewayTextModel ?? process.env.NOVA_GATEWAY_TEXT_MODEL ?? 'google:gemini-3.5-flash-lite',
+      })
+    : null;
+  const directGemini = gatewayEnhancement
+    ? createDirectGeminiAdapter({ apiKey: config.geminiApiKey ?? process.env.GEMINI_API_KEY ?? '' })
+    : null;
+
   const apiState = new ApiStateStore(path.join(dataDir, 'api-state.json'));
 
   // D1 client: the Worker origin is required — the API process cannot
@@ -307,6 +361,13 @@ export function createApiServer(config = {}) {
     storePath: config.storePath ?? path.join(dataDir, 'gpu-manager.json'),
     now,
     config: { maxQueueDepth: 100 },
+    enhancement: {
+      enabled: gatewayEnhancement,
+      client: gatewayClient,
+      directGemini,
+      policy: gatewayPolicy,
+      authorizationStore,
+    },
   });
   const storage = config.storage ?? createStorage({
     rootDir: config.storageRootDir ?? path.join(dataDir, 'store'),
@@ -379,6 +440,7 @@ export function createApiServer(config = {}) {
     runnerHealthPath: config.runnerHealthPath ?? path.join(dataDir, 'runner-health.json'),
     d1Client,
     apiState,
+    gatewayPolicy,
     mode,
     ackWindowMs: config.ackWindowMs ?? ACK_WINDOW_MS,
     ackPollMs: config.ackPollMs ?? 1000,
@@ -717,7 +779,7 @@ export function createApiServer(config = {}) {
   }
 
   return {
-    config: { mode, host, port, dataDir },
+    config: { mode, host, port, dataDir, gatewayEnvironment, gatewayEnhancement },
     manager,
     executor: legacyExecutor,
     storage,
@@ -726,6 +788,9 @@ export function createApiServer(config = {}) {
     reconcile,
     apiState,
     d1Client,
+    gatewayPolicy,
+    authorizationStore,
+    gatewayClient,
     routeInventory,
     start,
     stop,

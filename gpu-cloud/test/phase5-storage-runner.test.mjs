@@ -405,7 +405,18 @@ test('runner: heartbeat gate — missing/stale heartbeat blocks new submits, fre
     productionExecutors: new Map([['provider-a', exec]]),
     d1Client: {
       async d1Apply() { return {}; }, async d1Read() { return {}; },
-      async getJob() { return null; }, async listScenes() { return []; },
+      // FreeLLMAPI (A5): the submit handler loads the stored record
+      // before the heartbeat gate, so the stub returns a record for any
+      // requested id — the real flow always creates the D1 job first.
+      async getJob(jobId) {
+        return {
+          id: jobId,
+          data: JSON.stringify({
+            id: jobId, mode: 'single', status: 'queued', prompt: 'heartbeat gate test',
+          }),
+        };
+      },
+      async listScenes() { return []; },
       async listExpiredScenes() { return []; }, async listPendingJobs() { return []; },
       async listTerminalJobs() { return []; }, async listExpiredRateLimits() { return []; },
     },

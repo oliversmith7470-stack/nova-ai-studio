@@ -150,6 +150,20 @@ export function createJob({
       currency: 'USD',
     },
     error: null,
+    // FreeLLMAPI gateway prompt enhancement (approved v5 design, A5).
+    // The original prompt above is immutable; the fields below are
+    // nullable and default to current behaviour (no migration, no
+    // behaviour change for existing jobs). Metadata fields are DEFERRED
+    // (A2) — none exist on the record.
+    enhancedPrompt: null, // gateway-produced variant, when accepted
+    promptSource: 'user', // 'user' | 'enhanced' — which prompt dispatches
+    enhancementSource: null, // 'gateway' | 'direct-gemini' | null
+    enhancementModel: null, // exact verified X-Routed-Via (gateway) or google/gemini-3.5-flash (direct)
+    enhancementRequestedModel: null, // colon-form gateway identifier requested, null otherwise
+    enhancementReportedModel: null, // gateway response model, null otherwise
+    // Server-created reference to the sandbox owner-authorization record
+    // covering this job (A5 contract). The caller can never supply it.
+    sandboxAuthorizationId: null,
     // Opaque delivery reference only — NEVER media bytes (O-27).
     resultRef: null,
     providerCompletedAt: null,
