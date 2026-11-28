@@ -16,8 +16,9 @@
 // or pending entry; an unregistered name is rejected explicitly (parse returns
 // { ok: false, reason: 'unregistered-event' }). A producer log line existing is not proof the alert system accepts it —
 // test (t) proves every registered name through the actual parser and dispatcher.
-// Takes a transport (default: resolveAlertTransport() — the outside SMTP
-// service when configured, else host sendmail); unit tests pass a stub transport.
+// Takes a transport (default: resolveAlertTransport() — the Gmail API
+// when configured, else the outside SMTP service when configured, else
+// host sendmail); unit tests pass a stub transport.
 // Persistent state (all under /var/lib/nova-api/, all written atomically —
 // temp file in the same directory + rename; see writeStateFileAtomic):
 //   alert-dedup.json   { "<event>:<windowStart|requestId>": { "sentAt": "<ISO-8601 UTC>", "requestId": "<uuid>|null" } }
@@ -84,6 +85,8 @@ import { spawnSync } from 'node:child_process';
 import { accessSync, closeSync, constants, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'; // (Rev 4.8, chunk-13 review — Gap 1, Finding 2: existsSync is gone; the read IS the existence test)
 import net from 'node:net';
 import tls from 'node:tls';
+import http from 'node:http';
+import https from 'node:https';
 import { flockExNb, flockUn } from './flock-binding.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -884,16 +887,21 @@ export function smtpConfig() {
 }
 
 // The transport the dispatcher uses when no explicit transport is passed:
-// the outside SMTP service when configured, else host sendmail. Evaluated
-// per call (env is fixed at process start, but tests set it per child).
+// the Gmail API when configured, else the outside SMTP service when
+// configured, else host sendmail. Evaluated per call (env is fixed at
+// process start, but tests set it per child).
 export function resolveAlertTransport() {
+  if (gmailConfig()) return gmailTransport;
   return smtpConfig() ? smtpTransport : sendmailTransport;
 }
 
 // Install/host-readiness gate (used by install.sh): the mail path is ready
-// when EITHER the SMTP service is fully configured OR a sendmail resolves.
-// Anything else is not ready — never a silent pass.
+// when the Gmail API is fully configured, OR the SMTP service is fully
+// configured, OR a sendmail resolves. Anything else is not ready — never
+// a silent pass.
 export function mailTransportReady() {
+  const g = gmailConfig();
+  if (g) return g.ok ? { ok: true, via: 'gmail', detail: g.from } : { ok: false, reason: g.reason };
   const c = smtpConfig();
   if (c) return c.ok ? { ok: true, via: 'smtp', detail: c.host } : { ok: false, reason: c.reason };
   const p = resolveSendmailPath();
@@ -1058,6 +1066,199 @@ export async function smtpTransport({ to, subject, body }) {
   if (!cfg) return { ok: false, reason: 'smtp-not-configured' };
   if (!cfg.ok) return { ok: false, reason: cfg.reason };
   return sendViaSmtp(cfg, { to, subject, body });
+}
+
+// Gmail API transport (OQ-1 path B, 28 Nov 2026: the SMTP app-password
+// route is dead — the password Shina submitted to the Secure Vault cannot
+// be read out into a host file by any approved path — so the dispatcher
+// sends through the Gmail API with its own OAuth2 consent instead).
+// Builtins only: node:http / node:https, no npm dependencies. Config
+// comes from the API unit's EnvironmentFile (/etc/nova-api/api.env):
+//   NOVA_ALERT_GMAIL_CLIENT_ID — OAuth client ID (a Desktop-app client
+//     on the dedicated NOVA Cloud project, NOT the NEXORA project).
+//     Unset = no Gmail configured; the dispatcher falls through to SMTP,
+//     then sendmail.
+//   NOVA_ALERT_GMAIL_CLIENT_SECRET — OAuth client secret. Never logged,
+//     never echoed in any reason string.
+//   NOVA_ALERT_GMAIL_REFRESH_TOKEN — long-lived refresh token from the
+//     attended consent (scope gmail.send ONLY — send-only, cannot read
+//     mail). Never logged, never echoed.
+//   NOVA_ALERT_GMAIL_FROM — From header (defaults to the owner account
+//     omoyenishina2000@gmail.com).
+//   NOVA_ALERT_GMAIL_TIMEOUT_MS — per-request timeout (default 30000).
+//   NOVA_ALERT_GMAIL_API_BASE — Gmail API base (default
+//     https://gmail.googleapis.com). Test-only override: a plain-http
+//     base is accepted ONLY for a loopback host (localhost, 127.0.0.1,
+//     ::1); any other http endpoint is rejected — tokens must never
+//     travel over plain HTTP to a remote host.
+//   NOVA_ALERT_GMAIL_TOKEN_URL — OAuth token endpoint (default
+//     https://oauth2.googleapis.com/token). Same http rule as above.
+// Fail-closed: a client ID set without a usable secret/refresh token
+// never sends and never falls back to SMTP/sendmail — the misconfiguration
+// is loud ('gmail-not-configured'), not silently rerouted. A fresh access
+// token is minted from the refresh token on every send (tokens live ~1h;
+// minting per send avoids stale-token state entirely). On a 401 the token
+// is minted once more and the send retried once. Failure reasons are
+// normalised to single tokens (whitespace -> '-'), the same convention as
+// the SMTP transport, and never contain credential material or response
+// bodies — only the HTTP status code.
+export const GMAIL_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
+export const GMAIL_SENDER = 'omoyenishina2000@gmail.com';
+export const GMAIL_API_BASE_DEFAULT = 'https://gmail.googleapis.com';
+export const GMAIL_TOKEN_URL_DEFAULT = 'https://oauth2.googleapis.com/token';
+
+function gmailReason(stage, detail) {
+  const suffix = detail === undefined || detail === null || `${detail}` === '' ? '' : `:${`${detail}`.replace(/\s+/g, '-')}`;
+  return `gmail-${stage}${suffix}`;
+}
+
+function gmailEndpoint(raw, fallback) {
+  const value = (raw ?? '').trim();
+  if (value === '') return fallback;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  if (url.protocol === 'https:') return url.href.replace(/\/$/, '');
+  const loopback = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(url.hostname);
+  if (url.protocol === 'http:' && loopback) return url.href.replace(/\/$/, '');
+  return null; // http to a remote host, or an unknown scheme — never allowed
+}
+
+export function gmailConfig() {
+  const clientId = process.env.NOVA_ALERT_GMAIL_CLIENT_ID ?? '';
+  if (!singleToken(clientId)) return null; // no Gmail configured
+  const clientSecret = process.env.NOVA_ALERT_GMAIL_CLIENT_SECRET ?? '';
+  const refreshToken = process.env.NOVA_ALERT_GMAIL_REFRESH_TOKEN ?? '';
+  const from = process.env.NOVA_ALERT_GMAIL_FROM ?? '';
+  const timeoutRaw = process.env.NOVA_ALERT_GMAIL_TIMEOUT_MS ?? '';
+  const timeoutMs = timeoutRaw === '' ? 30000 : Number.parseInt(timeoutRaw, 10);
+  const apiBase = gmailEndpoint(process.env.NOVA_ALERT_GMAIL_API_BASE, GMAIL_API_BASE_DEFAULT);
+  const tokenUrl = gmailEndpoint(process.env.NOVA_ALERT_GMAIL_TOKEN_URL, GMAIL_TOKEN_URL_DEFAULT);
+  if (!singleToken(clientSecret) || !singleToken(refreshToken)
+    || !Number.isInteger(timeoutMs) || timeoutMs <= 0
+    || (from !== '' && !emailShape(from))
+    || apiBase === null || tokenUrl === null) {
+    return { ok: false, reason: 'gmail-not-configured' };
+  }
+  return { ok: true, clientId, clientSecret, refreshToken, from: from === '' ? GMAIL_SENDER : from, timeoutMs, apiBase, tokenUrl };
+}
+
+function gmailStepError(stage, detail) {
+  const e = new Error(String(detail ?? stage));
+  e.gmailStage = stage;
+  return e;
+}
+
+// One HTTPS/HTTP JSON request. Protocol is chosen from the URL; plain http
+// is only ever offered to a loopback endpoint (gmailEndpoint enforces it).
+// Throws gmailStepError on transport failure, timeout, or non-JSON reply.
+async function gmailJsonRequest(url, { method, headers, body, timeoutMs }) {
+  const mod = url.startsWith('https://') ? https : http;
+  return new Promise((resolve, reject) => {
+    const req = mod.request(url, { method, headers, signal: AbortSignal.timeout(timeoutMs) }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        try { json = text === '' ? null : JSON.parse(text); } catch { return reject(gmailStepError('bad-response', 'non-json-reply')); }
+        resolve({ status: res.statusCode ?? 0, json });
+      });
+      res.on('error', (e) => reject(gmailStepError('request-failed', e.message ?? e)));
+    });
+    req.on('error', (e) => {
+      if (e?.name === 'AbortError') return reject(gmailStepError('request-timeout', 'request-timeout'));
+      reject(gmailStepError('request-failed', e.message ?? e));
+    });
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+async function mintGmailAccessToken(cfg) {
+  const form = new URLSearchParams({
+    grant_type: 'refresh_token',
+    client_id: cfg.clientId,
+    client_secret: cfg.clientSecret,
+    refresh_token: cfg.refreshToken,
+  }).toString();
+  let res;
+  try {
+    res = await gmailJsonRequest(cfg.tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': String(Buffer.byteLength(form)) },
+      body: form,
+      timeoutMs: cfg.timeoutMs,
+    });
+  } catch (e) {
+    // Any transport failure while minting is a token-refresh failure —
+    // the inner stage (timeout, bad reply) is the detail, not the stage.
+    throw gmailStepError('token-refresh-failed', e?.message ?? e);
+  }
+  if (res.status !== 200 || !res.json || typeof res.json.access_token !== 'string' || res.json.access_token === '') {
+    throw gmailStepError('token-refresh-failed', `http-${res.status}`);
+  }
+  return res.json.access_token;
+}
+
+// The message is an RFC 5322 text (From/To/Subject + body), base64url
+// encoded, sent as { raw } to messages.send. Header-injection safety is
+// the same by-construction rule as sendAlertEmail: the subject is built
+// only from the registered event token + validated scope, `to` is the
+// configured ALERT_RECIPIENT, and the free-form detail goes in the BODY
+// (after the blank line), never in a header.
+async function sendGmailMessage(cfg, accessToken, { to, subject, body }) {
+  const raw = Buffer.from(
+    [`From: ${cfg.from}`, `To: ${to}`, `Subject: ${subject}`, 'MIME-Version: 1.0', 'Content-Type: text/plain; charset="UTF-8"', '', body].join('\r\n'),
+    'utf8',
+  ).toString('base64url');
+  const payload = JSON.stringify({ raw });
+  let res;
+  try {
+    res = await gmailJsonRequest(`${cfg.apiBase}/gmail/v1/users/me/messages/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(payload)), Authorization: `Bearer ${accessToken}` },
+      body: payload,
+      timeoutMs: cfg.timeoutMs,
+    });
+  } catch (e) {
+    // Any transport failure while sending is a send failure — the inner
+    // stage (timeout, bad reply) is the detail, not the stage.
+    throw gmailStepError('send-failed', e?.message ?? e);
+  }
+  if (res.status === 401) throw gmailStepError('send-unauthorized', 'http-401');
+  if (res.status !== 200 || !res.json || typeof res.json.id !== 'string') {
+    throw gmailStepError('send-failed', `http-${res.status}`);
+  }
+  return { ok: true, id: res.json.id };
+}
+
+async function sendViaGmail(cfg, { to, subject, body }) {
+  try {
+    const accessToken = await mintGmailAccessToken(cfg);
+    try {
+      return await sendGmailMessage(cfg, accessToken, { to, subject, body });
+    } catch (e) {
+      if (e?.gmailStage !== 'send-unauthorized') throw e;
+      // The minted token was rejected: mint once more and retry once.
+      const retryToken = await mintGmailAccessToken(cfg);
+      return await sendGmailMessage(cfg, retryToken, { to, subject, body });
+    }
+  } catch (e) {
+    const stage = e?.gmailStage ?? 'failed';
+    const detail = e?.gmailStage ? (e.message ?? '') : (e?.message ?? e);
+    return { ok: false, reason: gmailReason(stage, detail) };
+  }
+}
+
+// Gmail API transport: same { to, subject, body } -> { ok, reason }
+// contract as sendmailTransport. Unconfigured (no client ID) or
+// misconfigured (client ID without usable secret/refresh token) never
+// sends and never falls back.
+export async function gmailTransport({ to, subject, body }) {
+  const cfg = gmailConfig();
+  if (!cfg) return { ok: false, reason: 'gmail-not-configured' };
+  if (!cfg.ok) return { ok: false, reason: cfg.reason };
+  return sendViaGmail(cfg, { to, subject, body });
 }
 
 // Dispatches one parsed event. Returns a Promise of { sent, reason, pending }.

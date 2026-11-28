@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import tls from 'node:tls';
+import http from 'node:http';
 import { spawnSync, spawn } from 'node:child_process';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..');
@@ -475,4 +476,253 @@ console.log(JSON.stringify(await dispatchAlert(parsed)));`, {
   assert.deepEqual(JSON.parse(out.trim()), { sent: true, reason: 'sent', pending: false });
   assert.ok(srv.events.data.includes('Event: startup-listen-failed'), 'dispatcher email reached the SMTP service');
   assert.ok(srv.events.data.includes('To: omoyenishina2000@gmail.com'), 'dispatcher email went to the owner decision address');
+});
+
+// =============================================================================
+// (ad) Gmail API transport — OQ-1 path B (28 Nov 2026: the SMTP
+// app-password route is dead — the vault value cannot be read out into a
+// host file — so the dispatcher sends through the Gmail API with its own
+// OAuth2 consent). Same child-process env isolation as the SMTP cases.
+// The fake Gmail server runs in this process; the child connects to it
+// over 127.0.0.1 with the Gmail env pointing at it (http to a loopback
+// host is the test-only endpoint override).
+// =============================================================================
+
+const IMPORT_GMAIL = `import { gmailConfig, gmailTransport, resolveAlertTransport, mailTransportReady, ALERT_RECIPIENT, dispatchAlert, parseEventLine } from '${DISPATCHER}';`;
+
+function startFakeGmail(opts = {}) {
+  const { tokenOk = true, tokenStatus = 500, sendStatuses = [200] } = opts;
+  const events = { tokenRequests: [], sendRequests: [], tokenCount: 0, sendCount: 0 };
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      if (req.url === '/token' && req.method === 'POST') {
+        events.tokenCount++;
+        events.tokenRequests.push({ headers: { ...req.headers }, body });
+        if (!tokenOk) {
+          res.writeHead(tokenStatus, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid_grant' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ access_token: `fake-access-token-${events.tokenCount}`, expires_in: 3600, token_type: 'Bearer' }));
+        return;
+      }
+      if (req.url === '/gmail/v1/users/me/messages/send' && req.method === 'POST') {
+        events.sendCount++;
+        const status = sendStatuses[Math.min(events.sendCount - 1, sendStatuses.length - 1)];
+        let raw = null;
+        try { raw = JSON.parse(body).raw; } catch { /* keep null */ }
+        events.sendRequests.push({ headers: { ...req.headers }, raw, body });
+        if (status === 200) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ id: 'fake-gmail-id-1', threadId: 'fake-thread-1' }));
+        } else {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: status, message: 'fake failure' } }));
+        }
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({
+    port: server.address().port,
+    events,
+    close: () => new Promise((r) => server.close(r)),
+  })));
+}
+
+function gmailEnv(port, extra = {}) {
+  return {
+    PATH: '/usr/bin:/bin',
+    NOVA_ALERT_GMAIL_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
+    NOVA_ALERT_GMAIL_CLIENT_SECRET: 'test-client-secret',
+    NOVA_ALERT_GMAIL_REFRESH_TOKEN: 'test-refresh-token',
+    NOVA_ALERT_GMAIL_API_BASE: `http://127.0.0.1:${port}`,
+    NOVA_ALERT_GMAIL_TOKEN_URL: `http://127.0.0.1:${port}/token`,
+    ...extra,
+  };
+}
+
+test('(ad) gmailTransport unconfigured / half-configured -> gmail-not-configured, no send', async (t) => {
+  const srv = await startFakeGmail();
+  t.after(() => srv.close());
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'phase5-transport-'));
+  // No Gmail env at all -> not configured.
+  const out1 = runInChild(`${IMPORT_GMAIL}
+console.log(JSON.stringify(await gmailTransport({ to: 'a@b.c', subject: 's', body: 'b' })));`, { PATH: dir });
+  assert.deepEqual(JSON.parse(out1.trim()), { ok: false, reason: 'gmail-not-configured' });
+  // Client ID without secret -> half-configured, fail closed.
+  const out2 = runInChild(`${IMPORT_GMAIL}
+console.log(JSON.stringify(await gmailTransport({ to: 'a@b.c', subject: 's', body: 'b' })));`, {
+    PATH: dir,
+    NOVA_ALERT_GMAIL_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
+  });
+  assert.deepEqual(JSON.parse(out2.trim()), { ok: false, reason: 'gmail-not-configured' });
+  // Client ID + secret without refresh token -> half-configured.
+  const out3 = runInChild(`${IMPORT_GMAIL}
+console.log(JSON.stringify(await gmailTransport({ to: 'a@b.c', subject: 's', body: 'b' })));`, {
+    PATH: dir,
+    NOVA_ALERT_GMAIL_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
+    NOVA_ALERT_GMAIL_CLIENT_SECRET: 'test-client-secret',
+  });
+  assert.deepEqual(JSON.parse(out3.trim()), { ok: false, reason: 'gmail-not-configured' });
+  // A plain-http API base to a REMOTE host is rejected at config time.
+  const out4 = runInChild(`${IMPORT_GMAIL}
+console.log(JSON.stringify(await gmailTransport({ to: 'a@b.c', subject: 's', body: 'b' })));`, {
+    ...gmailEnv(srv.port),
+    NOVA_ALERT_GMAIL_API_BASE: 'http://gmail.example.com',
+  });
+  assert.deepEqual(JSON.parse(out4.trim()), { ok: false, reason: 'gmail-not-configured' });
+  assert.equal(srv.events.tokenCount, 0, 'no token mint was attempted for any not-configured case');
+  assert.equal(srv.events.sendCount, 0, 'no send was attempted for any not-configured case');
+});
+
+test('(ad) resolveAlertTransport: Gmail env wins over SMTP env wins over sendmail', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'phase5-transport-'));
+  const out1 = runInChild(`${IMPORT_GMAIL}
+console.log(JSON.stringify({ name: resolveAlertTransport().name }));`, { PATH: dir });
+  assert.equal(JSON.parse(out1.trim()).name, 'sendmailTransport');
+  const out2 = runInChild(`${IMPORT_GMAIL}
+console.log(JSON.stringify({ name: resolveAlertTransport().name }));`, {
+    PATH: dir,
+    NOVA_ALERT_SMTP_HOST: 'smtp.gmail.com',
+    NOVA_ALERT_SMTP_USER: 'omoyenishina2000@gmail.com',
+    NOVA_ALERT_SMTP_PASS: 'x'.repeat(16),
+  });
+  assert.equal(JSON.parse(out2.trim()).name, 'smtpTransport');
+  const out3 = runInChild(`${IMPORT_GMAIL}
+console.log(JSON.stringify({ name: resolveAlertTransport().name }));`, {
+    PATH: dir,
+    NOVA_ALERT_GMAIL_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
+    NOVA_ALERT_GMAIL_CLIENT_SECRET: 'test-client-secret',
+    NOVA_ALERT_GMAIL_REFRESH_TOKEN: 'test-refresh-token',
+    NOVA_ALERT_SMTP_HOST: 'smtp.gmail.com',
+    NOVA_ALERT_SMTP_USER: 'omoyenishina2000@gmail.com',
+    NOVA_ALERT_SMTP_PASS: 'x'.repeat(16),
+  });
+  assert.equal(JSON.parse(out3.trim()).name, 'gmailTransport');
+});
+
+test('(ad) mailTransportReady: Gmail ready -> gmail; half-configured Gmail fails closed even with SMTP ready', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'phase5-transport-'));
+  const out1 = runInChild(`${IMPORT_GMAIL}
+console.log(JSON.stringify(mailTransportReady()));`, {
+    PATH: dir,
+    NOVA_ALERT_GMAIL_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
+    NOVA_ALERT_GMAIL_CLIENT_SECRET: 'test-client-secret',
+    NOVA_ALERT_GMAIL_REFRESH_TOKEN: 'test-refresh-token',
+  });
+  assert.deepEqual(JSON.parse(out1.trim()), { ok: true, via: 'gmail', detail: 'omoyenishina2000@gmail.com' });
+  // Half-configured Gmail + fully configured SMTP: the Gmail
+  // misconfiguration is loud, never silently rerouted to SMTP.
+  const out2 = runInChild(`${IMPORT_GMAIL}
+console.log(JSON.stringify(mailTransportReady()));`, {
+    PATH: dir,
+    NOVA_ALERT_GMAIL_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
+    NOVA_ALERT_SMTP_HOST: 'smtp.gmail.com',
+    NOVA_ALERT_SMTP_USER: 'omoyenishina2000@gmail.com',
+    NOVA_ALERT_SMTP_PASS: 'x'.repeat(16),
+  });
+  assert.deepEqual(JSON.parse(out2.trim()), { ok: false, reason: 'gmail-not-configured' });
+});
+
+test('(ad) fake Gmail: token minted, message sent, raw decodes to headers + body', async (t) => {
+  const srv = await startFakeGmail();
+  t.after(() => srv.close());
+  const out = await runInChildAsync(`${IMPORT_GMAIL}
+console.log(JSON.stringify(await gmailTransport({ to: 'omoyenishina2000@gmail.com', subject: '[NOVA] startup-listen-failed', body: 'Event: startup-listen-failed\\nDetail: gmail-proof' })));`, gmailEnv(srv.port));
+  assert.deepEqual(JSON.parse(out.trim()), { ok: true, id: 'fake-gmail-id-1' });
+  assert.equal(srv.events.tokenCount, 1, 'one token mint per send');
+  const tokenReq = srv.events.tokenRequests[0];
+  assert.ok(tokenReq.body.includes('grant_type=refresh_token'), 'refresh-grant used');
+  assert.ok(tokenReq.body.includes('refresh_token=test-refresh-token'), 'refresh token sent to the token endpoint');
+  assert.ok(tokenReq.body.includes('client_secret=test-client-secret'), 'client secret present in the token request');
+  assert.equal(srv.events.sendCount, 1);
+  const sendReq = srv.events.sendRequests[0];
+  assert.equal(sendReq.headers.authorization, 'Bearer fake-access-token-1', 'minted token used as the Bearer token');
+  const decoded = Buffer.from(sendReq.raw, 'base64url').toString('utf8');
+  assert.ok(decoded.includes('From: omoyenishina2000@gmail.com'), decoded);
+  assert.ok(decoded.includes('To: omoyenishina2000@gmail.com'), decoded);
+  assert.ok(decoded.includes('Subject: [NOVA] startup-listen-failed'), decoded);
+  assert.ok(decoded.includes('Event: startup-listen-failed'), decoded);
+  assert.ok(decoded.includes('Detail: gmail-proof'), decoded);
+});
+
+test('(ad) Gmail token endpoint rejects (500) -> gmail-token-refresh-failed, no send attempted', async (t) => {
+  const srv = await startFakeGmail({ tokenOk: false, tokenStatus: 500 });
+  t.after(() => srv.close());
+  const out = await runInChildAsync(`${IMPORT_GMAIL}
+console.log(JSON.stringify(await gmailTransport({ to: 'a@b.c', subject: 's', body: 'b' })));`, gmailEnv(srv.port));
+  const result = JSON.parse(out.trim());
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'gmail-token-refresh-failed:http-500', `reason: ${result.reason}`);
+  assert.equal(srv.events.sendCount, 0, 'no send after a failed token mint');
+});
+
+test('(ad) Gmail send 403 -> gmail-send-failed:http-403, single token', async (t) => {
+  const srv = await startFakeGmail({ sendStatuses: [403] });
+  t.after(() => srv.close());
+  const out = await runInChildAsync(`${IMPORT_GMAIL}
+console.log(JSON.stringify(await gmailTransport({ to: 'a@b.c', subject: 's', body: 'b' })));`, gmailEnv(srv.port));
+  const result = JSON.parse(out.trim());
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'gmail-send-failed:http-403', `reason: ${result.reason}`);
+  assert.ok(!/\s/.test(result.reason), `reason is a single token: ${result.reason}`);
+});
+
+test('(ad) Gmail send 401 -> token minted again, send retried once, then succeeds', async (t) => {
+  const srv = await startFakeGmail({ sendStatuses: [401, 200] });
+  t.after(() => srv.close());
+  const out = await runInChildAsync(`${IMPORT_GMAIL}
+console.log(JSON.stringify(await gmailTransport({ to: 'a@b.c', subject: 's', body: 'b' })));`, gmailEnv(srv.port));
+  assert.deepEqual(JSON.parse(out.trim()), { ok: true, id: 'fake-gmail-id-1' });
+  assert.equal(srv.events.tokenCount, 2, 'one mint for the first attempt, one for the retry');
+  assert.equal(srv.events.sendCount, 2, 'the send was retried once after the 401');
+  assert.equal(srv.events.sendRequests[1].headers.authorization, 'Bearer fake-access-token-2', 'the retry used the freshly minted token');
+});
+
+test('(ad) Gmail silent token server -> request timeout, transport does not hang', async (t) => {
+  const server = http.createServer(() => { /* accept, never reply */ });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((r) => server.close(r)));
+  const out = runInChild(`${IMPORT_GMAIL}
+console.log(JSON.stringify(await gmailTransport({ to: 'a@b.c', subject: 's', body: 'b' })));`, {
+    ...gmailEnv(server.address().port),
+    NOVA_ALERT_GMAIL_TIMEOUT_MS: '300',
+  });
+  const result = JSON.parse(out.trim());
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /^gmail-token-refresh-failed:request-timeout$/, `reason: ${result.reason}`);
+});
+
+test('(ad) dispatchAlert with NO explicit transport uses the Gmail API when configured', async (t) => {
+  // Save/restore the shared dedup state file around the child run.
+  fs.mkdirSync('/var/lib/nova-api', { recursive: true });
+  const DEDUP = '/var/lib/nova-api/alert-dedup.json';
+  let saved = null;
+  try { saved = fs.readFileSync(DEDUP); } catch { saved = null; }
+  t.after(() => {
+    if (saved === null) fs.rmSync(DEDUP, { force: true });
+    else fs.writeFileSync(DEDUP, saved);
+    for (const f of fs.readdirSync('/var/lib/nova-api')) {
+      if (/^alert-dedup\.json\.(corrupt|recovered)-/.test(f) || /^alert-dedup\.json\.tmp\./.test(f)) fs.rmSync(path.join('/var/lib/nova-api', f), { force: true });
+    }
+    for (const f of ['alert-dedup.json.lock']) fs.rmSync(path.join('/var/lib/nova-api', f), { force: true });
+  });
+  const srv = await startFakeGmail();
+  t.after(() => srv.close());
+  const out = await runInChildAsync(`${IMPORT_GMAIL}
+const line = 'ts=2026-11-28T09:00:00Z level=error event=startup-listen-failed requestId=66666666-6666-4666-8666-666666666666 windowStart=2026-11-28T08:00:00Z detail=gmail-default-path-test';
+const { ok, parsed } = parseEventLine(line);
+if (!ok) { console.log(JSON.stringify({ parseFailed: true })); process.exit(0); }
+console.log(JSON.stringify(await dispatchAlert(parsed)));`, gmailEnv(srv.port));
+  assert.deepEqual(JSON.parse(out.trim()), { sent: true, reason: 'sent', pending: false });
+  assert.equal(srv.events.sendCount, 1, 'the dispatcher email reached the Gmail API');
+  const decoded = Buffer.from(srv.events.sendRequests[0].raw, 'base64url').toString('utf8');
+  assert.ok(decoded.includes('Event: startup-listen-failed'), 'dispatcher email carried the event');
+  assert.ok(decoded.includes('To: omoyenishina2000@gmail.com'), 'dispatcher email went to the owner decision address');
 });

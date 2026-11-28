@@ -579,11 +579,13 @@ if [ -f "$SYSTEMD_DIR/nova-health-check.timer" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# sendmail check (Rev 4.7, F5-01; extended Rev 5.0, OQ-1): mailTransportReady()
-# against the INSTALLED alert-dispatcher.js, on the API unit's PATH.
-# Passes when EITHER a sendmail resolves (host MTA) OR api.env carries a
-# complete SMTP config (NOVA_ALERT_SMTP_HOST/USER/PASS — the outside mail
-# service the owner chose 28 Nov 2026). Fails if neither is ready.
+# sendmail check (Rev 4.7, F5-01; extended Rev 5.0, OQ-1; extended OQ-1
+# path B, 28 Nov 2026): mailTransportReady() against the INSTALLED
+# alert-dispatcher.js, on the API unit's PATH. Passes when EITHER a
+# sendmail resolves (host MTA) OR api.env carries a complete Gmail API
+# config (NOVA_ALERT_GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN) OR a complete
+# SMTP config (NOVA_ALERT_SMTP_HOST/USER/PASS — the outside mail service
+# the owner chose 28 Nov 2026). Fails if none is ready.
 # Deferred while the dispatcher module or its imports have not been
 # delivered yet.
 #
@@ -592,20 +594,23 @@ fi
 # host-readiness gate, not a file-integrity gate. A host with no mail
 # transport still gets its units installed and verified, but the install
 # as a whole FAILS here (non-zero exit, exact reason below) — never a
-# silent pass. On the target host the MTA must be installed (or the SMTP
-# config added to api.env) first; a re-run then passes cleanly (all
-# copies are idempotent).
+# silent pass. On the target host the MTA must be installed (or the Gmail
+# or SMTP config added to api.env) first; a re-run then passes cleanly
+# (all copies are idempotent).
 # ---------------------------------------------------------------------------
 
 if [ -f "$MOD_DIR/alert-dispatcher.js" ] && [ -f "$MOD_DIR/flock-binding.mjs" ] && [ -f "$MOD_DIR/startup-counter.mjs" ]; then
-    # SMTP config for the mail check comes from api.env (the same file the
-    # API unit reads as its EnvironmentFile). Values are passed through the
-    # environment only for this check and are never echoed.
+    # Gmail + SMTP config for the mail check comes from api.env (the same
+    # file the API unit reads as its EnvironmentFile). Values are passed
+    # through the environment only for this check and are never echoed.
+    gmail_client_id=$(sed -n 's/^NOVA_ALERT_GMAIL_CLIENT_ID=//p' "$API_ENV" | head -n 1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^['\"]//" -e "s/['\"]$//")
+    gmail_client_secret=$(sed -n 's/^NOVA_ALERT_GMAIL_CLIENT_SECRET=//p' "$API_ENV" | head -n 1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^['\"]//" -e "s/['\"]$//")
+    gmail_refresh_token=$(sed -n 's/^NOVA_ALERT_GMAIL_REFRESH_TOKEN=//p' "$API_ENV" | head -n 1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^['\"]//" -e "s/['\"]$//")
     smtp_host=$(sed -n 's/^NOVA_ALERT_SMTP_HOST=//p' "$API_ENV" | head -n 1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^['\"]//" -e "s/['\"]$//")
     smtp_user=$(sed -n 's/^NOVA_ALERT_SMTP_USER=//p' "$API_ENV" | head -n 1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^['\"]//" -e "s/['\"]$//")
     smtp_pass=$(sed -n 's/^NOVA_ALERT_SMTP_PASS=//p' "$API_ENV" | head -n 1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^['\"]//" -e "s/['\"]$//")
     mail_err=$(mktemp) || fail "cannot create temp file for mail transport check"
-    if mail_out=$(PATH="$SYSTEMD_DEFAULT_PATH" NOVA_ALERT_SMTP_HOST="$smtp_host" NOVA_ALERT_SMTP_USER="$smtp_user" NOVA_ALERT_SMTP_PASS="$smtp_pass" node --input-type=module -e "import { mailTransportReady } from '$MOD_DIR/alert-dispatcher.js'; const r = mailTransportReady(); console.log(r.ok ? r.via + ':' + r.detail : 'none:' + r.reason); process.exit(r.ok ? 0 : 1);" 2>"$mail_err"); then
+    if mail_out=$(PATH="$SYSTEMD_DEFAULT_PATH" NOVA_ALERT_GMAIL_CLIENT_ID="$gmail_client_id" NOVA_ALERT_GMAIL_CLIENT_SECRET="$gmail_client_secret" NOVA_ALERT_GMAIL_REFRESH_TOKEN="$gmail_refresh_token" NOVA_ALERT_SMTP_HOST="$smtp_host" NOVA_ALERT_SMTP_USER="$smtp_user" NOVA_ALERT_SMTP_PASS="$smtp_pass" node --input-type=module -e "import { mailTransportReady } from '$MOD_DIR/alert-dispatcher.js'; const r = mailTransportReady(); console.log(r.ok ? r.via + ':' + r.detail : 'none:' + r.reason); process.exit(r.ok ? 0 : 1);" 2>"$mail_err"); then
         mail_rc=0
     else
         mail_rc=$?
@@ -613,7 +618,7 @@ if [ -f "$MOD_DIR/alert-dispatcher.js" ] && [ -f "$MOD_DIR/flock-binding.mjs" ] 
     if [ "$mail_rc" -ne 0 ]; then
         mail_detail=$(cat "$mail_err" 2>/dev/null | head -n 3 | tr '\n' ' ')
         rm -f "$mail_err"
-        fail "mail transport check: no mail transport ready — no executable sendmail on the API unit's PATH $SYSTEMD_DEFAULT_PATH and no complete SMTP config (NOVA_ALERT_SMTP_HOST/USER/PASS) in $API_ENV; check error: ${mail_detail:-unknown}"
+        fail "mail transport check: no mail transport ready — no executable sendmail on the API unit's PATH $SYSTEMD_DEFAULT_PATH and no complete Gmail API config (NOVA_ALERT_GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN) or SMTP config (NOVA_ALERT_SMTP_HOST/USER/PASS) in $API_ENV; check error: ${mail_detail:-unknown}"
     fi
     rm -f "$mail_err"
     echo "mail transport: $mail_out"
