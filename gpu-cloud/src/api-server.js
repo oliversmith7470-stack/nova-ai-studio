@@ -39,6 +39,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { GpuManager } from './gpu-manager.js';
 import { PROVIDER_DEFINITIONS } from './providers.js';
 import { KaggleExecutor, KAGGLE_PROVIDER_ID } from './kaggle-executor.js';
+import { KaggleCliTransport } from './kaggle-transport.js';
 // The real personal executor (Rev 4.8 §7, reviewer correction): the LTX
 // executor that builds the Run 10 notebook, replacing the Wan default
 // notebook builder the generic KaggleExecutor ships with.
@@ -284,6 +285,13 @@ export function isKaggleCredentialPresent({ env = process.env, home = os.homedir
   }
 }
 
+// The Kaggle CLI the personal executor dispatches through: the proof
+// host's venv binary. Overridable per host via NOVA_KAGGLE_BIN (env) or
+// config.kaggleBin, and per call via the factory's kaggleBin option —
+// the default is the host path, never a bare `kaggle` on PATH, so a
+// stray or wrong CLI can never be picked up by accident.
+export const DEFAULT_KAGGLE_BIN = '/var/lib/nova-api/.venv-kaggle/bin/kaggle';
+
 // Personal executor registration (owner-only, Rev 4.9 §4): the only
 // recognised personal id is `kaggle-t4`; it must resolve to an implemented
 // Kaggle executor and the required Kaggle credential must be present on the
@@ -314,14 +322,15 @@ export function isKaggleCredentialPresent({ env = process.env, home = os.homedir
 // those flags, and credential presence is the only authenticated signal
 // available at this layer; the five §6 status concepts (S1) remain a
 // separate design change and are NOT claimed here.
-export function createPersonalExecutor({ personalExecutorId = '', kaggleCredentialPresent = null, ownerTokenConfigured = null, hoursTracker = null, registry = null, packageDir = null, attestationVerifier = null, nexoraAttestationVerifier = null } = {}) {
+
+export function createPersonalExecutor({ personalExecutorId = '', kaggleCredentialPresent = null, ownerTokenConfigured = null, hoursTracker = null, registry = null, packageDir = null, attestationVerifier = null, nexoraAttestationVerifier = null, kaggleBin = null, kaggleUsername = null, transport = null, pollIntervalMs = null, env = process.env, home = os.homedir() } = {}) {
   const id = typeof personalExecutorId === 'string' ? personalExecutorId.trim() : '';
   if (id === '') return null;
   if (id !== KAGGLE_PROVIDER_ID) {
     console.error(`[api-server] personal executor unavailable: unknown personal executor id ${JSON.stringify(id)} (only kaggle-t4 is recognised)`);
     return null;
   }
-  const credentialPresent = kaggleCredentialPresent ?? isKaggleCredentialPresent();
+  const credentialPresent = kaggleCredentialPresent ?? isKaggleCredentialPresent({ env, home });
   if (!credentialPresent) {
     console.error('[api-server] personal executor unavailable: kaggle-t4 requested but the Kaggle credential is not present on this host');
     return null;
@@ -339,7 +348,6 @@ export function createPersonalExecutor({ personalExecutorId = '', kaggleCredenti
     console.error('[api-server] personal executor unavailable: no packageDir for the Kaggle executor');
     return null;
   }
-  const executor = new LtxKaggleExecutor({ packageDir, hoursTracker, registry, attestationVerifier, nexoraAttestationVerifier });
   // The personal executor is the REAL LTX executor (engines/ltx-executor.js):
   // it builds the Run 10 notebook (121f, 1024x576, 24 fps, 8 steps) with
   // the Kaggle Model mounts, NOT the generic KaggleExecutor's Wan default.
@@ -347,10 +355,52 @@ export function createPersonalExecutor({ personalExecutorId = '', kaggleCredenti
   // carried so the executor's VDP-06 boundary can verify the
   // server-generated personal attestation; without it no personal job
   // verifies (fail closed).
-  // The transport stays null (human channel) until the owner supplies a
-  // Kaggle credential AND the proof run is separately authorised — the
-  // executor never dispatches without it, and submit() without a
-  // transport returns a pending promise (no fake completion).
+  // The transport is the REAL Kaggle CLI transport (kaggle-transport.js),
+  // not the old null human channel: submit() pushes through the venv CLI
+  // and afterSubmit() polls to a terminal status, so a started job
+  // resolves instead of hanging on a pending promise that only a manual
+  // fileReport could ever settle. An injected transport (tests) is
+  // honoured, but it never bypasses the credential gate above — the
+  // gate runs first, so a transport without a credential still refuses.
+  // KaggleCliTransport's own construction throws without a credential.
+  // The gate above already refused the no-credential case, but the two
+  // checks can still diverge — a caller may override
+  // kaggleCredentialPresent to simulate presence (tests) without a real
+  // credential on the host, or the credential may vanish between the
+  // probe and construction. A transport that cannot be constructed
+  // means the personal path is unavailable, and the API must still
+  // start: the personal path is opt-in, unlike a production id, which
+  // is a startup failure. Never let the throw escape the factory.
+  // The username rides the kernel metadata id (<owner>/nova-gpu-cloud-
+  // <jobId>); it comes from the factory option or KAGGLE_USERNAME, and
+  // stays null (the '<kaggle-username>' placeholder) when neither is
+  // set — a push with the placeholder is a real-CLI failure, never a
+  // silent wrong-owner push. The licence gate (dispatch.js) still
+  // refuses every personal job until a determination is recorded, so
+  // wiring the transport authorises no generation by itself.
+  let resolvedTransport = transport;
+  if (resolvedTransport == null) {
+    try {
+      resolvedTransport = new KaggleCliTransport({
+        kaggleBin: kaggleBin ?? env.NOVA_KAGGLE_BIN ?? DEFAULT_KAGGLE_BIN,
+        env,
+        home,
+      });
+    } catch (err) {
+      console.error(`[api-server] personal executor unavailable: Kaggle transport cannot be constructed (${err?.message ?? err})`);
+      return null;
+    }
+  }
+  const executor = new LtxKaggleExecutor({
+    packageDir,
+    hoursTracker,
+    registry,
+    attestationVerifier,
+    nexoraAttestationVerifier,
+    transport: resolvedTransport,
+    kaggleUsername: kaggleUsername ?? env.KAGGLE_USERNAME ?? null,
+    ...(pollIntervalMs !== null ? { pollIntervalMs } : {}),
+  });
   assertExecutorMatchesProvider(executor, KAGGLE_PROVIDER_ID);
   return {
     providerId: KAGGLE_PROVIDER_ID,
@@ -680,6 +730,19 @@ export function createApiServer(config = {}) {
       hoursTracker,
       registry: manager.registry,
       packageDir: config.packageDir ?? path.join(dataDir, 'packages'),
+      // Transport wiring (proof host): the Kaggle CLI binary and the
+      // owner's Kaggle username come from config or the environment
+      // (NOVA_KAGGLE_BIN / KAGGLE_USERNAME); the factory defaults the
+      // binary to the proof host's venv when neither is set.
+      kaggleBin: config.kaggleBin ?? null,
+      kaggleUsername: config.kaggleUsername ?? null,
+      // A pre-constructed transport (tests): the harness injects a stub
+      // when it simulates a credential-present host, so the factory
+      // never shells out. Production never sets this — the factory
+      // builds the real KaggleCliTransport. An injected transport never
+      // bypasses the credential gate in the factory. The factory's
+      // parameter is named `transport`, not `kaggleTransport`.
+      transport: config.kaggleTransport ?? null,
       // M2-P round 2: the executor's VDP-06 boundary verifies the
       // server-generated personal attestation against the API host's
       // signing secrets (current + previous during rotation) with the

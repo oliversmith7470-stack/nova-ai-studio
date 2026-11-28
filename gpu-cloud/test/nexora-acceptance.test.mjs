@@ -28,9 +28,10 @@
 //
 // No live Kaggle, no real secrets (every secret here is a clearly-fake
 // test vector), no network beyond loopback. The personal executor's
-// transport stays null, so an accepted job's start promise stays
-// pending — a test job never completes, which is also why T-V19's
-// orphan is observable.
+// transport is a stub (support.mjs stubKaggleTransport) whose status
+// stays 'running', so an accepted job's start promise stays pending —
+// a test job never completes, which is also why T-V19's orphan is
+// observable.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';

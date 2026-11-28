@@ -45,6 +45,7 @@ const requireA2 = createRequire(new URL('../../a2-impl/package.json', import.met
 const { Miniflare } = requireA2('miniflare');
 
 import { createApiServer } from '../src/api-server.js';
+import { stubKaggleTransport } from '../src/api-server/test/support.mjs';
 import { HttpD1Client } from '../src/api-server/d1-client.js';
 import { createStorage } from '../src/storage/index.js';
 import { CHECKPOINT_SHA256 } from '../src/phase6/resource-profiles.js';
@@ -151,6 +152,13 @@ async function bootProduction({ personalFlag = true, apiOriginOverride = null } 
     executor: null,
     ownerTokenId: TEST_OWNER_TOKEN_ID,
     kaggleCredentialPresent: true,
+    // The boot simulates a credential-present host, so it also
+    // simulates the transport (the stub never shells out and its
+    // status stays 'running', so pushed jobs stay pending exactly as
+    // on the old null channel). Without it the factory would try to
+    // build the real KaggleCliTransport and refuse without a real
+    // credential.
+    kaggleTransport: stubKaggleTransport(),
     personalExecutor: 'kaggle-t4',
     activationConfigPath: confPath,
     // Kaggle design v13 §3.3: the strict re-verification expects the

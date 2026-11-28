@@ -39,6 +39,13 @@ const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'phase5-startup-state-')
 process.env.NOVA_STARTUP_STATE_DIR = STATE_DIR;
 const attempts = await import('../src/api-server/startup-attempts.js');
 const apiServer = await import('../src/api-server.js');
+// The stub Kaggle transport MUST be imported dynamically, after
+// NOVA_STARTUP_STATE_DIR is set above — never as a static import.
+// support.mjs imports api-server.js, which imports startup-attempts.js,
+// and startup-attempts.js reads NOVA_STARTUP_STATE_DIR at import time:
+// a hoisted static import would evaluate it with the variable unset
+// (STARTUP_STATE_DIR null) and break every (z)/(t)/(aa) readiness test.
+const { stubKaggleTransport } = await import('../src/api-server/test/support.mjs');
 
 const COUNTER_LOCK = '/var/lib/nova-api/startup-attempts.lock';
 const REPO_ROOT = path.resolve(import.meta.dirname, '..', '..');
@@ -148,6 +155,14 @@ function makeApi(t, { state = true, d1 = stubD1(), port = 0, extra = {} } = {}) 
     dataDir,
     sweepIntervalMs: 60 * 60 * 1000,
     reconcileIntervalMs: 60 * 60 * 1000,
+    // A boot that simulates a credential-present host also simulates
+    // the transport (the stub never shells out; its status stays
+    // 'running', so pushed jobs stay pending exactly as on the old
+    // null channel). Without it the factory would try to build the
+    // real KaggleCliTransport and refuse without a real credential.
+    // An explicit kaggleTransport in extra wins.
+    kaggleTransport: extra.kaggleTransport
+      ?? (extra.kaggleCredentialPresent === true ? stubKaggleTransport() : undefined),
     ...extra,
   });
   t.after(async () => { try { await api.stop(); } catch { /* already stopped */ } });

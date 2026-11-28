@@ -349,6 +349,37 @@ export class MemoryD1Client {
   }
 }
 
+// A stub Kaggle transport for harness boots that simulate a
+// credential-present host: push succeeds, status stays 'running'
+// forever, output is never reached. A pushed job therefore stays
+// pending until a report is filed — the same observable behaviour as
+// the old null (human) channel, which is what the orphan/pending
+// tests rely on (a completing stub would settle jobs the tests expect
+// to stay outstanding). It never shells out and never touches Kaggle.
+// The harness injects it automatically when the caller simulates a
+// credential (kaggleCredentialPresent: true) without supplying its own
+// transport; it never bypasses the factory's credential or owner-token
+// gates — those still run first.
+export function stubKaggleTransport() {
+  const calls = { push: [], status: [], output: [] };
+  return {
+    calls,
+    async push(packageDir) {
+      calls.push.push(packageDir);
+      const jobId = path.basename(packageDir);
+      return { ok: true, kernelId: `test-owner/nova-gpu-cloud-${jobId}` };
+    },
+    async status(kernelId) {
+      calls.status.push(kernelId);
+      return { state: 'running' };
+    },
+    async output(kernelId) {
+      calls.output.push(kernelId);
+      throw new Error('stubKaggleTransport.output is never reached while status is running');
+    },
+  };
+}
+
 // -- API process harness ----------------------------------------------------
 
 export async function makeApi(overrides = {}) {
@@ -429,6 +460,14 @@ export async function makeApi(overrides = {}) {
     ownerTokenId: overrides.ownerTokenId,
     kaggleCredentialPresent: overrides.kaggleCredentialPresent,
     personalExecutor: overrides.personalExecutor,
+    // The factory builds the real KaggleCliTransport when no transport
+    // is injected — which throws without a real credential. A harness
+    // boot that simulates a credential-present host therefore also
+    // simulates the transport (the stub above); an explicit
+    // kaggleTransport override wins. Boots that do not simulate the
+    // credential get nothing, and the factory refuses on its own gate.
+    kaggleTransport: overrides.kaggleTransport
+      ?? (overrides.kaggleCredentialPresent === true ? stubKaggleTransport() : undefined),
     productionExecutors: overrides.productionExecutors,
     storage: overrides.storage,
     // FreeLLMAPI (A4/A5): gateway options pass through; undefined falls
