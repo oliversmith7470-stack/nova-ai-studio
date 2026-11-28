@@ -111,14 +111,17 @@
 #     run-health-check.sh wrapper line (`flock ... 9 /usr/bin/node ...`)
 #     do NOT test/use the fd form on this flock; see the implementation
 #     report — the wrapper is the health-check owner's file.
-#   - sendmail: runs resolveSendmailPath() against the INSTALLED
-#     alert-dispatcher.js and fails if it returns null (Rev 4.7, F5-01).
-#     Deferred (warning, not a failure) while the dispatcher module (or
-#     its imports) have not been delivered yet. This check runs LAST —
+#   - mail transport (sendmail check, Rev 4.7 F5-01, extended Rev 5.0
+#     OQ-1): runs mailTransportReady() against the INSTALLED
+#     alert-dispatcher.js — passes when a sendmail resolves on the API
+#     unit's PATH (host MTA) OR api.env carries a complete SMTP config
+#     (outside mail service, owner decision 28 Nov 2026). Deferred
+#     (warning, not a failure) while the dispatcher module (or its
+#     imports) have not been delivered yet. This check runs LAST —
 #     after files are installed and units verified — because it is a
-#     host-readiness gate (the MTA belongs on the API host), not a
-#     file-integrity gate; a host without an MTA still fails the install
-#     as a whole (non-zero exit), but its units are in place.
+#     host-readiness gate, not a file-integrity gate; a host with no
+#     mail transport still fails the install as a whole (non-zero
+#     exit), but its units are in place.
 #
 # Usage: gpu-cloud/systemd/install.sh
 
@@ -576,35 +579,44 @@ if [ -f "$SYSTEMD_DIR/nova-health-check.timer" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# sendmail check (Rev 4.7, F5-01): resolveSendmailPath() against the
-# INSTALLED alert-dispatcher.js, on the API unit's PATH. Fails if it
-# returns null. Deferred while the dispatcher module or its imports have
-# not been delivered yet.
+# sendmail check (Rev 4.7, F5-01; extended Rev 5.0, OQ-1): mailTransportReady()
+# against the INSTALLED alert-dispatcher.js, on the API unit's PATH.
+# Passes when EITHER a sendmail resolves (host MTA) OR api.env carries a
+# complete SMTP config (NOVA_ALERT_SMTP_HOST/USER/PASS — the outside mail
+# service the owner chose 28 Nov 2026). Fails if neither is ready.
+# Deferred while the dispatcher module or its imports have not been
+# delivered yet.
 #
 # ORDERING (deliberate, and the design does not fix an order): this check
 # runs LAST, after files are installed and units are verified. It is a
-# host-readiness gate (the MTA belongs on the API host; the dev VM has
-# none by design), not a file-integrity gate. A host without an MTA still
-# gets its units installed and verified, but the install as a whole
-# FAILS here (non-zero exit, exact reason below) — never a silent pass.
-# On the target host the MTA must be installed first; a re-run then
-# passes cleanly (all copies are idempotent).
+# host-readiness gate, not a file-integrity gate. A host with no mail
+# transport still gets its units installed and verified, but the install
+# as a whole FAILS here (non-zero exit, exact reason below) — never a
+# silent pass. On the target host the MTA must be installed (or the SMTP
+# config added to api.env) first; a re-run then passes cleanly (all
+# copies are idempotent).
 # ---------------------------------------------------------------------------
 
 if [ -f "$MOD_DIR/alert-dispatcher.js" ] && [ -f "$MOD_DIR/flock-binding.mjs" ] && [ -f "$MOD_DIR/startup-counter.mjs" ]; then
-    sendmail_err=$(mktemp) || fail "cannot create temp file for sendmail check"
-    if sendmail_out=$(PATH="$SYSTEMD_DEFAULT_PATH" node --input-type=module -e "import { resolveSendmailPath } from '$MOD_DIR/alert-dispatcher.js'; const p = resolveSendmailPath(); console.log(p === null ? 'null' : p); process.exit(p === null ? 1 : 0);" 2>"$sendmail_err"); then
-        sendmail_rc=0
+    # SMTP config for the mail check comes from api.env (the same file the
+    # API unit reads as its EnvironmentFile). Values are passed through the
+    # environment only for this check and are never echoed.
+    smtp_host=$(sed -n 's/^NOVA_ALERT_SMTP_HOST=//p' "$API_ENV" | head -n 1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^['\"]//" -e "s/['\"]$//")
+    smtp_user=$(sed -n 's/^NOVA_ALERT_SMTP_USER=//p' "$API_ENV" | head -n 1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^['\"]//" -e "s/['\"]$//")
+    smtp_pass=$(sed -n 's/^NOVA_ALERT_SMTP_PASS=//p' "$API_ENV" | head -n 1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^['\"]//" -e "s/['\"]$//")
+    mail_err=$(mktemp) || fail "cannot create temp file for mail transport check"
+    if mail_out=$(PATH="$SYSTEMD_DEFAULT_PATH" NOVA_ALERT_SMTP_HOST="$smtp_host" NOVA_ALERT_SMTP_USER="$smtp_user" NOVA_ALERT_SMTP_PASS="$smtp_pass" node --input-type=module -e "import { mailTransportReady } from '$MOD_DIR/alert-dispatcher.js'; const r = mailTransportReady(); console.log(r.ok ? r.via + ':' + r.detail : 'none:' + r.reason); process.exit(r.ok ? 0 : 1);" 2>"$mail_err"); then
+        mail_rc=0
     else
-        sendmail_rc=$?
+        mail_rc=$?
     fi
-    if [ "$sendmail_rc" -ne 0 ]; then
-        sendmail_detail=$(cat "$sendmail_err" 2>/dev/null | head -n 3 | tr '\n' ' ')
-        rm -f "$sendmail_err"
-        fail "sendmail check: resolveSendmailPath() returned null (no executable sendmail on the API unit's PATH $SYSTEMD_DEFAULT_PATH) or the check errored: ${sendmail_detail:-unknown}"
+    if [ "$mail_rc" -ne 0 ]; then
+        mail_detail=$(cat "$mail_err" 2>/dev/null | head -n 3 | tr '\n' ' ')
+        rm -f "$mail_err"
+        fail "mail transport check: no mail transport ready — no executable sendmail on the API unit's PATH $SYSTEMD_DEFAULT_PATH and no complete SMTP config (NOVA_ALERT_SMTP_HOST/USER/PASS) in $API_ENV; check error: ${mail_detail:-unknown}"
     fi
-    rm -f "$sendmail_err"
-    echo "sendmail: $sendmail_out"
+    rm -f "$mail_err"
+    echo "mail transport: $mail_out"
 else
     warn "sendmail check DEFERRED: alert-dispatcher.js (or its imports flock-binding.mjs / startup-counter.mjs) not yet delivered by its owner; this check will run — and fail closed — once the module lands"
 fi

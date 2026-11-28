@@ -16,7 +16,8 @@
 // or pending entry; an unregistered name is rejected explicitly (parse returns
 // { ok: false, reason: 'unregistered-event' }). A producer log line existing is not proof the alert system accepts it —
 // test (t) proves every registered name through the actual parser and dispatcher.
-// Takes a transport (default: host sendmail); unit tests pass a stub transport.
+// Takes a transport (default: resolveAlertTransport() — the outside SMTP
+// service when configured, else host sendmail); unit tests pass a stub transport.
 // Persistent state (all under /var/lib/nova-api/, all written atomically —
 // temp file in the same directory + rename; see writeStateFileAtomic):
 //   alert-dedup.json   { "<event>:<windowStart|requestId>": { "sentAt": "<ISO-8601 UTC>", "requestId": "<uuid>|null" } }
@@ -81,6 +82,8 @@
 // short-lived, so the cache cannot go stale across an install).
 import { spawnSync } from 'node:child_process';
 import { accessSync, closeSync, constants, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'; // (Rev 4.8, chunk-13 review — Gap 1, Finding 2: existsSync is gone; the read IS the existence test)
+import net from 'node:net';
+import tls from 'node:tls';
 import { flockExNb, flockUn } from './flock-binding.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -157,7 +160,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 export const DEDUP_PATH = '/var/lib/nova-api/alert-dedup.json';
 export const PENDING_PATH = '/var/lib/nova-api/alert-pending.json';
 export const PENDING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-export const ALERT_RECIPIENT = 'novaaistudio.com@gmail.com'; // owner's business email (About page)
+export const ALERT_RECIPIENT = 'omoyenishina2000@gmail.com'; // owner decision 27 Nov 2026 (OQ-1 destination): alerts go to the owner's Gmail, not the business address
 
 // The literal sentinel "none" is not an identifier. Normalise it to null at the
 // single point where parsed fields are produced, so every consumer below (dedup
@@ -696,7 +699,7 @@ export function isSamePendingEntry(current, entry) {
 // or incrementing its attempts, and the failure path increments the CURRENT
 // attempts (not the snapshot's) — a stale outcome never overwrites a newer
 // entry or resurrects a removed one.
-export async function retryPending(transport = sendmailTransport) {
+export async function retryPending(transport = resolveAlertTransport()) {
   // Unlocked snapshot load (Rev 4.8, chunk-13 review — Gap 1, Finding 3):
   // quarantine DISABLED — this read runs outside the transaction lock, so a
   // corrupt file is returned as the fallback with the file left in place;
@@ -828,6 +831,235 @@ export function sendmailTransport({ to, subject, body }) {
   return { ok: true };
 }
 
+// SMTP transport (OQ-1, owner decision 28 Nov 2026: alerts go through an
+// OUTSIDE mail service, not an MTA on the host). No npm dependency:
+// minimal SMTP client over node:net / node:tls. Config comes from the API
+// unit's EnvironmentFile (/etc/nova-api/api.env):
+//   NOVA_ALERT_SMTP_HOST — relay hostname (e.g. smtp.gmail.com). Unset =
+//     no SMTP configured; the dispatcher falls back to sendmail.
+//   NOVA_ALERT_SMTP_PORT — port (default 587, or 465 when SECURE=true).
+//   NOVA_ALERT_SMTP_USER — SMTP username (the Gmail address).
+//   NOVA_ALERT_SMTP_PASS — SMTP password (Gmail app password). Never
+//     logged, never echoed in any reason string.
+//   NOVA_ALERT_SMTP_FROM — envelope/header From (defaults to USER).
+//   NOVA_ALERT_SMTP_SECURE — 'true' = implicit TLS on connect (port 465);
+//     default false = plain connect + STARTTLS (port 587).
+//   NOVA_ALERT_SMTP_CA_FILE — optional path to a PEM CA bundle used to
+//     verify the relay's certificate (private CA / test certs). Unset =
+//     the platform default CA store.
+//   NOVA_ALERT_SMTP_TIMEOUT_MS — per-operation socket timeout (default
+//     30000).
+// Fail-closed: a host set without a usable user/password never sends and
+// never falls back to sendmail — the misconfiguration is loud
+// ('smtp-not-configured'), not silently rerouted. Credentials are NEVER
+// sent on a plain connection: when SECURE is false the client requires
+// the server to advertise STARTTLS and upgrades before AUTH; a relay
+// that does not offer STARTTLS fails with 'smtp-starttls-unavailable'.
+// Failure reasons are normalised to single tokens (whitespace -> '-'),
+// the same convention as the sendmail transport, and never contain the
+// password or any credential material.
+function singleToken(v) { return typeof v === 'string' && v.length > 0 && !/\s/.test(v); }
+function emailShape(v) { return singleToken(v) && /^[^@\s]+@[^@\s]+$/.test(v); }
+
+export function smtpConfig() {
+  const host = process.env.NOVA_ALERT_SMTP_HOST ?? '';
+  if (!singleToken(host)) return null; // no SMTP configured
+  const user = process.env.NOVA_ALERT_SMTP_USER ?? '';
+  const pass = process.env.NOVA_ALERT_SMTP_PASS ?? '';
+  const from = process.env.NOVA_ALERT_SMTP_FROM ?? '';
+  const secure = (process.env.NOVA_ALERT_SMTP_SECURE ?? '').toLowerCase() === 'true';
+  const portRaw = process.env.NOVA_ALERT_SMTP_PORT ?? '';
+  const port = portRaw === '' ? (secure ? 465 : 587) : Number.parseInt(portRaw, 10);
+  const timeoutRaw = process.env.NOVA_ALERT_SMTP_TIMEOUT_MS ?? '';
+  const timeoutMs = timeoutRaw === '' ? 30000 : Number.parseInt(timeoutRaw, 10);
+  const caFile = process.env.NOVA_ALERT_SMTP_CA_FILE ?? '';
+  if (!emailShape(user) || !singleToken(pass)
+    || !Number.isInteger(port) || port < 1 || port > 65535
+    || !Number.isInteger(timeoutMs) || timeoutMs <= 0
+    || (from !== '' && !emailShape(from))
+    || (caFile !== '' && /\s/.test(caFile))) {
+    return { ok: false, reason: 'smtp-not-configured' };
+  }
+  return { ok: true, host, port, user, pass, from: from === '' ? user : from, secure, timeoutMs, caFile: caFile === '' ? null : caFile };
+}
+
+// The transport the dispatcher uses when no explicit transport is passed:
+// the outside SMTP service when configured, else host sendmail. Evaluated
+// per call (env is fixed at process start, but tests set it per child).
+export function resolveAlertTransport() {
+  return smtpConfig() ? smtpTransport : sendmailTransport;
+}
+
+// Install/host-readiness gate (used by install.sh): the mail path is ready
+// when EITHER the SMTP service is fully configured OR a sendmail resolves.
+// Anything else is not ready — never a silent pass.
+export function mailTransportReady() {
+  const c = smtpConfig();
+  if (c) return c.ok ? { ok: true, via: 'smtp', detail: c.host } : { ok: false, reason: c.reason };
+  const p = resolveSendmailPath();
+  return p ? { ok: true, via: 'sendmail', detail: p } : { ok: false, reason: 'no-mail-transport' };
+}
+
+function smtpReason(stage, detail) {
+  const suffix = detail === undefined || detail === null || `${detail}` === '' ? '' : `:${`${detail}`.replace(/\s+/g, '-')}`;
+  return `smtp-${stage}${suffix}`;
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(label)), ms); });
+  return Promise.race([promise.finally(() => clearTimeout(timer)), timeout]);
+}
+
+// One SMTP connection: sequential command/response. The reader buffers
+// socket data and resolves complete replies — a reply is complete on a
+// line matching /^\d{3} / (code + space); lines matching /^\d{3}-/
+// continue it; any other line ends the reply. Callers must not issue two
+// reads concurrently. detach() removes the reader's socket listeners —
+// it MUST be called before the socket is upgraded to TLS (a 'data'
+// listener left on the underlying socket could steal encrypted bytes
+// from the TLS layer).
+function makeSmtpReader(socket) {
+  let buffer = '';
+  let lines = [];
+  let waiter = null;
+  let closed = false;
+  const pump = () => {
+    if (!waiter) return;
+    for (;;) {
+      const nl = buffer.indexOf('\n');
+      if (nl < 0) break;
+      lines.push(buffer.slice(0, nl).replace(/\r$/, ''));
+      buffer = buffer.slice(nl + 1);
+      const last = lines[lines.length - 1];
+      if (/^\d{3} /.test(last) || !/^\d{3}-/.test(last)) {
+        const done = lines; lines = [];
+        const w = waiter; waiter = null; w(done); return;
+      }
+    }
+    if (closed) {
+      const done = lines.length > 0 ? lines : null; lines = [];
+      const w = waiter; waiter = null; w(done);
+    }
+  };
+  const onData = (chunk) => { buffer += chunk.toString('utf8'); pump(); };
+  const onClosed = () => { closed = true; pump(); };
+  socket.on('data', onData);
+  socket.on('close', onClosed);
+  socket.on('error', onClosed);
+  return {
+    readReply() {
+      if (waiter) throw new Error('smtp reader: concurrent read');
+      return new Promise((resolve) => { waiter = resolve; pump(); });
+    },
+    detach() {
+      socket.removeListener('data', onData);
+      socket.removeListener('close', onClosed);
+      socket.removeListener('error', onClosed);
+    },
+  };
+}
+
+function smtpStepError(stage, detail) {
+  const e = new Error(String(detail ?? stage));
+  e.smtpStage = stage;
+  return e;
+}
+
+async function sendViaSmtp(cfg, { to, subject, body }) {
+  let socket = null;
+  const destroy = () => { try { socket?.destroy(); } catch { /* best-effort */ } };
+  try {
+    let ca;
+    if (cfg.caFile) {
+      try { ca = readFileSync(cfg.caFile); }
+      catch (e) { throw smtpStepError('ca-unreadable', encodeFsDetail(e)); }
+    }
+    // Connect (the socket is assigned to the outer variable BEFORE the
+    // connect settles, so a timeout still destroys it).
+    const raw = cfg.secure
+      ? tls.connect({ host: cfg.host, port: cfg.port, servername: cfg.host, ...(ca ? { ca } : {}) })
+      : net.connect({ host: cfg.host, port: cfg.port });
+    socket = raw;
+    await withTimeout(new Promise((resolve, reject) => {
+      raw.once('error', reject);
+      raw.once(cfg.secure ? 'secureConnect' : 'connect', resolve);
+    }), cfg.timeoutMs, 'connect-timeout').catch((e) => { throw smtpStepError('connect-failed', e.message ?? e); });
+
+    let reader = makeSmtpReader(socket);
+    const send = (line) => new Promise((resolve, reject) => {
+      socket.write(`${line}\r\n`, (e) => (e ? reject(e) : resolve()));
+    });
+    const expect = async (codes, stage) => {
+      const lines = await withTimeout(reader.readReply(), cfg.timeoutMs, `${stage}-timeout`)
+        .catch((e) => { throw smtpStepError(stage, e.message ?? e); });
+      if (!lines || lines.length === 0) throw smtpStepError(stage, 'connection-closed');
+      const code = Number.parseInt(lines[0].slice(0, 3), 10);
+      if (!codes.includes(code)) throw smtpStepError(stage, `${code}-${lines.join(' ')}`);
+      return lines;
+    };
+
+    await expect([220], 'greeting');
+    await send('EHLO localhost');
+    let ehloLines = await expect([250], 'ehlo');
+    let caps = ehloLines.join(' ');
+    if (!cfg.secure) {
+      if (!/STARTTLS/i.test(caps)) throw smtpStepError('starttls-unavailable', 'server-does-not-offer-starttls');
+      await send('STARTTLS');
+      await expect([220], 'starttls');
+      // Upgrade in place: detach the plain reader first (see
+      // makeSmtpReader), then wrap the socket in TLS.
+      reader.detach();
+      const upgraded = tls.connect({ socket, servername: cfg.host, ...(ca ? { ca } : {}) });
+      socket = upgraded;
+      await withTimeout(new Promise((resolve, reject) => {
+        upgraded.once('error', reject);
+        upgraded.once('secureConnect', resolve);
+      }), cfg.timeoutMs, 'tls-upgrade-timeout').catch((e) => { throw smtpStepError('tls-upgrade-failed', e.message ?? e); });
+      reader = makeSmtpReader(socket);
+      await send('EHLO localhost');
+      ehloLines = await expect([250], 'ehlo');
+      caps = ehloLines.join(' ');
+    }
+    if (!/AUTH[^\n]*LOGIN/i.test(caps)) throw smtpStepError('auth-unavailable', 'server-does-not-offer-auth-login');
+    await send('AUTH LOGIN');
+    await expect([334], 'auth');
+    await send(Buffer.from(cfg.user, 'utf8').toString('base64'));
+    await expect([334], 'auth');
+    await send(Buffer.from(cfg.pass, 'utf8').toString('base64'));
+    await expect([235], 'auth');
+    await send(`MAIL FROM:<${cfg.from}>`);
+    await expect([250], 'mail-from');
+    await send(`RCPT TO:<${to}>`);
+    await expect([250], 'rcpt-to');
+    await send('DATA');
+    await expect([354], 'data');
+    // Dot-stuff lines starting with '.'; CRLF line endings (RFC 5321).
+    const message = [`From: ${cfg.from}`, `To: ${to}`, `Subject: ${subject}`, '', ...body.split('\n')]
+      .map((l) => (l.startsWith('.') ? `.${l}` : l)).join('\r\n');
+    await send(`${message}\r\n.`);
+    await expect([250], 'send');
+    try { await send('QUIT'); } catch { /* best-effort goodbye */ }
+    destroy();
+    return { ok: true };
+  } catch (e) {
+    destroy();
+    const stage = e?.smtpStage ?? 'failed';
+    const detail = e?.smtpStage ? (e.message ?? '') : (e?.message ?? e);
+    return { ok: false, reason: smtpReason(stage, detail) };
+  }
+}
+
+// Outside-service transport: same { to, subject, body } -> { ok, reason }
+// contract as sendmailTransport. Unconfigured (no host) or misconfigured
+// (host without usable credentials) never sends and never falls back.
+export async function smtpTransport({ to, subject, body }) {
+  const cfg = smtpConfig();
+  if (!cfg) return { ok: false, reason: 'smtp-not-configured' };
+  if (!cfg.ok) return { ok: false, reason: cfg.reason };
+  return sendViaSmtp(cfg, { to, subject, body });
+}
+
 // Dispatches one parsed event. Returns a Promise of { sent, reason, pending }.
 // sent=true: delivered AND the dedup entry written. sent=false with
 // reason 'duplicate': an email was already sent for this key. sent=false with
@@ -859,7 +1091,7 @@ export function sendmailTransport({ to, subject, body }) {
 // neither serialises the SEND across processes: two processes can both send one
 // alert (at-least-once); the in-lock re-check blocks only a second dedup entry.
 const inFlight = new Map();
-export async function dispatchAlert(parsed, transport = sendmailTransport) {
+export async function dispatchAlert(parsed, transport = resolveAlertTransport()) {
   // Rev 4.9 §2 — the policy boundary, BEFORE any normalisation,
   // undedupeable handling, serialisation, or transport: a journal-only
   // name returns exactly { sent: false, reason: 'journal-only',
